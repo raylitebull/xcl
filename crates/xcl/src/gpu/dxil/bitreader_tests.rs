@@ -1,7 +1,7 @@
 //! A test-only reader for the bitstream [`super::bitstream::BitWriter`]
-//! produces (unabbreviated records only), used to check record layouts
-//! that the validator and disassembler do not distinguish (e.g. atomic
-//! ordering codes the LLVM reader maps leniently).
+//! produces (both unabbreviated records and `DEFINE_ABBREV` abbreviated records),
+//! used to check record layouts that the validator and disassembler do not
+//! distinguish (e.g. atomic ordering codes the LLVM reader maps leniently).
 
 use super::module::{BinOp, Module, RmwOp};
 
@@ -10,6 +10,15 @@ pub(super) struct Block {
     pub id: u32,
     pub records: Vec<(u32, Vec<u64>)>,
     pub blocks: Vec<Block>,
+}
+
+#[derive(Clone, Debug)]
+enum AbOp {
+    Literal(u64),
+    Fixed(u32),
+    Vbr(u32),
+    ArrayFixed(u32),
+    ArrayVbr(u32),
 }
 
 impl Block {
@@ -57,6 +66,7 @@ impl Reader<'_> {
     }
     fn block(&mut self, id: u32, width: u32, end_bit: Option<usize>) -> Block {
         let mut blk = Block { id, ..Default::default() };
+        let mut abbrevs: Vec<Vec<AbOp>> = Vec::new();
         loop {
             if end_bit.is_none() && self.pos + width as usize > self.b.len() * 8 {
                 return blk;
@@ -77,13 +87,70 @@ impl Reader<'_> {
                     let end = self.pos + words * 32;
                     blk.blocks.push(self.block(sub, w, Some(end)));
                 }
+                2 => {
+                    let n = self.vbr(5);
+                    let mut ops = Vec::new();
+                    let mut i = 0;
+                    while i < n {
+                        if self.fixed(1) == 1 {
+                            ops.push(AbOp::Literal(self.vbr(8)));
+                            i += 1;
+                        } else {
+                            match self.fixed(3) {
+                                1 => {
+                                    ops.push(AbOp::Fixed(self.vbr(5) as u32));
+                                    i += 1;
+                                }
+                                2 => {
+                                    ops.push(AbOp::Vbr(self.vbr(5) as u32));
+                                    i += 1;
+                                }
+                                3 => {
+                                    assert_eq!(self.fixed(1), 0, "array element must be encoded");
+                                    match self.fixed(3) {
+                                        1 => ops.push(AbOp::ArrayFixed(self.vbr(5) as u32)),
+                                        2 => ops.push(AbOp::ArrayVbr(self.vbr(5) as u32)),
+                                        e => panic!("unsupported array elem encoding {e}"),
+                                    }
+                                    i += 2;
+                                }
+                                e => panic!("unsupported abbrev encoding {e}"),
+                            }
+                        }
+                    }
+                    abbrevs.push(ops);
+                }
                 3 => {
                     let code = self.vbr(6) as u32;
                     let n = self.vbr(6);
                     let ops = (0..n).map(|_| self.vbr(6)).collect();
                     blk.records.push((code, ops));
                 }
-                a => panic!("unexpected abbreviation id {a}"),
+                a => {
+                    let ab = abbrevs.get((a - 4) as usize).unwrap_or_else(|| panic!("unknown abbreviation id {a}"));
+                    let mut vals = Vec::new();
+                    for op in ab {
+                        match *op {
+                            AbOp::Literal(v) => vals.push(v),
+                            AbOp::Fixed(w) => vals.push(self.fixed(w)),
+                            AbOp::Vbr(w) => vals.push(self.vbr(w)),
+                            AbOp::ArrayFixed(w) => {
+                                let len = self.vbr(6);
+                                for _ in 0..len {
+                                    vals.push(self.fixed(w));
+                                }
+                            }
+                            AbOp::ArrayVbr(w) => {
+                                let len = self.vbr(6);
+                                for _ in 0..len {
+                                    vals.push(self.vbr(w));
+                                }
+                            }
+                        }
+                    }
+                    let code = vals[0] as u32;
+                    blk.records.push((code, vals[1..].to_vec()));
+                }
             }
         }
     }

@@ -6,6 +6,14 @@ use super::lower::Lw;
 use super::module::{BinOp, Pred, Value};
 use super::ops_core::op;
 
+/// Native RDNA float lowering (`XCL_RDNA_FLOAT`, default on, `=0` disables): emits single-op
+/// `dx.op.unary(Frc)` for `v_fract_f32` and eliminates redundant `== 0` checks in `mul_legacy` /
+/// `fma_legacy` whenever an operand is a known finite non-zero (or zero) constant.
+pub fn rdna_float_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_RDNA_FLOAT").map_or(true, |v| v.trim() != "0"))
+}
+
 impl Lw {
     /// `cvt_u32`: NaN / ≤ 0 → 0, ≥ 2^32 → 0xFFFFFFFF.
     pub fn cvt_u32(&mut self, f: Value) -> Value {
@@ -69,8 +77,12 @@ impl Lw {
         let one = self.u(c);
         self.sub(h, one)
     }
+
     /// `fract_f`: x - floor(x), below 1.0.
     pub fn fract_f(&mut self, x: Value) -> Value {
+        if rdna_float_enabled() {
+            return self.un(op::FRC, x);
+        }
         let fl = self.un(op::ROUND_NI, x);
         let r = self.fsub(x, fl);
         let one = self.fc(1.0);
@@ -219,6 +231,16 @@ impl Lw {
     }
     /// `mul_legacy`: 0 · anything = 0.
     pub fn mul_legacy(&mut self, a: Value, b: Value) -> Value {
+        if rdna_float_enabled() {
+            let ca = self.s.m.const_f32(a);
+            let cb = self.s.m.const_f32(b);
+            if ca == Some(0.0) || cb == Some(0.0) {
+                return self.fc(0.0);
+            }
+            if ca.is_some_and(|x| x.is_finite() && x != 0.0) || cb.is_some_and(|x| x.is_finite() && x != 0.0) {
+                return self.fmul(a, b);
+            }
+        }
         let z = self.fc(0.0);
         let az = self.fcmp(Pred::FOEq, a, z);
         let bz = self.fcmp(Pred::FOEq, b, z);
@@ -234,6 +256,16 @@ impl Lw {
     }
     /// `fma_legacy`: (a == 0 || b == 0) ? c : mad(a, b, c).
     pub fn fma_legacy(&mut self, a: Value, b: Value, c: Value) -> Value {
+        if rdna_float_enabled() {
+            let ca = self.s.m.const_f32(a);
+            let cb = self.s.m.const_f32(b);
+            if ca == Some(0.0) || cb == Some(0.0) {
+                return c;
+            }
+            if ca.is_some_and(|x| x.is_finite() && x != 0.0) || cb.is_some_and(|x| x.is_finite() && x != 0.0) {
+                return self.fmad(a, b, c);
+            }
+        }
         let z = self.fc(0.0);
         let az = self.fcmp(Pred::FOEq, a, z);
         let bz = self.fcmp(Pred::FOEq, b, z);

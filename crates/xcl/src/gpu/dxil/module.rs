@@ -13,7 +13,7 @@
 
 use std::collections::HashMap;
 
-use super::bitstream::{signed, BitWriter};
+use super::bitstream::{signed, AbbrevOp, BitWriter};
 
 mod opt;
 pub(super) mod split;
@@ -58,6 +58,9 @@ enum ConstDef {
     Undef(Ty),
     Null(Ty),
     Aggregate(Ty, Vec<Value>),
+    /// Packed `i32` constant array (`CST_CODE_DATA = 22`), avoiding per-element `CST_CODE_INTEGER`
+    /// interning for large lookup tables (e.g. `compact.rs`).
+    DataI32(Ty, Vec<u32>),
 }
 
 #[derive(Clone)]
@@ -468,6 +471,16 @@ impl Module {
         self.constant(ConstDef::Aggregate(ty, elems.to_vec()))
     }
 
+    /// Packed `[N x i32]` constant data array (`CST_CODE_DATA`), avoiding interning each element.
+    pub fn const_data_i32(&mut self, words: &[u32]) -> Value {
+        let i32 = self.i32();
+        let at = self.array(words.len() as u64, i32);
+        if words.is_empty() {
+            return self.null(at);
+        }
+        self.constant(ConstDef::DataI32(at, words.to_vec()))
+    }
+
     // ---- functions and globals
 
     /// Declares (or finds) a function by name.
@@ -517,7 +530,12 @@ impl Module {
                 self.ptr(t, 0)
             }
             Value::Const(c) => match &self.consts[c as usize] {
-                ConstDef::Int(t, _) | ConstDef::Float(t, _) | ConstDef::Undef(t) | ConstDef::Null(t) | ConstDef::Aggregate(t, _) => *t,
+                ConstDef::Int(t, _)
+                | ConstDef::Float(t, _)
+                | ConstDef::Undef(t)
+                | ConstDef::Null(t)
+                | ConstDef::Aggregate(t, _)
+                | ConstDef::DataI32(t, _) => *t,
             },
             Value::Inst(i) => self.insts[i as usize].ty,
         }
@@ -837,34 +855,59 @@ impl Module {
         // are dropped. Value numbering follows that order.
         let (order, pos) = self.block_layout();
 
-        // Global variables nothing references (e.g. an exchange array the code never
-        // needed) are left out: the validator rejects unused internal declarations.
-        // Likewise declarations of functions no longer called (after `optimize`).
+        // Global variables, functions, and constants nothing references (after `optimize`)
+        // are left out: the validator rejects unused internal globals, and pruning dead
+        // constants shrinks both `BLOCK_CONSTANTS` and every relative operand ID in `FUNCTION`.
         let mut gused = vec![false; self.globals.len()];
         let mut fused: Vec<bool> = self.funcs.iter().map(|f| f.defined).collect();
+        let mut cused = vec![false; self.consts.len()];
         {
-            let mut mark = |v: Value| match v {
-                Value::Global(g) => gused[g as usize] = true,
+            let mut work_g: Vec<usize> = Vec::new();
+            let mut work_c: Vec<usize> = Vec::new();
+            let mark = |v: Value, gused: &mut [bool], fused: &mut [bool], cused: &mut [bool], work_g: &mut Vec<usize>, work_c: &mut Vec<usize>| match v {
+                Value::Global(g) => {
+                    let g = g as usize;
+                    if !gused[g] {
+                        gused[g] = true;
+                        work_g.push(g);
+                    }
+                }
                 Value::Func(f) => fused[f as usize] = true,
-                _ => {}
+                Value::Const(c) => {
+                    let c = c as usize;
+                    if !cused[c] {
+                        cused[c] = true;
+                        work_c.push(c);
+                    }
+                }
+                Value::Inst(_) => {}
             };
             for &b in &order {
                 for &i in &self.blocks[b] {
                     let op = &self.insts[i as usize].op;
                     if let Op::Call(f, _) = op {
-                        mark(Value::Func(*f));
+                        mark(Value::Func(*f), &mut gused, &mut fused, &mut cused, &mut work_g, &mut work_c);
                     }
-                    op.for_each_operand(&mut mark);
-                }
-            }
-            for c in &self.consts {
-                if let ConstDef::Aggregate(_, e) = c {
-                    e.iter().copied().for_each(&mut mark);
+                    op.for_each_operand(|v| mark(v, &mut gused, &mut fused, &mut cused, &mut work_g, &mut work_c));
                 }
             }
             for m in &self.md {
                 if let MdDef::Val(_, v) = m {
-                    mark(*v);
+                    mark(*v, &mut gused, &mut fused, &mut cused, &mut work_g, &mut work_c);
+                }
+            }
+            while !work_g.is_empty() || !work_c.is_empty() {
+                while let Some(g) = work_g.pop() {
+                    if let Some(init) = self.globals[g].init {
+                        mark(init, &mut gused, &mut fused, &mut cused, &mut work_g, &mut work_c);
+                    }
+                }
+                while let Some(c) = work_c.pop() {
+                    if let ConstDef::Aggregate(_, e) = &self.consts[c] {
+                        for &v in e {
+                            mark(v, &mut gused, &mut fused, &mut cused, &mut work_g, &mut work_c);
+                        }
+                    }
                 }
             }
         }
@@ -886,7 +929,15 @@ impl Module {
             }
         }
         let fmap = &fmap;
-        let n_consts = self.consts.len() as u64;
+        let mut cmap: Vec<Option<u64>> = vec![None; self.consts.len()];
+        let mut n_consts = 0u64;
+        for (c, used) in cused.iter().enumerate() {
+            if *used {
+                cmap[c] = Some(n_consts);
+                n_consts += 1;
+            }
+        }
+        let cmap = &cmap;
         let const_base = n_globals + n_funcs;
         let inst_base = const_base + n_consts;
 
@@ -907,7 +958,7 @@ impl Module {
             match v {
                 Value::Global(g) => gmap[g as usize].expect("use of a dropped global"),
                 Value::Func(f) => n_globals + fmap[f as usize].expect("use of a dropped function"),
-                Value::Const(c) => const_base + c as u64,
+                Value::Const(c) => const_base + cmap[c as usize].expect("use of a dropped constant"),
                 Value::Inst(i) => inst_ids[i as usize].unwrap_or_else(|| {
                     self.fail(format!("use of a void instruction %{i}"));
                     0
@@ -962,25 +1013,44 @@ impl Module {
         }
 
         // Module-level constants.
-        if !self.consts.is_empty() {
+        if n_consts > 0 {
+            const ABBREV_CST_INT: &[AbbrevOp] = &[AbbrevOp::Literal(CST_CODE_INTEGER as u64), AbbrevOp::Vbr(6)];
+            const ABBREV_CST_F32: &[AbbrevOp] = &[AbbrevOp::Literal(CST_CODE_FLOAT as u64), AbbrevOp::Fixed(32)];
+            const ABBREV_CST_DATA: &[AbbrevOp] = &[AbbrevOp::Literal(CST_CODE_DATA as u64), AbbrevOp::ArrayFixed(32)];
             w.enter_block(BLOCK_CONSTANTS);
+            let ab_int = w.define_abbrev(ABBREV_CST_INT);
+            let ab_f32 = w.define_abbrev(ABBREV_CST_F32);
+            let ab_data = w.define_abbrev(ABBREV_CST_DATA);
             let mut cur_ty = None;
-            for c in &self.consts {
+            for (ci, c) in self.consts.iter().enumerate() {
+                if !cused[ci] {
+                    continue;
+                }
                 let t = match c {
-                    ConstDef::Int(t, _) | ConstDef::Float(t, _) | ConstDef::Undef(t) | ConstDef::Null(t) | ConstDef::Aggregate(t, _) => *t,
+                    ConstDef::Int(t, _)
+                    | ConstDef::Float(t, _)
+                    | ConstDef::Undef(t)
+                    | ConstDef::Null(t)
+                    | ConstDef::Aggregate(t, _)
+                    | ConstDef::DataI32(t, _) => *t,
                 };
                 if cur_ty != Some(t) {
                     w.record(CST_CODE_SETTYPE, &[t.0 as u64]);
                     cur_ty = Some(t);
                 }
                 match c {
-                    ConstDef::Int(_, v) => w.record(CST_CODE_INTEGER, &[signed(*v)]),
+                    ConstDef::Int(_, v) => w.emit_abbrev(ab_int, ABBREV_CST_INT, &[signed(*v)]),
+                    ConstDef::Float(_, bits) if *bits <= u32::MAX as u64 => w.emit_abbrev(ab_f32, ABBREV_CST_F32, &[*bits]),
                     ConstDef::Float(_, bits) => w.record(CST_CODE_FLOAT, &[*bits]),
                     ConstDef::Undef(_) => w.record(CST_CODE_UNDEF, &[]),
                     ConstDef::Null(_) => w.record(CST_CODE_NULL, &[]),
                     ConstDef::Aggregate(_, e) => {
                         let ops: Vec<u64> = e.iter().map(|&v| abs(v)).collect();
                         w.record(CST_CODE_AGGREGATE, &ops)
+                    }
+                    ConstDef::DataI32(_, words) => {
+                        let ops: Vec<u64> = words.iter().map(|&x| x as u64).collect();
+                        w.emit_abbrev(ab_data, ABBREV_CST_DATA, &ops);
                     }
                 }
             }
@@ -1022,15 +1092,16 @@ impl Module {
         }
         w.end_block();
 
-        // The entry's body.
-        w.enter_block(BLOCK_FUNCTION);
+        // The entry's body (abbrev width 4 -> 12 user abbreviations for hot DXIL opcodes).
+        w.enter_block_with_width(BLOCK_FUNCTION, 4);
+        let ab = FuncAbbrevs::define(&mut w);
         w.record(FUNC_CODE_DECLAREBLOCKS, &[order.len() as u64]);
         let mut inst_id = inst_base;
         let mut operands = Vec::new();
         for &b in &order {
             for k in 0..self.blocks[b].len() {
                 let i = self.blocks[b][k] as usize;
-                self.write_inst(&mut w, i, inst_id, &abs, &pos, &mut operands);
+                self.write_inst(&mut w, &ab, i, inst_id, &abs, &pos, &mut operands);
                 if !self.is_void(self.insts[i].ty) {
                     inst_id += 1;
                 }
@@ -1184,6 +1255,7 @@ impl Module {
     fn write_inst(
         &self,
         w: &mut BitWriter,
+        ab: &FuncAbbrevs,
         i: usize,
         inst_id: u64,
         abs: &dyn Fn(Value) -> u64,
@@ -1209,21 +1281,22 @@ impl Module {
         ops.clear();
         match &self.insts[i].op {
             Op::Bin(op, a, b, flags) => {
-                ops.extend_from_slice(&[rel(*a), rel(*b), *op as u64]);
-                if *flags != 0 {
-                    ops.push(*flags);
+                if *flags == 0 {
+                    w.emit_abbrev(ab.binop, ABBREV_BINOP, &[rel(*a), rel(*b), *op as u64]);
+                } else {
+                    ops.extend_from_slice(&[rel(*a), rel(*b), *op as u64, *flags]);
+                    w.record(FUNC_CODE_INST_BINOP, ops);
                 }
-                w.record(FUNC_CODE_INST_BINOP, ops)
             }
-            Op::Cast(op, v, t) => w.record(FUNC_CODE_INST_CAST, &[rel(*v), t.0 as u64, *op as u64]),
-            Op::Cmp(p, a, b) => w.record(FUNC_CODE_INST_CMP2, &[rel(*a), rel(*b), *p as u64]),
-            Op::Select(c, t, f) => w.record(FUNC_CODE_INST_VSELECT, &[rel(*t), rel(*f), rel(*c)]),
-            Op::Extract(a, idx) => w.record(FUNC_CODE_INST_EXTRACTVAL, &[rel(*a), *idx as u64]),
+            Op::Cast(op, v, t) => w.emit_abbrev(ab.cast, ABBREV_CAST, &[rel(*v), t.0 as u64, *op as u64]),
+            Op::Cmp(p, a, b) => w.emit_abbrev(ab.cmp2, ABBREV_CMP2, &[rel(*a), rel(*b), *p as u64]),
+            Op::Select(c, t, f) => w.emit_abbrev(ab.vselect, ABBREV_VSELECT, &[rel(*t), rel(*f), rel(*c)]),
+            Op::Extract(a, idx) => w.emit_abbrev(ab.extract, ABBREV_EXTRACT, &[rel(*a), *idx as u64]),
             Op::Call(f, args) => {
                 let fd = &self.funcs[*f as usize];
-                ops.extend_from_slice(&[0, 1 << 15, fd.ty.0 as u64, rel(Value::Func(*f))]);
+                ops.extend_from_slice(&[fd.ty.0 as u64, rel(Value::Func(*f))]);
                 ops.extend(args.iter().map(|&a| rel(a)));
-                w.record(FUNC_CODE_INST_CALL, ops)
+                w.emit_abbrev(ab.call, ABBREV_CALL, ops);
             }
             Op::Phi(inc) => {
                 ops.push(self.insts[i].ty.0 as u64);
@@ -1232,22 +1305,30 @@ impl Module {
                     ops.push(signed(inst_id as i64 - abs(v) as i64));
                     ops.push(bb(b));
                 }
-                w.record(FUNC_CODE_INST_PHI, ops)
+                w.emit_abbrev(ab.phi, ABBREV_PHI, ops);
             }
             Op::Load(p, align) => {
                 let a = if *align == 0 { 0 } else { align.trailing_zeros() as u64 + 1 };
-                w.record(FUNC_CODE_INST_LOAD, &[rel(*p), self.insts[i].ty.0 as u64, a, 0])
+                if a == 3 {
+                    w.emit_abbrev(ab.load, ABBREV_LOAD, &[rel(*p), self.insts[i].ty.0 as u64]);
+                } else {
+                    w.record(FUNC_CODE_INST_LOAD, &[rel(*p), self.insts[i].ty.0 as u64, a, 0]);
+                }
             }
             Op::Store(p, v, align) => {
                 let a = if *align == 0 { 0 } else { align.trailing_zeros() as u64 + 1 };
-                w.record(FUNC_CODE_INST_STORE, &[rel(*p), rel(*v), a, 0])
+                if a == 3 {
+                    w.emit_abbrev(ab.store, ABBREV_STORE, &[rel(*p), rel(*v)]);
+                } else {
+                    w.record(FUNC_CODE_INST_STORE, &[rel(*p), rel(*v), a, 0]);
+                }
             }
             Op::Gep(p, idx) => {
                 let pt = self.value_ty(*p);
                 let (src, _) = self.pointee_of(pt).unwrap_or((pt, 0));
-                ops.extend_from_slice(&[1, src.0 as u64, rel(*p)]);
+                ops.extend_from_slice(&[src.0 as u64, rel(*p)]);
                 ops.extend(idx.iter().map(|&v| rel(v)));
-                w.record(FUNC_CODE_INST_GEP, ops)
+                w.emit_abbrev(ab.gep, ABBREV_GEP, ops);
             }
             Op::AtomicRmw(op, p, v) => {
                 // [ptr, val, op, vol, ordering, synchscope (crossthread = 1)]
@@ -1263,8 +1344,8 @@ impl Module {
                 let a = align.trailing_zeros() as u64 + 1;
                 w.record(FUNC_CODE_INST_ALLOCA, &[t.0 as u64, i32t.0 as u64, abs(*n), a | 1 << 6])
             }
-            Op::Br(b) => w.record(FUNC_CODE_INST_BR, &[bb(*b)]),
-            Op::CondBr(c, t, f) => w.record(FUNC_CODE_INST_BR, &[bb(*t), bb(*f), rel(*c)]),
+            Op::Br(b) => w.emit_abbrev(ab.br, ABBREV_BR, &[bb(*b)]),
+            Op::CondBr(c, t, f) => w.emit_abbrev(ab.condbr, ABBREV_CONDBR, &[bb(*t), bb(*f), rel(*c)]),
             Op::Switch(v, d, cases) => {
                 ops.extend_from_slice(&[self.value_ty(*v).0 as u64, rel(*v), bb(*d)]);
                 for &(c, b) in cases {
@@ -1284,7 +1365,12 @@ impl Module {
             Value::Global(g) => self.globals[g as usize].ptr,
             Value::Func(f) => self.type_ids[&TypeDef::Ptr(self.funcs[f as usize].ty, 0)],
             Value::Const(c) => match &self.consts[c as usize] {
-                ConstDef::Int(t, _) | ConstDef::Float(t, _) | ConstDef::Undef(t) | ConstDef::Null(t) | ConstDef::Aggregate(t, _) => *t,
+                ConstDef::Int(t, _)
+                | ConstDef::Float(t, _)
+                | ConstDef::Undef(t)
+                | ConstDef::Null(t)
+                | ConstDef::Aggregate(t, _)
+                | ConstDef::DataI32(t, _) => *t,
             },
             Value::Inst(i) => self.insts[i as usize].ty,
         }
@@ -1343,6 +1429,7 @@ const CST_CODE_UNDEF: u32 = 3;
 const CST_CODE_INTEGER: u32 = 4;
 const CST_CODE_FLOAT: u32 = 6;
 const CST_CODE_AGGREGATE: u32 = 7;
+const CST_CODE_DATA: u32 = 22;
 
 const METADATA_STRING: u32 = 1;
 const METADATA_VALUE: u32 = 2;
@@ -1370,6 +1457,66 @@ const FUNC_CODE_INST_ATOMICRMW: u32 = 38;
 const FUNC_CODE_INST_GEP: u32 = 43;
 const FUNC_CODE_INST_STORE: u32 = 44;
 const FUNC_CODE_INST_CMPXCHG: u32 = 46;
+
+const ABBREV_BINOP: &[AbbrevOp] = &[AbbrevOp::Literal(FUNC_CODE_INST_BINOP as u64), AbbrevOp::Vbr(5), AbbrevOp::Vbr(5), AbbrevOp::Fixed(4)];
+const ABBREV_CAST: &[AbbrevOp] = &[AbbrevOp::Literal(FUNC_CODE_INST_CAST as u64), AbbrevOp::Vbr(5), AbbrevOp::Vbr(5), AbbrevOp::Fixed(4)];
+const ABBREV_CMP2: &[AbbrevOp] = &[AbbrevOp::Literal(FUNC_CODE_INST_CMP2 as u64), AbbrevOp::Vbr(5), AbbrevOp::Vbr(5), AbbrevOp::Fixed(6)];
+const ABBREV_VSELECT: &[AbbrevOp] = &[AbbrevOp::Literal(FUNC_CODE_INST_VSELECT as u64), AbbrevOp::Vbr(5), AbbrevOp::Vbr(5), AbbrevOp::Vbr(5)];
+const ABBREV_EXTRACT: &[AbbrevOp] = &[AbbrevOp::Literal(FUNC_CODE_INST_EXTRACTVAL as u64), AbbrevOp::Vbr(5), AbbrevOp::Vbr(4)];
+const ABBREV_LOAD: &[AbbrevOp] = &[AbbrevOp::Literal(FUNC_CODE_INST_LOAD as u64), AbbrevOp::Vbr(6), AbbrevOp::Vbr(5), AbbrevOp::Literal(3), AbbrevOp::Literal(0)];
+const ABBREV_STORE: &[AbbrevOp] = &[AbbrevOp::Literal(FUNC_CODE_INST_STORE as u64), AbbrevOp::Vbr(6), AbbrevOp::Vbr(5), AbbrevOp::Literal(3), AbbrevOp::Literal(0)];
+const ABBREV_BR: &[AbbrevOp] = &[AbbrevOp::Literal(FUNC_CODE_INST_BR as u64), AbbrevOp::Vbr(6)];
+const ABBREV_CONDBR: &[AbbrevOp] = &[AbbrevOp::Literal(FUNC_CODE_INST_BR as u64), AbbrevOp::Vbr(6), AbbrevOp::Vbr(6), AbbrevOp::Vbr(5)];
+const ABBREV_CALL: &[AbbrevOp] = &[
+    AbbrevOp::Literal(FUNC_CODE_INST_CALL as u64),
+    AbbrevOp::Literal(0),
+    AbbrevOp::Literal(1 << 15),
+    AbbrevOp::Vbr(5),
+    AbbrevOp::Vbr(6),
+    AbbrevOp::ArrayVbr(5),
+];
+const ABBREV_PHI: &[AbbrevOp] = &[AbbrevOp::Literal(FUNC_CODE_INST_PHI as u64), AbbrevOp::Vbr(5), AbbrevOp::ArrayVbr(6)];
+const ABBREV_GEP: &[AbbrevOp] = &[
+    AbbrevOp::Literal(FUNC_CODE_INST_GEP as u64),
+    AbbrevOp::Literal(1),
+    AbbrevOp::Vbr(5),
+    AbbrevOp::Vbr(5),
+    AbbrevOp::ArrayVbr(5),
+];
+
+struct FuncAbbrevs {
+    binop: u32,
+    cast: u32,
+    cmp2: u32,
+    vselect: u32,
+    extract: u32,
+    load: u32,
+    store: u32,
+    br: u32,
+    condbr: u32,
+    call: u32,
+    phi: u32,
+    gep: u32,
+}
+
+impl FuncAbbrevs {
+    fn define(w: &mut BitWriter) -> Self {
+        Self {
+            binop: w.define_abbrev(ABBREV_BINOP),
+            cast: w.define_abbrev(ABBREV_CAST),
+            cmp2: w.define_abbrev(ABBREV_CMP2),
+            vselect: w.define_abbrev(ABBREV_VSELECT),
+            extract: w.define_abbrev(ABBREV_EXTRACT),
+            load: w.define_abbrev(ABBREV_LOAD),
+            store: w.define_abbrev(ABBREV_STORE),
+            br: w.define_abbrev(ABBREV_BR),
+            condbr: w.define_abbrev(ABBREV_CONDBR),
+            call: w.define_abbrev(ABBREV_CALL),
+            phi: w.define_abbrev(ABBREV_PHI),
+            gep: w.define_abbrev(ABBREV_GEP),
+        }
+    }
+}
 
 // ------------------------------------------------------- introspection
 
@@ -1511,6 +1658,23 @@ impl Module {
                 ConstDef::Int(t, x) => {
                     let w = self.int_width(*t)?;
                     Some(if w >= 64 { *x as u64 } else { (*x as u64) & ((1u64 << w) - 1) })
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// The `f32` value of a float constant (also unwraps `bitcast i32_const to float`).
+    pub fn const_f32(&self, v: Value) -> Option<f32> {
+        match v {
+            Value::Const(c) => match &self.consts[c as usize] {
+                ConstDef::Float(t, bits) if matches!(self.types[t.0 as usize], TypeDef::Float) => Some(f32::from_bits(*bits as u32)),
+                _ => None,
+            },
+            Value::Inst(i) => match self.insts[i as usize].op {
+                Op::Cast(CastOp::BitCast, src, to) if matches!(self.types[to.0 as usize], TypeDef::Float) => {
+                    self.const_u64(src).map(|b| f32::from_bits(b as u32))
                 }
                 _ => None,
             },

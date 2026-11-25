@@ -239,6 +239,10 @@ pub struct Lw {
     pub static_used: Vec<([u32; 4], bool, super::ops::Sampler)>,
     pub sampler_base: u32,
     pub exec_cache: HashMap<(Block, Value, Value), Value>,
+    /// dynamic block-start PC `(blk_pc_val, rep_blk_pc)` when lowering compact `S_GETPC_B64` blocks
+    pub compact_blk_pc: Option<(Value, u64)>,
+    /// dynamic 32-bit literal value when lowering a single-literal parameterized compact block
+    pub compact_lit: Option<Value>,
     /// groupshared exchange words of the split form
     /// split form: the halves' exchange words (storage, first index) and the lane counter
     pub xs: Option<(super::ops::GroupShared, u32)>,
@@ -713,6 +717,10 @@ impl Lw {
     }
 
     /// 32-bit value of a scalar source code (0..255) or VALU source (256+ = VGPR).
+    fn lit_c(&mut self, lit: u32) -> Value {
+        self.compact_lit.unwrap_or_else(|| self.c(lit))
+    }
+
     pub fn code32(&mut self, code: u64, lit: Option<u32>, f16: bool) -> Option<Value> {
         Some(match code {
             0..=124 | 126 | 127 => self.sreg(code),
@@ -736,7 +744,7 @@ impl Lw {
                 self.u(z)
             }
             253 => self.scc(),
-            255 => self.c(lit?),
+            255 => self.lit_c(lit?),
             256..=511 => self.vreg(code - 256),
             235..=238 => self.c(0),
             239 => self.c(0x7FFF_FFFF),
@@ -760,9 +768,9 @@ impl Lw {
             251 | 252 | 253 => (self.code32(code, None, false)?, self.c(0)),
             255 => {
                 if f64 {
-                    (self.c(0), self.c(lit?))
+                    (self.c(0), self.lit_c(lit?))
                 } else {
-                    (self.c(lit?), self.c(0))
+                    (self.lit_c(lit?), self.c(0))
                 }
             }
             256..=510 => (self.vreg(code - 256), self.vreg(code - 255)),
@@ -779,7 +787,7 @@ impl Lw {
 
     pub fn read(&mut self, d: &Decoded, o: &Operand, f16: bool) -> Option<Value> {
         match o.field {
-            Some("LITERAL") => Some(self.c(d.literal?)),
+            Some("LITERAL") => Some(self.lit_c(d.literal?)),
             Some(f) => {
                 let v = Self::field(d, f);
                 let width = d.enc.field_width(f);
@@ -788,7 +796,7 @@ impl Lw {
                 }
                 match o.ty {
                     "OPR_SIMM16" => Some(self.c(v as u32)),
-                    "OPR_SIMM32" => Some(self.c(d.literal?)),
+                    "OPR_SIMM32" => Some(self.lit_c(d.literal?)),
                     _ => self.code32(v, d.literal, f16),
                 }
             }
@@ -1349,9 +1357,15 @@ impl Lw {
         if name == "s_getpc_b64" {
             // the code region is addressed from 0 – with constant data after the program and
             // several memory windows, above them all (`rodata_loads`), as the HLSL kernel
-            let pc = d.pc + d.len as u64;
+            let lo = match self.compact_blk_pc {
+                Some((blk_pc, rep_blk_pc)) => {
+                    let rel = (d.pc + d.len as u64).wrapping_sub(rep_blk_pc) as u32;
+                    if rel == 0 { blk_pc } else { self.addc(blk_pc, rel) }
+                }
+                None => self.c((d.pc + d.len as u64) as u32),
+            };
             let code_hi = if self.rodata.is_empty() || !self.windowed() { 0 } else { crate::gpu::recomp::CODE_ADDRESS_HI };
-            let (lo, hi) = (self.c(pc as u32), self.c(code_hi));
+            let hi = self.c(code_hi);
             self.write64(&dst, lo, hi);
             return Ok(());
         }

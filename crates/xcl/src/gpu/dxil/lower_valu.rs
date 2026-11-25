@@ -1324,8 +1324,31 @@ impl Lw {
         })
     }
 
-    /// The recompiler's `float_compare`: NaN tested explicitly.
+    /// Float compare: single-instruction IEEE-754 ordered/unordered `fcmp` for `f32`,
+    /// explicit `isnan_d` for `f64`.
     pub fn float_compare(&mut self, opn: &str, a: Value, b: Value) -> Option<Value> {
+        let is_f32 = self.s.m.type_of(a) == self.s.m.f32();
+        if is_f32 {
+            return Some(match opn {
+                "f" => self.b(false),
+                "t" | "tru" => self.b(true),
+                "lt" => self.fcmp(Pred::FOLt, a, b),
+                "eq" => self.fcmp(Pred::FOEq, a, b),
+                "le" => self.fcmp(Pred::FOLe, a, b),
+                "gt" => self.fcmp(Pred::FOGt, a, b),
+                "ge" => self.fcmp(Pred::FOGe, a, b),
+                "lg" => self.fcmp(Pred::FONe, a, b),
+                "o" => self.fcmp(Pred::FOrd, a, b),
+                "u" => self.fcmp(Pred::FUno, a, b),
+                "nlt" => self.fcmp(Pred::FUGe, a, b),
+                "neq" => self.fcmp(Pred::FUNe, a, b),
+                "nle" => self.fcmp(Pred::FUGt, a, b),
+                "ngt" => self.fcmp(Pred::FULe, a, b),
+                "nge" => self.fcmp(Pred::FULt, a, b),
+                "nlg" => self.fcmp(Pred::FUEq, a, b),
+                _ => return None,
+            });
+        }
         let rel = |s: &mut Self, r: &str| -> Option<Value> {
             Some(match r {
                 "lt" => s.fcmp(Pred::FOLt, a, b),

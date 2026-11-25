@@ -213,7 +213,7 @@ fn gpu_compact_inline_table_above_old_cap_checks_late_entries() {
     let leaders = cfg.blocks.iter().filter_map(|b| b.insts.first().map(|&i| cfg.insts[i].pc)).collect();
     let lw = super::lower::Lw::new(&cfg.insts, &leaders, o, &super::kernel::Entry::Kernel);
     let p = super::compact::automatic_plan(&cfg, &lw, false).unwrap();
-    assert!(p.inline && p.words() > 8192 && p.words() <= 12288);
+    assert!(p.inline && p.order.len() > 16384 && p.words() <= 12288);
     let k = translate_full(&code, o).unwrap();
     for initial in [0u32, u32::MAX - 1, 0u32.wrapping_sub(COPIES as u32), 0u32.wrapping_sub((2 * COPIES) as u32), 0u32.wrapping_sub(COPIES as u32 + 1)] {
         let mut st = KernelState::default();

@@ -1,21 +1,30 @@
 //! LLVM bitstream writer: fixed and VBR fields, nested blocks with
-//! back-patched lengths, and unabbreviated records.
-//!
-//! DXIL accepts the plain bitstream container without any abbreviations,
-//! which keeps the writer small; size is not a concern for shader modules
-//! (the driver re-encodes them anyway).
+//! back-patched lengths, unabbreviated records, and LLVM `DEFINE_ABBREV`
+//! abbreviations for compact DXIL encoding.
 
 /// Bit-level writer, little-endian within 32-bit words as LLVM defines.
 pub struct BitWriter {
     out: Vec<u8>,
     acc: u64,
     nbits: u32,
-    /// Open blocks: (byte offset of the length word, outer abbreviation width).
-    blocks: Vec<(usize, u32)>,
+    /// Open blocks: (byte offset of the length word, outer abbreviation width, next abbrev id).
+    blocks: Vec<(usize, u32, u32)>,
     width: u32,
 }
 
-/// Abbreviation width used for every block we open (IDs 0..3 need 2 bits).
+/// Abbreviation operand encoding for LLVM `DEFINE_ABBREV` records.
+#[derive(Clone, Copy, Debug)]
+pub enum AbbrevOp {
+    Literal(u64),
+    Fixed(u32),
+    Vbr(u32),
+    /// Trailing array of fixed-width operands (LLVM `Array` + `Fixed(w)` pair).
+    ArrayFixed(u32),
+    /// Trailing array of VBR-encoded operands (LLVM `Array` + `VBR(w)` pair).
+    ArrayVbr(u32),
+}
+
+/// Abbreviation width used for every block opened via [`BitWriter::enter_block`] (IDs 0..7).
 pub const ABBREV_WIDTH: u32 = 3;
 
 impl Default for BitWriter {
@@ -31,7 +40,7 @@ impl BitWriter {
 
     pub fn emit(&mut self, value: u64, width: u32) {
         debug_assert!(width <= 32);
-        debug_assert!(width == 64 || value >> width == 0, "value {value:#x} does not fit {width} bits");
+        debug_assert!(width == 64 || width == 32 || value >> width == 0, "value {value:#x} does not fit {width} bits");
         self.acc |= value << self.nbits;
         self.nbits += width;
         while self.nbits >= 8 {
@@ -60,23 +69,112 @@ impl BitWriter {
     }
 
     pub fn enter_block(&mut self, id: u32) {
+        self.enter_block_with_width(id, ABBREV_WIDTH);
+    }
+
+    pub fn enter_block_with_width(&mut self, id: u32, abbrev_width: u32) {
         self.emit(1, self.width); // ENTER_SUBBLOCK
         self.vbr(id as u64, 8);
-        self.vbr(ABBREV_WIDTH as u64, 4);
+        self.vbr(abbrev_width as u64, 4);
         self.align32();
         let at = self.out.len();
         self.out.extend_from_slice(&[0; 4]);
-        self.blocks.push((at, self.width));
-        self.width = ABBREV_WIDTH;
+        self.blocks.push((at, self.width, 4));
+        self.width = abbrev_width;
     }
 
     pub fn end_block(&mut self) {
         self.emit(0, self.width); // END_BLOCK
         self.align32();
-        let (at, outer) = self.blocks.pop().expect("end_block without enter_block");
+        let (at, outer, _) = self.blocks.pop().expect("end_block without enter_block");
         let words = ((self.out.len() - at - 4) / 4) as u32;
         self.out[at..at + 4].copy_from_slice(&words.to_le_bytes());
         self.width = outer;
+    }
+
+    /// Define a block-local abbreviation (`DEFINE_ABBREV = 2`) and return its ID (`>= 4`).
+    pub fn define_abbrev(&mut self, ops: &[AbbrevOp]) -> u32 {
+        let id = {
+            let top = self.blocks.last_mut().expect("define_abbrev outside block");
+            let id = top.2;
+            top.2 += 1;
+            id
+        };
+        debug_assert!((id as u64) < (1u64 << self.width), "abbrev id {id} exceeds width {}", self.width);
+        let num_ops: u64 = ops.iter().map(|o| if matches!(o, AbbrevOp::ArrayFixed(_) | AbbrevOp::ArrayVbr(_)) { 2 } else { 1 }).sum();
+        self.emit(2, self.width); // DEFINE_ABBREV
+        self.vbr(num_ops, 5);
+        for &op in ops {
+            match op {
+                AbbrevOp::Literal(v) => {
+                    self.emit(1, 1);
+                    self.vbr(v, 8);
+                }
+                AbbrevOp::Fixed(w) => {
+                    self.emit(0, 1);
+                    self.emit(1, 3);
+                    self.vbr(w as u64, 5);
+                }
+                AbbrevOp::Vbr(w) => {
+                    self.emit(0, 1);
+                    self.emit(2, 3);
+                    self.vbr(w as u64, 5);
+                }
+                AbbrevOp::ArrayFixed(w) => {
+                    self.emit(0, 1);
+                    self.emit(3, 3); // Array
+                    self.emit(0, 1);
+                    self.emit(1, 3); // Fixed element
+                    self.vbr(w as u64, 5);
+                }
+                AbbrevOp::ArrayVbr(w) => {
+                    self.emit(0, 1);
+                    self.emit(3, 3); // Array
+                    self.emit(0, 1);
+                    self.emit(2, 3); // VBR element
+                    self.vbr(w as u64, 5);
+                }
+            }
+        }
+        id
+    }
+
+    /// Emit an abbreviated record defined by [`Self::define_abbrev`]. `values` supplies only the
+    /// non-literal operands in order; if `ops` ends with `ArrayFixed`/`ArrayVbr`, remaining items
+    /// in `values` form the array payload.
+    pub fn emit_abbrev(&mut self, id: u32, ops: &[AbbrevOp], values: &[u64]) {
+        self.emit(id as u64, self.width);
+        let mut idx = 0usize;
+        for &op in ops {
+            match op {
+                AbbrevOp::Literal(_) => {}
+                AbbrevOp::Fixed(w) => {
+                    self.emit(values[idx], w);
+                    idx += 1;
+                }
+                AbbrevOp::Vbr(w) => {
+                    self.vbr(values[idx], w);
+                    idx += 1;
+                }
+                AbbrevOp::ArrayFixed(w) => {
+                    let rest = &values[idx..];
+                    self.vbr(rest.len() as u64, 6);
+                    for &v in rest {
+                        self.emit(v, w);
+                    }
+                    idx = values.len();
+                }
+                AbbrevOp::ArrayVbr(w) => {
+                    let rest = &values[idx..];
+                    self.vbr(rest.len() as u64, 6);
+                    for &v in rest {
+                        self.vbr(v, w);
+                    }
+                    idx = values.len();
+                }
+            }
+        }
+        debug_assert_eq!(idx, values.len());
     }
 
     /// An unabbreviated record.
@@ -151,5 +249,22 @@ mod tests {
         assert_eq!(signed(3), 6);
         assert_eq!(signed(-3), 7);
         assert_eq!(signed(i64::MIN), 1);
+    }
+
+    #[test]
+    fn define_abbrev_round_trips_fixed_vbr_and_arrays() {
+        const AB: &[AbbrevOp] = &[AbbrevOp::Literal(22), AbbrevOp::ArrayFixed(32)];
+        let mut w = BitWriter::new();
+        for b in [b'B', b'C', 0xC0, 0xDE] {
+            w.emit(b as u64, 8);
+        }
+        w.enter_block_with_width(11, 3);
+        let id = w.define_abbrev(AB);
+        assert_eq!(id, 4);
+        w.emit_abbrev(id, AB, &[0x1234_5678, 0xDEAD_BEEF]);
+        w.end_block();
+        let bc = w.finish();
+        assert_eq!(&bc[..4], b"BC\xC0\xDE");
+        assert_eq!(bc.len() % 4, 0);
     }
 }
