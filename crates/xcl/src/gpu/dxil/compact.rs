@@ -22,9 +22,7 @@ pub struct Plan {
 }
 
 /// Most 32-bit words of tables a program may need to take the form by itself.
-pub const TABLE_WORDS: usize = 8192;
-/// `TABLE_WORDS` on a GPU that runs only 32-lane waves.
-pub const TABLE_WORDS_WAVE32: usize = 12288;
+const MAX_TABLE_WORDS: usize = 12288;
 
 impl Plan {
     /// Bits of a table entry: the class, and the taken successor or the index of the pair of offsets.
@@ -48,11 +46,11 @@ pub(super) fn atomic_candidate(cfg: &Cfg) -> bool {
     })
 }
 
-pub fn automatic_plan(cfg: &Cfg, lw: &Lw, split_compute: bool, tables: usize) -> Option<Plan> {
+pub fn automatic_plan(cfg: &Cfg, lw: &Lw, split_compute: bool) -> Option<Plan> {
     let large = large(cfg);
     if !large && !(split_compute && atomic_candidate(cfg)) { return None; }
     let p = plan(cfg, lw)?;
-    if p.words() > tables { return None; }
+    if p.words() > MAX_TABLE_WORDS { return None; }
     let insts = |n: usize| cfg.blocks[p.order[n]].insts.len();
     let all: usize = (0..p.order.len()).map(insts).sum();
     let once: usize = p.rep.iter().map(|&n| insts(n)).sum();

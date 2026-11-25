@@ -91,33 +91,33 @@ pub fn compact_nest_tag() -> Option<String> {
 /// `translate_full` in the compact form (`compact = true`) or the plain one.
 #[cfg(test)]
 pub fn translate_full_as(code: &[u8], o: KernelOptions, compact: bool) -> Result<Kernel, String> {
-    translate_entry(code, o, Entry::Kernel, Some(compact), None, super::compact::TABLE_WORDS_WAVE32)
+    translate_entry(code, o, Entry::Kernel, Some(compact), None)
 }
 
 /// `translate_full` in the compact form with an explicit dispatch nesting policy.
 #[cfg(test)]
 pub fn translate_full_nested(code: &[u8], o: KernelOptions, nest: super::compact::Nest) -> Result<Kernel, String> {
-    translate_entry(code, o, Entry::Kernel, Some(true), Some(nest), super::compact::TABLE_WORDS_WAVE32)
+    translate_entry(code, o, Entry::Kernel, Some(true), Some(nest))
 }
 
 pub fn translate_full(code: &[u8], o: KernelOptions) -> Result<Kernel, String> {
-    translate_entry(code, o, Entry::Kernel, compact_mode(), None, super::compact::TABLE_WORDS_WAVE32)
+    translate_entry(code, o, Entry::Kernel, compact_mode(), None)
 }
 
 /// A mesh-mode (NGG) program: the first pass that writes one record per group into
 /// `res` (the recompiler's `Mode::Mesh`; the pass-through mesh shader draws them).
 pub fn translate_mesh(code: &[u8], o: KernelOptions, ms: &MsInterface) -> Result<Kernel, String> {
-    translate_entry(code, o, Entry::Mesh(ms.clone()), None, None, 0)
+    translate_entry(code, o, Entry::Mesh(ms.clone()), None, None)
 }
 
 /// A vertex shader (the recompiler's `Mode::Vertex`; wave-size independent).
 pub fn translate_vertex(code: &[u8], o: KernelOptions, vs: &VsInterface) -> Result<Kernel, String> {
-    translate_entry(code, o, Entry::Vertex(vs.clone()), None, None, 0)
+    translate_entry(code, o, Entry::Vertex(vs.clone()), None, None)
 }
 
 /// A pixel shader (the recompiler's `Mode::Pixel`; wave-size independent).
 pub fn translate_pixel(code: &[u8], o: KernelOptions, ps: &PsInterface) -> Result<Kernel, String> {
-    translate_entry(code, o, Entry::Pixel(ps.clone()), None, None, 0)
+    translate_entry(code, o, Entry::Pixel(ps.clone()), None, None)
 }
 
 /// A geometry-mode (ES+GS) program: the compute pass that writes one mesh record per
@@ -136,7 +136,7 @@ pub fn translate_geometry(code: &[u8], o: KernelOptions, g: &GsInterface) -> Res
 /// `translate_geometry` without the refusal of the split form's ES phase: the translation
 /// `XCL_SAFE_BARRIER=0` takes (and what tests of that form check whatever the environment).
 pub(crate) fn translate_geometry_unrefused(code: &[u8], o: KernelOptions, g: &GsInterface) -> Result<Kernel, String> {
-    translate_entry(code, KernelOptions { wave64: true, ..o }, Entry::Geometry(g.clone()), None, None, 0)
+    translate_entry(code, KernelOptions { wave64: true, ..o }, Entry::Geometry(g.clone()), None, None)
 }
 
 /// The entry ABI.
@@ -152,18 +152,12 @@ pub enum Entry {
 
 /// A compute-mode program (the CS ABI of `cs`).
 pub fn translate_compute(code: &[u8], o: KernelOptions, cs: &CsInterface) -> Result<Kernel, String> {
-    translate_compute_on(code, o, cs, true)
+    translate_compute_rodata(code, o, cs, &[])
 }
 
-/// `translate_compute` for a GPU: one that runs only 32-lane waves takes larger compact tables.
-pub fn translate_compute_on(code: &[u8], o: KernelOptions, cs: &CsInterface, wave32_only: bool) -> Result<Kernel, String> {
-    translate_compute_rodata(code, o, cs, wave32_only, &[])
-}
-
-/// `translate_compute_on` with the constant data after the program (`translate_entry_rodata`).
-pub fn translate_compute_rodata(code: &[u8], o: KernelOptions, cs: &CsInterface, wave32_only: bool, rodata: &[(u32, Vec<u32>)]) -> Result<Kernel, String> {
-    let tables = if wave32_only { super::compact::TABLE_WORDS_WAVE32 } else { super::compact::TABLE_WORDS };
-    translate_entry_with(code, o, Entry::Compute(cs.clone()), compact_mode(), None, tables, rodata.to_vec())
+/// `translate_compute` with the constant data after the program (`translate_entry_rodata`).
+pub fn translate_compute_rodata(code: &[u8], o: KernelOptions, cs: &CsInterface, rodata: &[(u32, Vec<u32>)]) -> Result<Kernel, String> {
+    translate_entry_with(code, o, Entry::Compute(cs.clone()), compact_mode(), None, rodata.to_vec())
 }
 
 fn translate_entry(
@@ -172,20 +166,18 @@ fn translate_entry(
     entry: Entry,
     compact: Option<bool>,
     nest: Option<super::compact::Nest>,
-    tables: usize,
 ) -> Result<Kernel, String> {
-    translate_entry_with(code, o, entry, compact, nest, tables, Vec::new())
+    translate_entry_with(code, o, entry, compact, nest, Vec::new())
 }
 
 /// A program at `entry` with the constant data the console compiler put after it in the code
 /// region (`xbox::Fssm::rodata`, the recompiler's `Options::rodata`): `s_getpc_b64` plus the
 /// compiler's offset is its address, and dword loads at such an address read the table the
-/// module carries (`Lw::rodata_loads`). The compact tables as `translate_full` /
-/// `translate_compute` take them (a compute program for a GPU with 64-lane waves:
-/// `translate_compute_rodata`).
+/// module carries (`Lw::rodata_loads`). The compact form as `translate_full` /
+/// `translate_compute` take it.
 pub fn translate_entry_rodata(code: &[u8], o: KernelOptions, entry: Entry, rodata: &[(u32, Vec<u32>)]) -> Result<Kernel, String> {
-    let (compact, tables) = if matches!(entry, Entry::Kernel | Entry::Compute(_)) { (compact_mode(), super::compact::TABLE_WORDS_WAVE32) } else { (None, 0) };
-    translate_entry_with(code, o, entry, compact, None, tables, rodata.to_vec())
+    let compact = if matches!(entry, Entry::Kernel | Entry::Compute(_)) { compact_mode() } else { None };
+    translate_entry_with(code, o, entry, compact, None, rodata.to_vec())
 }
 
 fn translate_entry_with(
@@ -194,7 +186,6 @@ fn translate_entry_with(
     entry: Entry,
     compact: Option<bool>,
     nest: Option<super::compact::Nest>,
-    tables: usize,
     rodata: Vec<(u32, Vec<u32>)>,
 ) -> Result<Kernel, String> {
     // SSA construction recurses along the CFG (one level per guarded memory access between
@@ -203,7 +194,7 @@ fn translate_entry_with(
     std::thread::Builder::new()
         .name("xcl-dxil-translate".into())
         .stack_size(256 << 20)
-        .spawn(move || translate_on_this_thread(&code, o, entry, compact, nest, tables, rodata))
+        .spawn(move || translate_on_this_thread(&code, o, entry, compact, nest, rodata))
         .map_err(|e| format!("translator thread: {e}"))?
         .join()
         .map_err(|e| {
@@ -233,7 +224,6 @@ fn translate_on_this_thread(
     entry: Entry,
     compact: Option<bool>,
     nest: Option<super::compact::Nest>,
-    tables: usize,
     rodata: Vec<(u32, Vec<u32>)>,
 ) -> Result<Kernel, String> {
     let geo = match &entry {
@@ -327,7 +317,7 @@ fn translate_on_this_thread(
         _ if !compute && !kernel => None,
         Some(false) => None,
         Some(true) => super::compact::plan(&cfg, &lw),
-        None => super::compact::automatic_plan(&cfg, &lw, compute && split, tables),
+        None => super::compact::automatic_plan(&cfg, &lw, compute && split),
     };
     if let Some(p) = &plan {
         crate::xlog_info!("[SHADER] direct DXIL compact form: {} blocks of {} kinds", p.order.len(), p.rep.len());

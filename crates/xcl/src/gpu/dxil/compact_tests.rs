@@ -181,40 +181,6 @@ fn a_mask_read_whole_after_one_copy_only_splits_the_class() {
     assert_ne!(p.class[0], p.class[2]);
 }
 
-fn two_segments(copies: usize) -> Vec<u8> {
-    let i = |n: &str, e: &str, f: &[(&str, u64)]| encode(n, e, f, None).unwrap_or_else(|x| panic!("{n}: {x}"));
-    let mut code = Vec::new();
-    code.extend(i("S_MOV_B32", "ENC_SOP1", &[("SDST", 2), ("SSRC0", 2)]));
-    for r in [2, 3] {
-        code.extend(i("V_MOV_B32", "ENC_VOP1", &[("VDST", r), ("SRC0", 256 + r)]));
-    }
-    for marker in [3, 4] {
-        for k in 0..copies {
-            code.extend(i("S_ADD_U32", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 0), ("SSRC1", 1)]));
-            code.extend(i("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 256), ("VSRC1", 1)]));
-            let offset = (copies - 1 - k) * 3 + 1;
-            assert!(offset <= i16::MAX as usize);
-            code.extend(i("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", offset as u64)]));
-        }
-        code.extend(i("S_MOV_B32", "ENC_SOP1", &[("SDST", marker), ("SSRC0", 129)]));
-    }
-    code.extend(i("S_ENDPGM", "ENC_SOPP", &[]));
-    code
-}
-
-#[test]
-fn a_gpu_with_64_lane_waves_keeps_the_first_table_limit() {
-    if compact_mode().is_some() {
-        return;
-    }
-    let code = two_segments(8192);
-    let o = KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 };
-    let cs = crate::gpu::recomp::CsInterface { threads: [64, 1, 1], user_sgprs: 4, tgid: [false; 3], tg_size: false, tid_components: 1 };
-    let size = |wave32_only| super::kernel::translate_compute_on(&code, o, &cs, wave32_only).unwrap().dxil.len();
-    let (compact, plain) = (size(true), size(false));
-    assert!(compact * 20 < plain, "{compact} B on a GPU with 32-lane waves only, {plain} B on one with 64-lane waves");
-}
-
 #[test]
 fn gpu_compact_inline_table_above_old_cap_checks_late_entries() {
     if compact_mode().is_some() {
@@ -225,12 +191,28 @@ fn gpu_compact_inline_table_above_old_cap_checks_late_entries() {
         (a, _, d) => return runner::skip_test(if a.is_err() { "no GPU" } else if d.is_err() { "no DXC" } else { "no wave64" }),
     }
     const COPIES: usize = 8192;
-    let code = two_segments(COPIES);
+    let i = |n: &str, e: &str, f: &[(&str, u64)]| encode(n, e, f, None).unwrap_or_else(|x| panic!("{n}: {x}"));
+    let mut code = Vec::new();
+    code.extend(i("S_MOV_B32", "ENC_SOP1", &[("SDST", 2), ("SSRC0", 2)]));
+    for r in [2, 3] {
+        code.extend(i("V_MOV_B32", "ENC_VOP1", &[("VDST", r), ("SRC0", 256 + r)]));
+    }
+    for marker in [3, 4] {
+        for k in 0..COPIES {
+            code.extend(i("S_ADD_U32", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 0), ("SSRC1", 1)]));
+            code.extend(i("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 256), ("VSRC1", 1)]));
+            let offset = (COPIES - 1 - k) * 3 + 1;
+            assert!(offset <= i16::MAX as usize);
+            code.extend(i("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", offset as u64)]));
+        }
+        code.extend(i("S_MOV_B32", "ENC_SOP1", &[("SDST", marker), ("SSRC0", 129)]));
+    }
+    code.extend(i("S_ENDPGM", "ENC_SOPP", &[]));
     let o = KernelOptions { wave64: true, split: runner::split_wave64(), mem_windows: 1, sampler_base: 0 };
     let cfg = super::cfg::Cfg::build(&code).unwrap();
     let leaders = cfg.blocks.iter().filter_map(|b| b.insts.first().map(|&i| cfg.insts[i].pc)).collect();
     let lw = super::lower::Lw::new(&cfg.insts, &leaders, o, &super::kernel::Entry::Kernel);
-    let p = super::compact::automatic_plan(&cfg, &lw, false, super::compact::TABLE_WORDS_WAVE32).unwrap();
+    let p = super::compact::automatic_plan(&cfg, &lw, false).unwrap();
     assert!(p.inline && p.words() > 8192 && p.words() <= 12288);
     let k = translate_full(&code, o).unwrap();
     for initial in [0u32, u32::MAX - 1, 0u32.wrapping_sub(COPIES as u32), 0u32.wrapping_sub((2 * COPIES) as u32), 0u32.wrapping_sub(COPIES as u32 + 1)] {
