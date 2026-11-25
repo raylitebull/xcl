@@ -1896,7 +1896,15 @@ impl Em {
             }
         };
         self.line(&format!("uint {t0} = {lo}; uint {t1} = {hi};"));
-        if let Some(c) = scc {
+        // "is a lane left" of a 64-bit lane mask (an AND with EXEC or VCC) in a wave64 pixel
+        // shader: over the live lanes (`mask_live64`), matching `mask_live` for wave32.
+        let lanes_left = matches!(name, "s_and_b64" | "s_andn2_b64")
+            && matches!(self.opt.mode, Mode::Pixel(_))
+            && d.enc.name == "ENC_SOP2"
+            && ["SSRC0", "SSRC1", "SDST"].iter().any(|f| matches!(Self::field(d, f), 106 | 126));
+        if lanes_left {
+            self.line(&format!("scc = (uint)(mask_live64({t0}, {t1}) != 0u);"));
+        } else if let Some(c) = scc {
             self.line(&format!("scc = (uint)({c});"));
         }
         if matches!(name, "s_bcnt0_i32_b64" | "s_bcnt1_i32_b64" | "s_ff0_i32_b64" | "s_ff1_i32_b64" | "s_flbit_i32_b64" | "s_flbit_i32_i64") {
@@ -6621,6 +6629,14 @@ uint mask_live(uint m) {
     m &= ballot(true).x;
 #endif
     return m;
+}
+uint mask_live64(uint lo, uint hi) {
+#ifdef XCL_PIXEL
+    uint2 lv = ballot(true);
+    lo &= lv.x;
+    hi &= lv.y;
+#endif
+    return lo | hi;
 }
 uint first_lane_live(uint lo, uint hi) {
 #ifdef XCL_PIXEL

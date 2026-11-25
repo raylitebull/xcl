@@ -696,6 +696,44 @@ impl Lw {
         let lnz = self.nz(lo);
         self.sel(lnz, fl, hv)
     }
+
+    /// Hardware live-lane ballot (excludes pixel-shader helper lanes, unlike [`Lw::ballot`]).
+    fn ballot_live(&mut self, cond: Value) -> (Value, Value) {
+        let w = self.s.wave_ballot(cond);
+        if !self.wave64 {
+            let z = self.c(0);
+            if let Some(h) = self.gfx_half {
+                return (self.sel(h, w[1], w[0]), z);
+            }
+            return (w[0], z);
+        }
+        if !self.split {
+            return (w[0], w[1]);
+        }
+        let m = w[0];
+        let o = self.exchange(m);
+        let u = self.upper;
+        let lo = self.sel(u, o, m);
+        let hi = self.sel(u, m, o);
+        (lo, hi)
+    }
+
+    /// First live lane of (lo, hi) in a pixel shader when EXEC has one, else first set lane
+    /// (the recompiler's `first_lane_live`: avoids reading helper-lane registers inside PS loops).
+    pub fn first_lane_live(&mut self, lo: Value, hi: Value) -> Value {
+        if self.gfx.as_ref().is_some_and(|g| g.ps.is_some()) {
+            let t = self.s.m.i1c(true);
+            let (lv_lo, lv_hi) = self.ballot_live(t);
+            let ml = self.and(lo, lv_lo);
+            let mh = self.and(hi, lv_hi);
+            let any = self.or(ml, mh);
+            let has_live = self.nz(any);
+            let lo = self.sel(has_live, ml, lo);
+            let hi = self.sel(has_live, mh, hi);
+            return self.first_lane(lo, hi);
+        }
+        self.first_lane(lo, hi)
+    }
 }
 
 #[cfg(test)]

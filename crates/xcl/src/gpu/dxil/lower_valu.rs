@@ -991,7 +991,7 @@ impl Lw {
             }
             "v_readfirstlane_b32" => {
                 let (el, eh) = self.exec_mask();
-                let l = self.first_lane(el, eh);
+                let l = self.first_lane_live(el, eh);
                 let t = self.read_lane_uniform(a, l);
                 self.write32(&dst, t);
                 return Ok(());
