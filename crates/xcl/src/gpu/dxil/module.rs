@@ -1465,6 +1465,45 @@ impl Module {
             fields.first().and_then(|&p0| self.const_u64(p0)).is_some_and(|w| w & 0x2000 != 0)
         })
     }
+    /// Scan surviving instructions in reachable blocks for call/atomic features that must stay in
+    /// sync with DXIL shader flags after optimization/DCE: `(double_fma, res_heap, smp_heap,
+    /// i64_atomic_gs, i64_atomic_res, uav_tex_load)`.
+    pub fn live_feature_scan(&self, i64: Option<Ty>) -> (bool, bool, bool, bool, bool, bool) {
+        let mut has_double_fma = false;
+        let mut has_res_heap = false;
+        let mut has_smp_heap = false;
+        let mut has_i64_atomic_gs = false;
+        let mut has_i64_atomic_res = false;
+        let mut has_uav_tex_load = false;
+        for &i in self.blocks.iter().flatten() {
+            let d = &self.insts[i as usize];
+            match &d.op {
+                Op::Call(f, args) => {
+                    let name = self.funcs[*f as usize].name.as_str();
+                    if name == "dx.op.createHandleFromHeap" && args.len() >= 3 {
+                        if self.const_u64(args[2]) == Some(0) {
+                            has_res_heap = true;
+                        } else {
+                            has_smp_heap = true;
+                        }
+                    } else if name == "dx.op.tertiary.f64" && args.first().and_then(|&a| self.const_u64(a)) == Some(47) {
+                        has_double_fma = true;
+                    } else if matches!(name, "dx.op.atomicBinOp.i64" | "dx.op.atomicCompareExchange.i64") {
+                        has_i64_atomic_res = true;
+                    } else if name.starts_with("dx.op.textureLoad")
+                        && args.get(2).is_some_and(|&mip| matches!(mip, Value::Const(c) if matches!(self.consts[c as usize], ConstDef::Undef(_))))
+                    {
+                        has_uav_tex_load = true;
+                    }
+                }
+                Op::AtomicRmw(..) | Op::CmpXchg(..) if i64 == Some(d.ty) => {
+                    has_i64_atomic_gs = true;
+                }
+                _ => {}
+            }
+        }
+        (has_double_fma, has_res_heap, has_smp_heap, has_i64_atomic_gs, has_i64_atomic_res, has_uav_tex_load)
+    }
     /// The integer value of a constant (zero-extended from its width).
     pub fn const_u64(&self, v: Value) -> Option<u64> {
         match v {

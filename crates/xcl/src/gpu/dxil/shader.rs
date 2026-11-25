@@ -497,21 +497,46 @@ impl Shader {
         (Some(node), [cbv, smp, srv, uav].concat())
     }
 
-    /// Requires the features implied by instruction types alone (`Int64Ops`
-    /// for any i64, `Doubles` for any double, `DoubleExtensions` for double
-    /// division and int ↔ double conversions), which the validator derives
-    /// from the code and demands in the flags even when the IR was built
-    /// with [`Module`] methods directly rather than the [`Shader`] helpers.
+    /// Reconciles shader feature flags against the surviving reachable instructions after
+    /// `optimize()`: adds features implied by instruction types (`Int64Ops`, `Doubles`,
+    /// `DoubleExtensions`, `Rovs`) and clears flags whose instructions were dead-code-eliminated
+    /// or folded away in unreachable CFG arms ("Flags must match usage").
     pub(super) fn infer_type_features(&mut self) {
         let (i64, f64) = self.m.existing_i64_f64();
-        if i64.is_some_and(|t| self.m.insts_use_type(t)) {
+        let has_i64 = i64.is_some_and(|t| self.m.insts_use_type(t));
+        let has_f64 = f64.is_some_and(|t| self.m.insts_use_type(t));
+        if has_i64 {
             self.require(Feature::Int64Ops);
+        } else {
+            self.features.remove(&Feature::Int64Ops);
         }
-        if f64.is_some_and(|t| self.m.insts_use_type(t)) {
+        if has_f64 {
             self.require(Feature::Doubles);
+        } else {
+            self.features.remove(&Feature::Doubles);
         }
-        if self.m.uses_double_extensions() {
+
+        let (has_double_fma, has_res_heap, has_smp_heap, has_i64_atomic_gs, has_i64_atomic_res, has_uav_tex_load) = self.m.live_feature_scan(i64);
+        if has_f64 && (self.m.uses_double_extensions() || has_double_fma) {
             self.require(Feature::DoubleExtensions);
+        } else {
+            self.features.remove(&Feature::DoubleExtensions);
+        }
+        if !has_res_heap {
+            self.features.remove(&Feature::ResourceHeapIndexing);
+        }
+        if !has_smp_heap {
+            self.features.remove(&Feature::SamplerHeapIndexing);
+        }
+        if !has_i64_atomic_gs {
+            self.features.remove(&Feature::AtomicInt64GroupShared);
+        }
+        if !has_i64_atomic_res {
+            self.features.remove(&Feature::AtomicInt64Typed);
+            self.features.remove(&Feature::AtomicInt64Heap);
+        }
+        if !has_uav_tex_load {
+            self.features.remove(&Feature::TypedUavLoadAdditionalFormats);
         }
         if self.bindings.iter().any(|b| b.rov) || self.m.has_rov_handle() {
             self.require(Feature::Rovs);

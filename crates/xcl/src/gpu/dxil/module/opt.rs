@@ -424,14 +424,114 @@ impl Module {
         idom
     }
 
+    /// Replace phis whose incoming values are only themselves and one other value. Repeat
+    /// because resolving one phi may make another trivial, including across loop backedges.
+    fn simplify_phis(&self, order: &[u32], repl: &mut [Option<Value>]) {
+        loop {
+            let mut changed = false;
+            for &b in order {
+                for &i in &self.blocks[b as usize] {
+                    let i = i as usize;
+                    if repl[i].is_some() {
+                        continue;
+                    }
+                    let Op::Phi(inc) = &self.insts[i].op else { break };
+                    let me = Value::Inst(i as u32);
+                    let mut same: Option<Value> = None;
+                    let mut trivial = true;
+                    for &(v, _) in inc {
+                        let v = resolve(repl, v);
+                        if v == me || Some(v) == same {
+                            continue;
+                        }
+                        if same.is_some() {
+                            trivial = false;
+                            break;
+                        }
+                        same = Some(v);
+                    }
+                    if let (true, Some(v)) = (trivial, same) {
+                        repl[i] = Some(v);
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+    }
+
+    /// Constants established by the control-flow edge that reaches each block. Facts are
+    /// intersected at joins, so a value is kept only when every incoming edge proves the same
+    /// value. Bounded to 16 RPO passes so giant shaders stay strictly linear.
+    fn branch_facts(&self, order: &[u32]) -> Vec<HashMap<Value, u64>> {
+        let mut preds: Vec<Vec<usize>> = vec![Vec::new(); self.blocks.len()];
+        for &b in order {
+            for s in self.successors(b as usize) {
+                if !preds[s.0 as usize].contains(&(b as usize)) {
+                    preds[s.0 as usize].push(b as usize);
+                }
+            }
+        }
+        let mut facts: Vec<HashMap<Value, u64>> = vec![HashMap::new(); self.blocks.len()];
+        let max_iters = order.len().min(16);
+        for _ in 0..=max_iters {
+            let mut changed = false;
+            for &b in order.iter().skip(1) {
+                let b = b as usize;
+                let mut incoming: Option<HashMap<Value, u64>> = None;
+                for &p in &preds[b] {
+                    let mut edge = facts[p].clone();
+                    if let Some(&term) = self.blocks[p].last() {
+                        match &self.insts[term as usize].op {
+                            Op::CondBr(v, t, f) if t != f => {
+                                if t.0 as usize == b {
+                                    edge.insert(*v, 1);
+                                } else if f.0 as usize == b {
+                                    edge.insert(*v, 0);
+                                }
+                            }
+                            Op::Switch(v, default, cases) if default.0 as usize != b => {
+                                let matching: Vec<Value> = cases.iter().filter(|(_, t)| t.0 as usize == b).map(|(c, _)| *c).collect();
+                                if let [case] = matching.as_slice() {
+                                    if let Some(value) = self.const_u64(*case) {
+                                        edge.insert(*v, value);
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    incoming = Some(match incoming {
+                        None => edge,
+                        Some(mut common) => {
+                            common.retain(|v, value| edge.get(v) == Some(value));
+                            common
+                        }
+                    });
+                }
+                let next = incoming.unwrap_or_default();
+                if facts[b] != next {
+                    facts[b] = next;
+                    changed = true;
+                }
+            }
+            if !changed {
+                return facts;
+            }
+        }
+        vec![HashMap::new(); self.blocks.len()]
+    }
+
     /// Cleans up the entry function (see the module docs of `opt`). Values
     /// keep their identities; replaced ones simply lose their uses.
     ///
-    /// `XCL_DXIL_NO_OPT=phi,cse,dce,merge` (any subset, or `all`) skips passes, for bisecting.
+    /// `XCL_DXIL_NO_OPT=phi,cse,cfg,dce,merge` (any subset, or `all`) skips passes, for bisecting.
     pub fn optimize(&mut self) {
         let off = std::env::var("XCL_DXIL_NO_OPT").unwrap_or_default();
         let skip = |p: &str| off.split(',').any(|x| x.trim() == p || x.trim() == "all");
-        let order: Vec<u32> = self.block_layout().0.into_iter().map(|b| b as u32).collect();
+        let mut order: Vec<u32> = self.block_layout().0.into_iter().map(|b| b as u32).collect();
         // malformed IR (a use before its definition or of a void result) is left for the
         // writer to report, not cleaned away
         if !self.uses_well_formed(&order) {
@@ -459,38 +559,8 @@ impl Module {
         let mut repl: Vec<Option<Value>> = vec![None; self.insts.len()];
 
         // trivial phis (all incoming values the phi itself or one value), to a fixed point
-        while !skip("phi") {
-            let mut changed = false;
-            for &b in &order {
-                for &i in &self.blocks[b as usize] {
-                    let i = i as usize;
-                    if repl[i].is_some() {
-                        continue;
-                    }
-                    let Op::Phi(inc) = &self.insts[i].op else { break };
-                    let me = Value::Inst(i as u32);
-                    let mut same: Option<Value> = None;
-                    let mut trivial = true;
-                    for &(v, _) in inc {
-                        let v = resolve(&mut repl, v);
-                        if v == me || Some(v) == same {
-                            continue;
-                        }
-                        if same.is_some() {
-                            trivial = false;
-                            break;
-                        }
-                        same = Some(v);
-                    }
-                    if let (true, Some(v)) = (trivial, same) {
-                        repl[i] = Some(v);
-                        changed = true;
-                    }
-                }
-            }
-            if !changed {
-                break;
-            }
+        if !skip("phi") {
+            self.simplify_phis(&order, &mut repl);
         }
 
         // CSE along the dominator tree (preorder walk with a scoped table)
@@ -563,45 +633,75 @@ impl Module {
         }
         // second trivial-phi fixed point if CSE/simplification collapsed incoming values
         if cse_replaced && !skip("phi") {
-            loop {
-                let mut changed = false;
-                for &b in &order {
-                    for &i in &self.blocks[b as usize] {
-                        let i = i as usize;
-                        if repl[i].is_some() {
-                            continue;
-                        }
-                        let Op::Phi(inc) = &self.insts[i].op else { break };
-                        let me = Value::Inst(i as u32);
-                        let mut same: Option<Value> = None;
-                        let mut trivial = true;
-                        for &(v, _) in inc {
-                            let v = resolve(&mut repl, v);
-                            if v == me || Some(v) == same {
-                                continue;
-                            }
-                            if same.is_some() {
-                                trivial = false;
-                                break;
-                            }
-                            same = Some(v);
-                        }
-                        if let (true, Some(v)) = (trivial, same) {
-                            repl[i] = Some(v);
-                            changed = true;
-                        }
-                    }
-                }
-                if !changed {
-                    break;
-                }
-            }
+            self.simplify_phis(&order, &mut repl);
         }
-        // phis may name values defined later (back edges): resolve once more
+        // phis may name values defined later (back edges): resolve before CFG folding so
+        // terminators see constants exposed by both CSE and the second trivial-phi pass.
         for &b in &order {
             for k in 0..self.blocks[b as usize].len() {
                 let i = self.blocks[b as usize][k] as usize;
                 self.insts[i].op.map_operands(|v| resolve(&mut repl, v));
+            }
+        }
+        // CSE, trivial-phi folding, or dominating branches can prove a terminator constant. Fold
+        // it before DCE, then rebuild reachability and predecessor edges so unreachable blocks and
+        // obsolete PHI edges are pruned cleanly while preserving loop backedges.
+        let mut cfg_folded = false;
+        if !skip("cfg") {
+            let facts = self.branch_facts(&order);
+            for &b in &order {
+                let Some(&i) = self.blocks[b as usize].last() else { continue };
+                let replacement = match self.insts[i as usize].op.clone() {
+                    Op::CondBr(c, t, f) => match self.const_u64(c).or_else(|| facts[b as usize].get(&c).copied()) {
+                        Some(0) => Some(Op::Br(f)),
+                        Some(1) => Some(Op::Br(t)),
+                        _ => None,
+                    },
+                    Op::Switch(v, default, cases) => self.const_u64(v).or_else(|| facts[b as usize].get(&v).copied()).map(|needle| {
+                        let target = cases.iter().find_map(|(case, target)| (self.const_u64(*case) == Some(needle)).then_some(*target)).unwrap_or(default);
+                        Op::Br(target)
+                    }),
+                    _ => None,
+                };
+                if let Some(op) = replacement {
+                    self.insts[i as usize].op = op;
+                    cfg_folded = true;
+                }
+            }
+        }
+        if cfg_folded {
+            order = self.block_layout().0.into_iter().map(|b| b as u32).collect();
+            let mut reach = vec![false; self.blocks.len()];
+            let mut preds: Vec<Vec<u32>> = vec![Vec::new(); self.blocks.len()];
+            for &b in &order {
+                reach[b as usize] = true;
+                for succ in self.successors(b as usize) {
+                    if let Some(p) = preds.get_mut(succ.0 as usize) {
+                        if !p.contains(&b) {
+                            p.push(b);
+                        }
+                    }
+                }
+            }
+            for (b, r) in reach.iter().enumerate() {
+                if !r {
+                    self.blocks[b].clear();
+                }
+            }
+            for &b in &order {
+                for &i in &self.blocks[b as usize] {
+                    let Op::Phi(inc) = &mut self.insts[i as usize].op else { break };
+                    inc.retain(|p| preds[b as usize].contains(&p.1 .0));
+                }
+            }
+            if !skip("phi") {
+                self.simplify_phis(&order, &mut repl);
+                for &b in &order {
+                    for k in 0..self.blocks[b as usize].len() {
+                        let i = self.blocks[b as usize][k] as usize;
+                        self.insts[i].op.map_operands(|v| resolve(&mut repl, v));
+                    }
+                }
             }
         }
 
@@ -1400,5 +1500,187 @@ mod tests {
         assert_eq!(m.const_u64(args[12]), Some(0), "and(zext(i1), 0xFFFF0000) -> 0");
         let order: Vec<u32> = m.block_layout().0.into_iter().map(|b| b as u32).collect();
         assert!(m.uses_well_formed(&order));
+    }
+
+    #[test]
+    fn constant_conditional_removes_edge_and_trivial_phi() {
+        let mut m = Module::new();
+        let yes = m.new_block();
+        let no = m.new_block();
+        let join = m.new_block();
+        let i32 = m.i32();
+        let slot = m.alloca(i32, 4);
+        let one = m.i32c(1);
+        let cond = m.cmp(Pred::Eq, one, one);
+        m.cond_br(cond, yes, no);
+        m.set_block(yes);
+        let live = m.i32c(7);
+        m.br(join);
+        m.set_block(no);
+        let dead = m.i32c(9);
+        m.br(join);
+        m.set_block(join);
+        let phi = m.phi(i32);
+        m.add_incoming(phi, live, yes);
+        m.add_incoming(phi, dead, no);
+        m.store(slot, phi, 4);
+        m.ret();
+
+        m.optimize();
+
+        let reachable = m.block_layout().0;
+        assert!(reachable.iter().all(|&b| !m.blocks[b].iter().any(|&i| matches!(m.insts[i as usize].op, Op::CondBr(..)))));
+        assert!(m.blocks[no.0 as usize].is_empty());
+        assert!(!m.blocks[join.0 as usize].iter().any(|&i| matches!(m.insts[i as usize].op, Op::Phi(_))));
+    }
+
+    #[test]
+    fn constant_switch_keeps_only_the_selected_predecessor() {
+        let mut m = Module::new();
+        let default = m.new_block();
+        let selected = m.new_block();
+        let join = m.new_block();
+        let one = m.i32c(1);
+        let two = m.i32c(2);
+        let selector = m.bin(BinOp::Add, one, one);
+        m.switch(selector, default, &[(two, selected)]);
+        m.set_block(default);
+        m.br(join);
+        m.set_block(selected);
+        m.br(join);
+        m.set_block(join);
+        m.ret();
+
+        m.optimize();
+
+        let reachable = m.block_layout().0;
+        assert!(reachable.iter().all(|&b| !m.blocks[b].iter().any(|&i| matches!(m.insts[i as usize].op, Op::Switch(..)))));
+        assert!(m.blocks[default.0 as usize].is_empty());
+    }
+
+    #[test]
+    fn branch_condition_folds_a_dominated_branch() {
+        let mut m = Module::new();
+        let yes = m.new_block();
+        let no = m.new_block();
+        let proven = m.new_block();
+        let impossible = m.new_block();
+        let i1 = m.i1();
+        let condition = m.alloca(i1, 1);
+        let condition = m.load(condition, 1);
+        m.cond_br(condition, yes, no);
+        m.set_block(yes);
+        m.cond_br(condition, proven, impossible);
+        m.set_block(no);
+        m.ret();
+        m.set_block(proven);
+        m.ret();
+        m.set_block(impossible);
+        m.ret();
+
+        m.optimize();
+
+        assert!(m.blocks[impossible.0 as usize].is_empty());
+        assert!(m.blocks[yes.0 as usize]
+            .iter()
+            .all(|&i| !matches!(m.insts[i as usize].op, Op::CondBr(..))));
+    }
+
+    #[test]
+    fn branch_condition_is_dropped_when_paths_reconverge() {
+        let mut m = Module::new();
+        let yes = m.new_block();
+        let no = m.new_block();
+        let join = m.new_block();
+        let a = m.new_block();
+        let b = m.new_block();
+        let i1 = m.i1();
+        let condition = m.alloca(i1, 1);
+        let condition = m.load(condition, 1);
+        m.cond_br(condition, yes, no);
+        m.set_block(yes);
+        m.br(join);
+        m.set_block(no);
+        m.br(join);
+        m.set_block(join);
+        m.cond_br(condition, a, b);
+        m.set_block(a);
+        m.ret();
+        m.set_block(b);
+        m.ret();
+
+        m.optimize();
+
+        let reachable = m.block_layout().0;
+        assert!(reachable.contains(&(a.0 as usize)));
+        assert!(reachable.contains(&(b.0 as usize)));
+        assert!(reachable.iter().any(|&block| m.blocks[block]
+            .iter()
+            .any(|&i| matches!(m.insts[i as usize].op, Op::CondBr(..)))));
+    }
+
+    #[test]
+    fn edge_trim_keeps_a_loop_phi_backedge() {
+        let mut m = Module::new();
+        let entry = m.entry_block();
+        let dead = m.new_block();
+        let lp = m.new_block();
+        let exit = m.new_block();
+        let i32 = m.i32();
+        let i1 = m.i1();
+        let result = m.alloca(i32, 4);
+        let loop_cond = m.alloca(i1, 1);
+        let zero = m.i32c(0);
+        let one = m.i32c(1);
+        let always = m.cmp(Pred::Eq, one, one);
+        m.cond_br(always, lp, dead);
+        m.set_block(dead);
+        let discarded = m.i32c(99);
+        m.br(lp);
+        m.set_block(lp);
+        let phi = m.phi(i32);
+        m.add_incoming(phi, zero, entry);
+        m.add_incoming(phi, discarded, dead);
+        let next = m.bin(BinOp::Add, phi, one);
+        m.add_incoming(phi, next, lp);
+        let again = m.load(loop_cond, 1);
+        m.cond_br(again, lp, exit);
+        m.set_block(exit);
+        m.store(result, phi, 4);
+        m.ret();
+
+        m.optimize();
+
+        assert!(m.blocks[dead.0 as usize].is_empty());
+        let incoming = m.phi_incoming(phi);
+        assert_eq!(incoming.len(), 2);
+        assert!(incoming.iter().any(|p| p.1 == entry));
+        assert!(incoming.iter().any(|p| p.1 == lp));
+    }
+
+    #[test]
+    fn dead_branch_i64_and_heap_handle_do_not_leave_stale_shader_flags() {
+        use crate::gpu::dxil::container::Stage;
+        use crate::gpu::dxil::shader::{Feature, Shader};
+        let mut s = Shader::new(Stage::Compute, (6, 6));
+        let live = s.m.new_block();
+        let dead = s.m.new_block();
+        let one = s.m.i32c(1);
+        let cond = s.m.cmp(Pred::Eq, one, one);
+        s.m.cond_br(cond, live, dead);
+        s.m.set_block(dead);
+        let i64 = s.m.i64();
+        let z64 = s.m.cast(CastOp::ZExt, one, i64);
+        let _ = s.m.bin(BinOp::Add, z64, z64);
+        s.require(Feature::Int64Ops);
+        let _ = s.handle_from_heap(one, false, false);
+        s.m.ret();
+        s.m.set_block(live);
+        s.m.ret();
+
+        s.m.optimize();
+        s.infer_type_features();
+        assert!(!s.features.contains(&Feature::Int64Ops), "pruned i64 branch must clear Int64Ops");
+        assert!(!s.features.contains(&Feature::ResourceHeapIndexing), "pruned heap handle must clear ResourceHeapIndexing");
     }
 }
