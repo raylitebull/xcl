@@ -1132,6 +1132,23 @@ fn gpu_direct_loads_read_the_constant_data_after_the_program() {
 }
 
 #[test]
+fn raw_buffer_oob_check_guards_32bit_wraparound() {
+    let ko = KernelOptions { wave64: false, split: false, mem_windows: 2, sampler_base: 0 };
+    // Non-zero OFFSET + OFFEN on a raw buffer load/atomic must emit unsigned wraparound checks
+    // (`icmp uge`) for both `voff + OFFSET` and `off + bytes` (#1893).
+    let code = prog(&[
+        ("BUFFER_LOAD_DWORD", "ENC_MUBUF", &[("VDATA", 3), ("VADDR", 0), ("SRSRC", 0), ("SOFFSET", 128), ("OFFEN", 1), ("OFFSET", 16)], None),
+        ("BUFFER_ATOMIC_ADD", "ENC_MUBUF", &[("VDATA", 4), ("VADDR", 0), ("SRSRC", 0), ("SOFFSET", 128), ("OFFEN", 1), ("OFFSET", 16)], None),
+    ]);
+    let dxil = translate(&code, ko).expect("mubuf + atomic translates");
+    super::validate::validate(&dxil).expect("validates");
+    if let Ok(dis) = super::validate::disassemble(&dxil) {
+        let uge = dis.matches("icmp uge i32").count();
+        assert!(uge >= 4, "expected wraparound icmp uge checks for load and atomic (got {uge}):\n{dis}");
+    }
+}
+
+#[test]
 fn dot8_u32_u4_unclamped_lowers_to_dot4_add_u8_packed() {
     use crate::gpu::recomp::{dxc, runner};
     const V: u64 = 256;

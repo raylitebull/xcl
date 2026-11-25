@@ -1256,18 +1256,29 @@ impl Lw {
         let voff = if offen { self.vreg(vaddr + idxen as u64) } else { self.c(0) };
         let stride = self.lshrc(d1, 16);
         let stride = self.andc(stride, 0x3FFF);
-        let off = self.addc(voff, f("OFFSET") as u32);
+        let imm_off = f("OFFSET") as u32;
+        let off = self.addc(voff, imm_off);
+        // 32-bit unsigned add `voff + imm_off` wraps iff `off < voff`; catch wraparound so a
+        // huge `voff` cannot wrap below `d2` while 64-bit `buffer_window()` carries into the next
+        // 4 GiB UMA window (#1893).
+        let off_no_wrap = if imm_off != 0 { Some(self.cmp(Pred::UGe, off, voff)) } else { None };
         let a = self.add(d0, soff);
         let a = self.add(a, off);
         let si = self.mul(stride, index);
         let a = self.add(a, si);
-        self.buffer_window(d0, d1, &[Ea::U(soff), Ea::U(voff), Ea::K(f("OFFSET") as u32), Ea::Mul(stride, index)], name.contains("store"));
+        self.buffer_window(d0, d1, &[Ea::U(soff), Ea::U(voff), Ea::K(imm_off), Ea::Mul(stride, index)], name.contains("store"));
         let act = self.act();
         let szero = self.cmpc(Pred::Eq, stride, 0);
         let idx_ok = self.cmp(Pred::ULt, index, d2);
         let in_range = |lw: &mut Lw, bytes: Value| -> Value {
             let e = lw.add(off, bytes);
-            let ok = lw.cmp(Pred::ULe, e, d2);
+            let e_no_wrap = lw.cmp(Pred::UGe, e, off);
+            let in_bounds = lw.cmp(Pred::ULe, e, d2);
+            let ok = lw.land(e_no_wrap, in_bounds);
+            let ok = match off_no_wrap {
+                Some(nw) => lw.land(nw, ok),
+                None => ok,
+            };
             lw.sel(szero, ok, idx_ok)
         };
         if let Some((n, signed, store, half)) = d16s {
@@ -1906,16 +1917,24 @@ impl Lw {
         let bytes = if x2 { 8 } else { 4 };
         let stride = self.lshrc(d1, 16);
         let stride = self.andc(stride, 0x3FFF);
-        let off = self.addc(voff, f("OFFSET") as u32);
+        let imm_off = f("OFFSET") as u32;
+        let off = self.addc(voff, imm_off);
+        let off_no_wrap = if imm_off != 0 { Some(self.cmp(Pred::UGe, off, voff)) } else { None };
         let a = self.add(d0, soff);
         let a = self.add(a, off);
         let si = self.mul(stride, index);
         let a = self.add(a, si);
-        self.buffer_window(d0, d1, &[Ea::U(soff), Ea::U(voff), Ea::K(f("OFFSET") as u32), Ea::Mul(stride, index)], true);
+        self.buffer_window(d0, d1, &[Ea::U(soff), Ea::U(voff), Ea::K(imm_off), Ea::Mul(stride, index)], true);
         let a = self.andc(a, !(bytes - 1));
         let szero = self.cmpc(Pred::Eq, stride, 0);
         let e = self.addc(off, bytes);
-        let r1 = self.cmp(Pred::ULe, e, d2);
+        let e_no_wrap = self.cmp(Pred::UGe, e, off);
+        let in_bounds = self.cmp(Pred::ULe, e, d2);
+        let r1 = self.land(e_no_wrap, in_bounds);
+        let r1 = match off_no_wrap {
+            Some(nw) => self.land(nw, r1),
+            None => r1,
+        };
         let r2 = self.cmp(Pred::ULt, index, d2);
         let ok = self.sel(szero, r1, r2);
         let act = self.act();
