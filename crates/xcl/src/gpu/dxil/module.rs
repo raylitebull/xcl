@@ -417,6 +417,16 @@ impl Module {
         let sext = if w >= 64 { v as i64 } else { ((v << (64 - w)) as i64) >> (64 - w) };
         self.constant(ConstDef::Int(ty, sext))
     }
+    /// The value of an integer constant (sign-extended to 64 bits), if `v` is one.
+    pub fn int_const(&self, v: Value) -> Option<i64> {
+        match v {
+            Value::Const(c) => match self.consts[c as usize] {
+                ConstDef::Int(_, x) => Some(x),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
     pub fn i32c(&mut self, v: u32) -> Value {
         let t = self.i32();
         self.const_int(t, v as u64)

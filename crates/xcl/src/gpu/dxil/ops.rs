@@ -358,12 +358,18 @@ impl Shader {
     pub fn bit_count(&mut self, op: BitCount, v: Value) -> Value {
         let t = self.m.type_of(v);
         let i32 = self.m.i32();
+        if let (BitCount::Countbits, Some(x), Some(w)) = (op, self.m.int_const(v), self.m.int_width(t)) {
+            // Fold `Countbits` of a constant here: AMD's driver (amdxc64,
+            // RDNA4) folds `Bfrev(Countbits(K))` to `Bfrev(n) | n` (n =
+            // countbits(K)), e.g. 0x80000001 for K = 2 (fuzz seed 1599, #2115).
+            let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+            return self.m.i32c(((x as u64) & mask).count_ones());
+        }
         if self.is_i64(v) {
             self.require(Feature::Int64Ops);
             if matches!(op, BitCount::Countbits) {
-                // Count each 32-bit half: AMD's driver (amdxc64, RDNA4) gets
-                // i64 bit ops wrong (see `bfrev`); fuzz seed 1599 reads a wrong
-                // value downstream of `Countbits.i64(i64 2)` there only.
+                // Count each 32-bit half: AMD's driver (amdxc64) gets i64 bit
+                // ops wrong (see `bfrev`).
                 let lo = self.m.cast(CastOp::Trunc, v, i32);
                 let c32 = self.m.const_int(t, 32);
                 let hi = self.m.bin(BinOp::LShr, v, c32);

@@ -1053,6 +1053,32 @@ fn i1_to_i64_sign_extension_and_shift_match_cpu() {
     }
 }
 
+/// `Bfrev(Countbits(K))` with a constant `K`: AMD's driver (amdxc64, RDNA4)
+/// folds it to `Bfrev(n) | n` (0x80000001 for K = 2), so `bit_count` folds
+/// `Countbits` of constants itself (#2115, fuzz seed 1599).
+#[test]
+fn bfrev_of_countbits_of_a_constant_matches_cpu() {
+    let ks: [u64; 6] = [0, 2, 3, 0xF0, 0xFFFF_FFFF, 0x8000_0000_0000_0003];
+    let mut k = kernel();
+    let (i32, i64) = (k.s.m.i32(), k.s.m.i64());
+    let mut outs = vec![];
+    for (i, &c) in ks.iter().enumerate() {
+        let v = if i == ks.len() - 1 { k.s.m.const_int(i64, c) } else { k.s.m.const_int(i32, c) };
+        let n = k.s.bit_count(BitCount::Countbits, v);
+        outs.push(k.s.bfrev(n));
+    }
+    for (i, &o) in outs.iter().enumerate() {
+        k.out(i as u32, o);
+    }
+    let c = k.finish([32, 1, 1]);
+    let dis = validate::disassemble(&c).unwrap_or_else(|d| d);
+    assert!(!dis.contains("Countbits(value)"), "Countbits of a constant is folded:\n{dis}");
+    let Some(r) = gpu(&c, &mem_of(&[vec![0; 32]]), &[], &[]) else { return };
+    for (i, &v) in ks.iter().enumerate() {
+        assert_eq!(outv(&r, i)[0], v.count_ones().reverse_bits(), "Bfrev(Countbits({v:#x}))");
+    }
+}
+
 #[test]
 fn uav_array_3d_stores_loads_and_texture_atomics_run() {
     // u: heap 3 = RWTexture2DArray<uint> 4×4×2, heap 5 = RWTexture3D<float> 4×4×2.
