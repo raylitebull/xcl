@@ -233,6 +233,8 @@ pub struct Lw {
     pub has_f64_round_op: bool,
     /// the T# SGPRs of the program's image stores and atomics (`recomp::emit::image_write_srsrcs`)
     pub img_writes: Vec<u64>,
+    /// highest VGPR index referenced by the program (for `v_movrel*` outside `Entry::Kernel`)
+    pub max_vgpr: u64,
     /// static samplers bound so far: (S#, comparison, handle) at `s<i>, space1`
     pub static_used: Vec<([u32; 4], bool, super::ops::Sampler)>,
     pub sampler_base: u32,

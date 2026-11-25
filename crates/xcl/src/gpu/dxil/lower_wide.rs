@@ -280,7 +280,8 @@ impl Lw {
 
     /// The highest VGPR the program names (relative moves index up to it).
     fn top_vgpr(&self) -> u64 {
-        self.init.touched.iter().filter(|&&v| (VAR_VGPR..VAR_VGPR + 256).contains(&v)).map(|&v| (v - VAR_VGPR) as u64).max().unwrap_or(0)
+        let touched = self.init.touched.iter().filter(|&&v| (VAR_VGPR..VAR_VGPR + 256).contains(&v)).map(|&v| (v - VAR_VGPR) as u64).max().unwrap_or(0);
+        touched.max(self.max_vgpr)
     }
 
     pub fn movrel(&mut self, d: &Decoded, name: &str) -> LResult<()> {
@@ -292,9 +293,12 @@ impl Lw {
         let m0 = self.sreg(124);
         let top = self.top_vgpr().max(vdst).max(src_code.saturating_sub(256));
         let (rd_idx, wr_idx) = match name {
-            "v_movrels_b32" => (Some(m0), None),
-            "v_movreld_b32" => (None, Some(m0)),
-            "v_movrelsd_b32" => (Some(m0), Some(m0)),
+            "v_movrels_b32" => (Some(self.andc(m0, 0xFF)), None),
+            "v_movreld_b32" => (None, Some(self.andc(m0, 0xFF))),
+            "v_movrelsd_b32" => {
+                let m = self.andc(m0, 0xFF);
+                (Some(m), Some(m))
+            }
             "v_movrelsd_2_b32" => {
                 let r = self.andc(m0, 0x3FF);
                 let w = self.lshrc(m0, 16);

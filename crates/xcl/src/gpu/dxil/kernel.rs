@@ -605,6 +605,15 @@ impl Lw {
             track_frexp_denorm: crate::gpu::recomp::emit::tracks_frexp_f32_denorm(insts),
             has_f64_round_op: false,
             img_writes: crate::gpu::recomp::emit::image_write_srsrcs(insts),
+            max_vgpr: insts
+                .iter()
+                .flat_map(|d| {
+                    let (r, w) = crate::gpu::rdna2::vgpr_uses(d);
+                    r.into_iter().chain(w)
+                })
+                .filter(|&v| v < 256)
+                .max()
+                .unwrap_or(0),
             exec_cache: HashMap::new(),
             xs: None,
             xw: None,

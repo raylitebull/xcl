@@ -1149,6 +1149,26 @@ fn raw_buffer_oob_check_guards_32bit_wraparound() {
 }
 
 #[test]
+fn compute_movrel_uses_program_max_vgpr_and_masks_m0() {
+    use crate::gpu::recomp::CsInterface;
+    let ko = KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 };
+    // Compute mode (not Entry::Kernel): v_movrels_b32 reading v[1 + (m0 & 0xFF)] when v5 is
+    // written later in the shader must still include k=4 (v5) in the switch and mask m0 & 0xFF.
+    let code = prog(&[
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 129)], None),
+        ("V_MOVRELS_B32", "ENC_VOP1", &[("VDST", 0), ("SRC0", 256 + 1)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 5), ("SRC0", 130)], None),
+    ]);
+    let cs = CsInterface { threads: [32, 1, 1], user_sgprs: 2, tgid: [false; 3], tg_size: false, tid_components: 1 };
+    let k = super::kernel::translate_compute(&code, ko, &cs).expect("compute movrel translates");
+    super::validate::validate(&k.dxil).expect("validates");
+    if let Ok(dis) = super::validate::disassemble(&k.dxil) {
+        assert!(dis.contains("and i32") && dis.contains(", 255"), "expected m0 & 0xFF mask:\n{dis}");
+        assert!(dis.contains("icmp eq i32") && dis.contains(", 4"), "expected k=4 (v5) branch from max_vgpr:\n{dis}");
+    }
+}
+
+#[test]
 fn dot8_u32_u4_unclamped_lowers_to_dot4_add_u8_packed() {
     use crate::gpu::recomp::{dxc, runner};
     const V: u64 = 256;
