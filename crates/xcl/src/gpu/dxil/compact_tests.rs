@@ -61,7 +61,11 @@ fn a_large_program_that_repeats_itself_takes_the_compact_form() {
         return;
     }
     let o = KernelOptions { wave64: true, split: true, mem_windows: 1, sampler_base: 0 };
-    for (copies, compact) in [(2500, true), (2000, false)] {
+    // `repeated(copies)` has 4 basic blocks and 9 non-terminator instructions per copy:
+    // - 2500 copies (10k blocks, 22.5k insts) and 500 copies (2k blocks, 4.5k insts) cross
+    //   the compact threshold and take the compact form;
+    // - 400 copies (1.6k blocks, 3.6k insts) stay below both thresholds and keep plain form.
+    for (copies, compact) in [(2500, true), (500, true), (400, false)] {
         assert_eq!(translate_full(&repeated(copies), o).unwrap().dxil.len(), size(copies, o, compact), "{copies} copies");
     }
 }

@@ -267,9 +267,18 @@ pub fn automatic_plan(cfg: &Cfg, lw: &Lw, split_compute: bool) -> Option<Plan> {
     repeated.then_some(p)
 }
 
-/// Whether to consider compaction based on instruction count alone.
+/// Reachable non-terminator instruction count threshold for trying the compact form.
+const LARGE_INSTS: usize = 10_000;
+/// Reachable basic-block count threshold for trying the compact form: branch-heavy
+/// unrolled programs with thousands of small blocks (even below `LARGE_INSTS`
+/// non-terminator instructions) expand into tens of thousands of DXIL blocks and PHIs
+/// in plain form, causing excessive driver-compiler memory commit spikes.
+const LARGE_BLOCKS: usize = 2_000;
+
+/// Whether to consider compaction based on the reachable instruction and block counts.
 pub fn large(cfg: &Cfg) -> bool {
-    cfg.rpo.iter().map(|&b| cfg.blocks[b].insts.len()).sum::<usize>() >= 20_000
+    cfg.rpo.len() >= LARGE_BLOCKS
+        || cfg.rpo.iter().map(|&b| cfg.blocks[b].insts.len()).sum::<usize>() >= LARGE_INSTS
 }
 
 pub const END: u32 = u32::MAX;
