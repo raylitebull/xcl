@@ -28,12 +28,16 @@ fn is_pure_nop(name: &str) -> bool {
 /// Conservative `(use_mask, def_mask)` over `s0..s105` (bits `0..106`) and `SCC` (bit `VAR_SCC`).
 /// Any register not provably unconditionally overwritten is omitted from `def_mask`; any unknown
 /// or indexed SGPR read sets all bits in `use_mask`.
-fn inst_sreg_scc_use_def(d: &crate::gpu::rdna2::Decoded) -> (u128, u128) {
+fn inst_sreg_scc_use_def(d: &crate::gpu::rdna2::Decoded, wave64: bool) -> (u128, u128) {
     use crate::gpu::rdna2::{field_value, register_scale, Variant};
     if d.inst.name.starts_with("S_MOVREL") {
         return (ALL_SGPRS_MASK, 0);
     }
-    let cond_write = d.inst.name == "S_CMOVK_I32";
+    let cond_write = d.inst.name.starts_with("S_CMOV");
+    let rmw_dst = matches!(
+        d.inst.name,
+        "S_ADDK_I32" | "S_MULK_I32" | "S_BITSET0_B32" | "S_BITSET1_B32" | "S_BITSET0_B64" | "S_BITSET1_B64"
+    );
     let (mut u, mut def) = (0u128, 0u128);
     for o in d.ienc.operands {
         if o.ty == "OPR_SSRC_SPECIAL_SCC" {
@@ -76,11 +80,16 @@ fn inst_sreg_scc_use_def(d: &crate::gpu::rdna2::Decoded) -> (u128, u128) {
             continue;
         }
         let n = (o.size as u64).div_ceil(32).max(1);
+        // Wave32 VALU mask writers (V_CMP_*, V_ADD_CO_*, etc.) only write the low SGPR; do not
+        // mark s[v + 1] as killed.
+        let def_n = if !wave64 && o.output && o.size == 64 && !d.inst.name.starts_with("S_") { 1 } else { n };
         for r in v..(v + n).min(106) {
-            if o.input || cond_write {
+            if o.input || (o.output && (cond_write || rmw_dst)) {
                 u |= 1u128 << r;
             }
-            if o.output && !cond_write {
+        }
+        if o.output && !cond_write {
+            for r in v..(v + def_n).min(106) {
                 def |= 1u128 << r;
             }
         }
@@ -88,19 +97,19 @@ fn inst_sreg_scc_use_def(d: &crate::gpu::rdna2::Decoded) -> (u128, u128) {
     (u, def)
 }
 
-fn compute_live_out(cfg: &Cfg, mblocks: &[MicroBlock], end_live: u128) -> Vec<u128> {
+fn compute_live_out(cfg: &Cfg, mblocks: &[MicroBlock], end_live: u128, wave64: bool) -> Vec<u128> {
     let n = mblocks.len();
     let mut b_use = vec![0u128; n];
     let mut b_def = vec![0u128; n];
     for (idx, blk) in mblocks.iter().enumerate() {
         let (mut u, mut d) = (0u128, 0u128);
         for &i in &blk.insts {
-            let (iu, id) = inst_sreg_scc_use_def(&cfg.insts[i]);
+            let (iu, id) = inst_sreg_scc_use_def(&cfg.insts[i], wave64);
             u |= iu & !d;
             d |= id;
         }
         if let Term::Cond(ci, ..) = blk.term {
-            let (iu, _) = inst_sreg_scc_use_def(&cfg.insts[ci]);
+            let (iu, _) = inst_sreg_scc_use_def(&cfg.insts[ci], wave64);
             u |= iu & !d;
         }
         b_use[idx] = u;
@@ -391,7 +400,7 @@ pub fn plan(cfg: &Cfg, lw: &Lw) -> Option<Plan> {
     // bypass empty non-header jump blocks so neither `xcl_blocks` nor `FUNCTION` pays for them.
     let end_live = if lw.res.is_some() { ALL_SGPRS_MASK | SCC_LIVE_BIT } else { 0 };
     if allow_split {
-        let live_out = compute_live_out(cfg, &mblocks, end_live);
+        let live_out = compute_live_out(cfg, &mblocks, end_live, lw.wave64);
         for (idx, blk) in mblocks.iter_mut().enumerate() {
             if let Some(r) = resolved_far_jump_reg(cfg, blk) {
                 let clobber = (1u128 << r) | (1u128 << (r + 1)) | SCC_LIVE_BIT;
@@ -505,7 +514,7 @@ pub fn plan(cfg: &Cfg, lw: &Lw) -> Option<Plan> {
     }
 
     let final_live_out = if allow_split {
-        compute_live_out(cfg, &mblocks, end_live)
+        compute_live_out(cfg, &mblocks, end_live, lw.wave64)
     } else {
         vec![ALL_SGPRS_MASK | SCC_LIVE_BIT; mblocks.len()]
     };
@@ -973,4 +982,52 @@ pub fn emit_with_nest(lw: &mut Lw, cfg: &Cfg, p: &Plan, head: Block, exit: Block
         lw.seal(head);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod liveness_tests {
+    use super::*;
+    use crate::gpu::rdna2;
+
+    fn dec(name: &str, enc: &str, fields: &[(&str, u64)]) -> rdna2::Decoded {
+        let bytes = rdna2::encode(name, enc, fields, None).unwrap();
+        rdna2::decode(&bytes, 0).unwrap()
+    }
+
+    #[test]
+    fn cmov_and_rmw_salu_read_sdst_and_wave32_valu_keeps_hi_sgpr() {
+        // S_CMOV_B32 / S_CMOV_B64: conditional write reads SDST and must not kill it.
+        let cmov32 = dec("S_CMOV_B32", "ENC_SOP1", &[("SDST", 4), ("SSRC0", 2)]);
+        let (u, d) = inst_sreg_scc_use_def(&cmov32, true);
+        assert_ne!(u & (1u128 << 4), 0, "S_CMOV_B32 must use SDST");
+        assert_eq!(d & (1u128 << 4), 0, "S_CMOV_B32 must not kill SDST");
+
+        let cmov64 = dec("S_CMOV_B64", "ENC_SOP1", &[("SDST", 6), ("SSRC0", 2)]);
+        let (u, d) = inst_sreg_scc_use_def(&cmov64, true);
+        assert_eq!(u & ((1u128 << 6) | (1u128 << 7)), (1u128 << 6) | (1u128 << 7));
+        assert_eq!(d & ((1u128 << 6) | (1u128 << 7)), 0);
+
+        // RMW SALU ops (S_ADDK_I32, S_MULK_I32, S_BITSET0_B32, S_BITSET1_B64): both use and def SDST.
+        for (name, enc, fields, width) in [
+            ("S_ADDK_I32", "ENC_SOPK", &[("SDST", 8), ("SIMM16", 1)][..], 1u64),
+            ("S_MULK_I32", "ENC_SOPK", &[("SDST", 9), ("SIMM16", 3)][..], 1u64),
+            ("S_BITSET0_B32", "ENC_SOP1", &[("SDST", 10), ("SSRC0", 128)][..], 1u64),
+            ("S_BITSET1_B64", "ENC_SOP1", &[("SDST", 12), ("SSRC0", 128)][..], 2u64),
+        ] {
+            let inst = dec(name, enc, fields);
+            let (u, d) = inst_sreg_scc_use_def(&inst, true);
+            let base = fields[0].1;
+            let mask = if width == 2 { (1u128 << base) | (1u128 << (base + 1)) } else { 1u128 << base };
+            assert_eq!(u & mask, mask, "{name} must use SDST");
+            assert_eq!(d & mask, mask, "{name} must def SDST");
+        }
+
+        // Wave32 VALU mask writer (V_CMP_EQ_U32 VOP3) writes only s4, leaving s5 live.
+        let vcmp = dec("V_CMP_EQ_U32", "ENC_VOP3", &[("VDST", 4), ("SRC0", 256), ("SRC1", 257)]);
+        let (_, d32) = inst_sreg_scc_use_def(&vcmp, false);
+        assert_ne!(d32 & (1u128 << 4), 0, "Wave32 V_CMP must def s4");
+        assert_eq!(d32 & (1u128 << 5), 0, "Wave32 V_CMP must not kill s5");
+        let (_, d64) = inst_sreg_scc_use_def(&vcmp, true);
+        assert_eq!(d64 & ((1u128 << 4) | (1u128 << 5)), (1u128 << 4) | (1u128 << 5));
+    }
 }
