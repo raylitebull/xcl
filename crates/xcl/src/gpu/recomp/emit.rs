@@ -46,10 +46,9 @@ pub(super) struct Em {
     /// split wave64 (`x64`): words one exchange carries (1: masks and lane reads, up to 16:
     /// coherent scalar loads, 32: `ds_bpermute`)
     x64_words: usize,
-    /// split wave64 and pixel shaders: pc → SGPRs whose whole value may be read after that
-    /// instruction (`x64_masks`); a mask written to none of them is only read lane by lane
-    /// (split: stays in its half, no exchange; pixel: no quad reads for the helper lanes)
-    pub mask_whole_live: BTreeMap<u64, u128>,
+    /// Mask-producing instruction PC and starting SGPR destinations that require
+    /// full reconstruction (split-wave exchange or pixel helper quad reads).
+    pub full_mask_destinations: BTreeMap<u64, u128>,
     /// wave64 VS / PS on a GPU with 32-lane waves only: what the console's lanes 32..63 hold
     /// where the program reads them (`upper_lanes`), used when the wave has 32 lanes
     pub upper: Option<super::upper_lanes::UpperLanes>,
@@ -618,7 +617,7 @@ impl Em {
             uses_lds: false,
             uses_scratch: false,
             x64_words: 1,
-            mask_whole_live: BTreeMap::new(),
+            full_mask_destinations: BTreeMap::new(),
             upper: None,
             cur_pc: 0,
             static_ss: BTreeMap::new(),
@@ -978,7 +977,7 @@ impl Em {
         // lane (the half's own word, the lane's own bit are enough), that goes nowhere, or that
         // is 0 in every lane anyway
         let local = match *dst {
-            Dst::S(n) => n < 126 && self.mask_whole_live.get(&self.cur_pc).is_some_and(|live| live & (3u128 << n) == 0),
+            Dst::S(n) => n < 126 && self.full_mask_destinations.get(&self.cur_pc).is_some_and(|live| live & (1u128 << n) == 0),
             Dst::Null => true,
             Dst::V(_) => false,
         };
