@@ -1738,13 +1738,19 @@ fn make_pipelines(pipelines: &Pipelines, mut jobs: Vec<PipelineJob>) {
     order_pipeline_jobs(&mut jobs);
     let used = jobs.iter().filter(|job| job.used).count();
     println!("pipelines: {} compute programs ({used} used earlier: first), {} driver compiles at once", jobs.len(), pipelines.most);
-    let next = AtomicUsize::new(0);
+    run_pipeline_jobs(jobs, pipelines.most, |job| pipelines.make(&job.compiled));
+}
+
+fn run_pipeline_jobs<T: Send>(jobs: Vec<T>, workers: usize, build: impl Fn(&T) + Sync) {
+    let workers = workers.min(jobs.len());
+    let jobs = Mutex::new(jobs.into_iter());
     std::thread::scope(|scope| {
-        for _ in 0..pipelines.most.min(jobs.len()) {
+        for _ in 0..workers {
             scope.spawn(|| loop {
-                let index = next.fetch_add(1, Ordering::Relaxed);
-                let Some(job) = jobs.get(index) else { break };
-                pipelines.make(&job.compiled);
+                let job = jobs.lock().unwrap().next();
+                let Some(job) = job else { break };
+                // Release the job's buffers as soon as its driver build returns.
+                build(&job);
             });
         }
     });
@@ -1767,6 +1773,25 @@ mod pipeline_selection_tests {
         order_pipeline_jobs(&mut jobs);
         let order: Vec<_> = jobs.iter().map(|job| (job.used, job.compiled.dxil.len())).collect();
         assert_eq!(order, [(true, 50), (true, 5), (false, 900), (false, 10)]);
+    }
+
+    #[test]
+    fn offline_pipeline_jobs_drop_their_inputs_after_each_build() {
+        use std::sync::Arc;
+
+        let jobs: Vec<_> = (0..3).map(Arc::new).collect();
+        let inputs: Vec<_> = jobs.iter().map(Arc::downgrade).collect();
+        let next = AtomicUsize::new(0);
+        run_pipeline_jobs(jobs, 1, |job| {
+            let index = next.fetch_add(1, Ordering::Relaxed);
+            assert_eq!(**job, index, "jobs keep their priority order");
+            assert!(inputs[..index].iter().all(|input| input.upgrade().is_none()),
+                "completed jobs still hold their inputs");
+            assert!(inputs[index..].iter().all(|input| input.upgrade().is_some()),
+                "active and queued jobs need their inputs");
+        });
+        assert_eq!(next.into_inner(), inputs.len());
+        assert!(inputs.iter().all(|input| input.upgrade().is_none()));
     }
 
     #[test]
