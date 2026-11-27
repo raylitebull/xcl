@@ -6,7 +6,8 @@
 //!   riid, out), CreateStatusArray(capacity, name, riid, out), SetCpuAffinity(mask),
 //!   SetDebugFlags(flags), SetStagingBufferSize(bytes), then 7 more,
 //! * queue desc (0x18): source type u32 @0 (0 file, 1 memory), capacity u16 @8, priority i8
-//!   @10 (-1 … 2; memory queues 2), name @0x10,
+//!   @10 (-1 … 2; memory queues 2), name @0x10; the newer factory's desc (0x20) adds options
+//!   u64 @0x18 (`DSTORAGE_QUEUE_OPTIONS`: bit 0 `AutoSubmitDisabled`),
 //! * request (0x48): options u64 @0 (`DSTORAGE_REQUEST_OPTIONS`: bit 0 `ZlibDecompress`,
 //!   bits 1–4 `BcpackMode`, bits 5–20 `SwizzleMode`, bit 21 `DestinationIsPhysicalPages`,
 //!   bit 22 `SourceType` (0 file / 1 memory), bit 23 `SourceIsPhysicalPages`),
@@ -344,11 +345,9 @@ unsafe fn bcpack_fill(r: &Request, target: &FillTarget) -> bool {
     let ok = match target {
         FillTarget::Pages(pages) => crate::hle::kernelx::write_physical_pages(pages, r.destination_page_offset as usize, &bytes),
         FillTarget::Virtual => {
-            if !writable(r.destination as usize, n) {
-                return false;
-            }
+            let Some(dest) = cpu_range(r.destination as usize, n).filter(|&d| writable(d, n)) else { return false };
             if n > 0 {
-                std::ptr::copy_nonoverlapping(bytes.as_ptr(), r.destination as *mut u8, n);
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), dest as *mut u8, n);
             }
             true
         }
@@ -482,17 +481,25 @@ unsafe extern "system" fn factory_unknown(_p: *mut c_void) -> HRESULT {
     E_NOTIMPL
 }
 
+/// `DSTORAGE_QUEUE_OPTIONS` bit 0: the queue runs its requests only at `Submit`, not when it is
+/// half full.
+const AUTO_SUBMIT_DISABLED: u64 = 1;
+
 /// Slot 10 of the newer factory: CreateQueue with a 0x20-byte desc – the 0x18 of
-/// `factory_create_queue`, then a u64 (a retail game: 1).
-unsafe extern "system" fn factory_create_queue1(p: *mut c_void, desc: *const u8, riid: *const GUID, out: *mut *mut c_void) -> HRESULT {
+/// `factory_create_queue`, then the queue's options u64 (a retail game: `AutoSubmitDisabled`).
+unsafe extern "system" fn factory_create_queue1(_p: *mut c_void, desc: *const u8, riid: *const GUID, out: *mut *mut c_void) -> HRESULT {
+    let mut options = 0;
     if !desc.is_null() {
-        let extra = (desc.add(0x18) as *const u64).read_unaligned();
+        options = (desc.add(0x18) as *const u64).read_unaligned();
         static SEEN: AtomicBool = AtomicBool::new(false);
         if !SEEN.swap(true, Ordering::Relaxed) {
-            crate::xlog_info!("DirectStorage: CreateQueue (0x20 desc), u64 @0x18 = {extra:#x}");
+            crate::xlog_info!("DirectStorage: CreateQueue (0x20 desc), options {options:#x}");
+        }
+        if options & !AUTO_SUBMIT_DISABLED != 0 {
+            warn_once("DSTORAGE_QUEUE_OPTIONS", format_args!("unknown queue option bits {:#x}", options & !AUTO_SUBMIT_DISABLED));
         }
     }
-    factory_create_queue(p, desc, riid, out)
+    create_queue(desc, riid, out, options & AUTO_SUBMIT_DISABLED == 0)
 }
 
 unsafe extern "system" fn factory_set_cpu_affinity(_p: *mut c_void, _mask: u64) -> HRESULT {
@@ -803,11 +810,52 @@ unsafe fn snapshot_page_array(ptr: u64, offset: u16, byte_len: u32) -> Result<Ve
     Ok(pages)
 }
 
-unsafe fn read_own(at: usize, out: *mut u8, len: usize) -> bool {
+/// `len` bytes of this process at `at` into `out`, false when any cannot be read (a page not
+/// committed, or decommitted meanwhile: the kernel's copy fails, nothing faults)
+pub(crate) unsafe fn read_own(at: usize, out: *mut u8, len: usize) -> bool {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut done = 0usize;
     at != 0 && ReadProcessMemory(GetCurrentProcess(), at as *const c_void, out as *mut c_void, len, &mut done) != 0 && done == len
+}
+
+/// Whether `[p, p + n)` lies in XCL's sparse windows: memory the title's GPU heaps are in. XCL
+/// commits their allocations whole; a part of one that the title gave back is found by the write
+/// (`write_title`), not by a query of the pages (a VirtualQuery there walks to the end of the
+/// committed run: 3-5 ms each for a 1-2 GB heap).
+fn in_sparse_memory(p: usize, n: usize) -> bool {
+    let Some(u) = crate::gpu::uma::get() else { return false };
+    n > 0 && u.is_sparse(p) && p.checked_add(n - 1).is_some_and(|e| u.is_sparse(e))
+}
+
+/// The bytes into the title's memory; false when the memory is not there (a write that faults).
+unsafe fn write_title(p: usize, bytes: &[u8]) -> bool {
+    #[link(name = "ntdll", kind = "raw-dylib")]
+    extern "system" {
+        fn NtWriteVirtualMemory(process: HANDLE, at: *mut c_void, data: *const c_void, len: usize, done: *mut usize) -> i32;
+    }
+    let mut done = 0usize;
+    let st = NtWriteVirtualMemory(windows_sys::Win32::System::Threading::GetCurrentProcess(), p as *mut c_void, bytes.as_ptr().cast(), bytes.len(), &mut done);
+    st >= 0 && done == bytes.len()
+}
+
+/// Where the CPU reads or writes `[p, p + n)` of the title's memory for a request: a GPU view of
+/// its memory in a view window (`d3d12x::view_want`; the CPU cannot touch it) at the CPU view
+/// behind it, whose pages the view's tiles show – a retail title gives DirectStorage the GPU
+/// view's addresses; any other address as it is. None: the range runs past its GPU view, or its
+/// pages are kept apart (the queue's page mappings: written there, it would land in another
+/// page's bytes).
+fn cpu_range(p: usize, n: usize) -> Option<usize> {
+    cpu_range_in(p, n, |a| crate::hle::d3d12x::view_want::is_view(a as u64))
+}
+
+/// `cpu_range`, with `in_view` saying which addresses lie in a view window.
+fn cpu_range_in(p: usize, n: usize, in_view: impl Fn(usize) -> bool) -> Option<usize> {
+    if p == 0 || !in_view(p) {
+        return Some(p);
+    }
+    // (every page of the range, not only its first and last byte)
+    crate::hle::d3d12x::view_want::cpu_run(p as u64, n as u64).map(|c| c as usize)
 }
 
 /// Whether `n` bytes at `p` are committed, writable memory.
@@ -874,13 +922,26 @@ fn note_request(r: &Request) {
             r.intermediate_size
         );
     }
+    // destinations in a GPU view (written at its CPU view, `cpu_range`)
+    if !r.dest_physical_pages() && crate::hle::d3d12x::view_want::is_view(r.destination) {
+        static VIEW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        static VIEW_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let k = VIEW.fetch_add(1, Ordering::Relaxed) + 1;
+        let b = VIEW_BYTES.fetch_add(n as u64, Ordering::Relaxed) + n as u64;
+        if k.is_power_of_two() {
+            crate::xlog_info!("DirectStorage: {k} requests so far into a GPU view of the title's memory ({} MB), written at its CPU view", b >> 20);
+        }
+    }
 }
 
 /// Run a request; the destination gets the bytes or nothing.
 unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[usize]>, dest_on_stack: bool, src_pages: Option<&[usize]>) -> Result<(), HRESULT> {
     let n = r.destination_size as usize;
     note_request(r);
-    if !r.dest_physical_pages() && !writable(r.destination as usize, n) {
+    // (a page list is read where it is: only a destination of bytes can be a GPU view)
+    let dest = if r.dest_physical_pages() { r.destination as usize } else { cpu_range(r.destination as usize, n).ok_or(E_ACCESS_VIOLATION)? };
+    let sparse_dest = !r.dest_physical_pages() && in_sparse_memory(dest, n);
+    if !r.dest_physical_pages() && !sparse_dest && !writable(dest, n) {
         return Err(E_ACCESS_VIOLATION);
     }
     let src: Vec<u8> = if r.memory_source() {
@@ -891,11 +952,12 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
                 return Err(E_ACCESS_VIOLATION);
             }
         } else {
-            if !crate::gpu::shader::readable(r.source as usize, r.source_size as usize) {
+            let at = cpu_range(r.source as usize, b.len()).ok_or(E_ACCESS_VIOLATION)?;
+            if !crate::gpu::shader::readable(at, r.source_size as usize) {
                 return Err(E_ACCESS_VIOLATION);
             }
             if !b.is_empty() {
-                std::ptr::copy_nonoverlapping(r.source as *const u8, b.as_mut_ptr(), b.len());
+                std::ptr::copy_nonoverlapping(at as *const u8, b.as_mut_ptr(), b.len());
             }
         }
         b
@@ -959,11 +1021,10 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
         // A page number of 0 in the snapshot taken at enqueue (no page has it): the entry is
         // read again now. A retail title keeps its page arrays in its own tables and fills an
         // entry after EnqueueRequest – its streaming requests were refused by the thousand
-        // with page 0. An array that had its pages at enqueue stays as it was snapshotted
-        // (titles also pass arrays on the stack). The title keeps an array with such an entry
-        // until the request is done: one it has freed or reused meanwhile cannot be told from
-        // a late fill. Read like the snapshot (`read_own`): an array unmapped since then fails
-        // the request instead of faulting in this worker (#476).
+        // with page 0. The title keeps an array with such an entry until the request is done: one
+        // it has freed or reused meanwhile cannot be told from a late fill. Read like the snapshot
+        // (`read_own`): an array unmapped since then fails the request instead of faulting in this
+        // worker (#476).
         let late: Vec<usize>;
         let pages = if pages.contains(&0) {
             let mut now = vec![0usize; pages.len()];
@@ -980,7 +1041,16 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
             return Err(E_ACCESS_VIOLATION);
         }
     } else if n > 0 {
-        std::ptr::copy_nonoverlapping(payload.as_ptr(), r.destination as *mut u8, n);
+        crate::hle::kernelx::pagelog::note("DirectStorage write", dest, 0, n);
+        if sparse_dest {
+            if !write_title(dest, &payload[..n]) {
+                return Err(E_ACCESS_VIOLATION);
+            }
+        } else {
+            std::ptr::copy_nonoverlapping(payload.as_ptr(), dest as *mut u8, n);
+        }
+        // (where the bytes are: the CPU view's pages are watched and shown, a GPU view's are not)
+        crate::hle::d3d12x::title_textures::note_known_write(dest, n);
     }
     Ok(())
 }
@@ -1073,6 +1143,11 @@ struct QueueInner {
     pool_override: OnceLock<Option<Arc<parallel::DecompressPool>>>,
     #[cfg(test)]
     test_hook: OnceLock<parallel::TestHook>,
+    /// a half-full queue submits by itself (not when made with `AutoSubmitDisabled`)
+    auto_submit: bool,
+    /// signalled when pending entries leave (`Submit`, a cancel, `Close`): a full queue made with
+    /// `AutoSubmitDisabled` holds its next enqueue until then
+    room: Condvar,
 }
 
 impl QueueInner {
@@ -1103,6 +1178,7 @@ impl QueueInner {
             return;
         }
         let batch = std::mem::take(&mut self.pending.lock().unwrap().entries);
+        self.room.notify_all();
         if batch.is_empty() {
             return;
         }
@@ -1203,9 +1279,19 @@ impl QueueInner {
         }
     }
 
+    /// A queue made with `AutoSubmitDisabled` that holds `capacity` entries: wait until the title's
+    /// `Submit` (from another thread), a cancel or `Close` takes some, as the console's queue
+    /// stalls an enqueue at capacity. Others never wait: they submit when half full.
+    fn wait_for_room<'a>(&self, mut p: std::sync::MutexGuard<'a, Pending>) -> std::sync::MutexGuard<'a, Pending> {
+        while !self.auto_submit && p.entries.len() >= self.capacity && !self.closed.load(Ordering::Acquire) {
+            p = self.room.wait(p).unwrap();
+        }
+        p
+    }
+
     fn enqueue(self: &Arc<Self>, e: Entry) {
         let n = {
-            let mut p = self.pending.lock().unwrap();
+            let mut p = self.wait_for_room(self.pending.lock().unwrap());
             if self.closed.load(Ordering::Acquire) {
                 return;
             }
@@ -1218,7 +1304,7 @@ impl QueueInner {
             p.entries.len()
         };
         // as on PC: a half-full queue submits by itself
-        if n >= (self.capacity / 2).max(1) {
+        if self.auto_submit && n >= (self.capacity / 2).max(1) {
             self.submit();
         }
     }
@@ -1234,7 +1320,7 @@ impl QueueInner {
 
     fn enqueue_numbered(self: &Arc<Self>, entry: impl FnOnce(u64) -> Entry) {
         let n = {
-            let mut p = self.pending.lock().unwrap();
+            let mut p = self.wait_for_room(self.pending.lock().unwrap());
             if self.closed.load(Ordering::Acquire) {
                 return;
             }
@@ -1243,7 +1329,7 @@ impl QueueInner {
             p.entries.push(entry(seq));
             p.entries.len()
         };
-        if n >= (self.capacity / 2).max(1) {
+        if self.auto_submit && n >= (self.capacity / 2).max(1) {
             self.submit();
         }
     }
@@ -1280,6 +1366,11 @@ fn queue_vtbl() -> &'static [usize] {
 }
 
 unsafe extern "system" fn factory_create_queue(_p: *mut c_void, desc: *const u8, riid: *const GUID, out: *mut *mut c_void) -> HRESULT {
+    create_queue(desc, riid, out, true)
+}
+
+/// A queue from the 0x18 bytes of `desc` (`auto_submit`: a half-full queue submits by itself).
+unsafe fn create_queue(desc: *const u8, riid: *const GUID, out: *mut *mut c_void, auto_submit: bool) -> HRESULT {
     if out.is_null() {
         return E_POINTER;
     }
@@ -1320,6 +1411,8 @@ unsafe extern "system" fn factory_create_queue(_p: *mut c_void, desc: *const u8,
         pool_override: OnceLock::new(),
         #[cfg(test)]
         test_hook: OnceLock::new(),
+        auto_submit,
+        room: Condvar::new(),
     });
     let o = new_object(queue_vtbl(), inner);
     let hr = queue_qi(o, riid, out);
@@ -1452,6 +1545,7 @@ unsafe extern "system" fn queue_cancel(p: *mut c_void, mask: u64, value: u64) {
     let cutoff = {
         let mut pend = q.pending.lock().unwrap();
         pend.entries.retain(|e| !matches!(e, Entry::Request { req, .. } | Entry::Refused { req, .. } if req.tag & mask == value));
+        q.room.notify_all();
         pend.next_seq.saturating_sub(1)
     };
     if cutoff == 0 {
@@ -1479,6 +1573,8 @@ unsafe extern "system" fn queue_close(p: *mut c_void) {
             std::mem::take(&mut pend.entries)
         }
     };
+    // an enqueue held by a full queue goes on (and finds the queue closed)
+    q.room.notify_all();
     for e in drained {
         if let Entry::Status(s, i) = e {
             if let Some(slot) = s.slots.get(i as usize) {
@@ -1578,6 +1674,114 @@ mod tests {
         b
     }
 
+    /// A queue the newer factory makes with `AutoSubmitDisabled` runs its requests at `Submit`
+    /// only, not when it is half full; one made without the option still submits by itself.
+    #[test]
+    fn a_queue_with_auto_submit_disabled_waits_for_submit() {
+        use std::time::{Duration, Instant};
+        unsafe {
+            let mut f = std::ptr::null_mut();
+            assert_eq!(DStorageGetFactory(&IID_FACTORY_X1, &mut f), S_OK);
+            let vt = *(f as *const *const usize);
+            let create_queue1: unsafe extern "system" fn(*mut c_void, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(10));
+            for (options, by_itself) in [(AUTO_SUBMIT_DISABLED, false), (0, true)] {
+                let mut desc = [0u8; 0x20];
+                desc[0..4].copy_from_slice(&1u32.to_le_bytes()); // memory source
+                desc[8..10].copy_from_slice(&4u16.to_le_bytes()); // capacity 4: half full at 2
+                desc[10] = 2;
+                desc[0x18..0x20].copy_from_slice(&options.to_le_bytes());
+                let mut q = std::ptr::null_mut();
+                assert_eq!(create_queue1(f, desc.as_ptr(), &IID_QUEUE_X1, &mut q), S_OK);
+                let qv = *(q as *const *const usize);
+                let enqueue: unsafe extern "system" fn(*mut c_void, *const u8) = std::mem::transmute(*qv.add(3));
+                let submit: unsafe extern "system" fn(*mut c_void) = std::mem::transmute(*qv.add(6));
+
+                let src = [0x5Au8; 64];
+                let dst = [vec![0u8; 64], vec![0u8; 64]];
+                for d in &dst {
+                    enqueue(q, request(SOURCE_MEMORY_BIT, d.as_ptr() as u64, 64, src.as_ptr() as u64, 0, 64).as_ptr());
+                }
+                let done = || dst.iter().all(|d| d.iter().all(|b| std::ptr::read_volatile(b) == 0x5A));
+                let t = Instant::now();
+                while !done() && t.elapsed() < Duration::from_millis(300) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                assert_eq!(done(), by_itself, "options {options:#x}: a half-full queue submits by itself only without AutoSubmitDisabled");
+                if !by_itself {
+                    submit(q);
+                    let t = Instant::now();
+                    while !done() && t.elapsed() < Duration::from_secs(5) {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    assert!(done(), "Submit runs the queue's requests");
+                }
+                queue_close(q);
+                queue_release(q);
+            }
+        }
+    }
+
+    /// A full queue made with `AutoSubmitDisabled` holds the next enqueue until another thread's
+    /// `Submit` takes its entries, and `Close` lets a held enqueue go (into the closed queue).
+    #[test]
+    fn a_full_queue_with_auto_submit_disabled_holds_an_enqueue_until_submit() {
+        use std::time::{Duration, Instant};
+        unsafe {
+            let mut f = std::ptr::null_mut();
+            assert_eq!(DStorageGetFactory(&IID_FACTORY_X1, &mut f), S_OK);
+            let vt = *(f as *const *const usize);
+            let create_queue1: unsafe extern "system" fn(*mut c_void, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(10));
+            let mut desc = [0u8; 0x20];
+            desc[0..4].copy_from_slice(&1u32.to_le_bytes()); // memory source
+            desc[8..10].copy_from_slice(&2u16.to_le_bytes()); // capacity 2
+            desc[10] = 2;
+            desc[0x18..0x20].copy_from_slice(&AUTO_SUBMIT_DISABLED.to_le_bytes());
+            for close_instead in [false, true] {
+                let mut q = std::ptr::null_mut();
+                assert_eq!(create_queue1(f, desc.as_ptr(), &IID_QUEUE_X1, &mut q), S_OK);
+                let qv = *(q as *const *const usize);
+                let enqueue: unsafe extern "system" fn(*mut c_void, *const u8) = std::mem::transmute(*qv.add(3));
+                let submit: unsafe extern "system" fn(*mut c_void) = std::mem::transmute(*qv.add(6));
+
+                let src = [0x3Cu8; 64];
+                let dst = [vec![0u8; 64], vec![0u8; 64], vec![0u8; 64]];
+                let req = |k: usize| request(SOURCE_MEMORY_BIT, dst[k].as_ptr() as u64, 64, src.as_ptr() as u64, 0, 64);
+                enqueue(q, req(0).as_ptr());
+                enqueue(q, req(1).as_ptr());
+                // the queue is full: a third enqueue waits
+                let (third, qa) = (req(2), q as usize);
+                let t = std::thread::spawn(move || {
+                    let e: unsafe extern "system" fn(*mut c_void, *const u8) = enqueue;
+                    e(qa as *mut c_void, third.as_ptr());
+                });
+                std::thread::sleep(Duration::from_millis(200));
+                assert!(!t.is_finished(), "an enqueue into a full queue waits");
+                if close_instead {
+                    queue_close(q);
+                } else {
+                    submit(q);
+                }
+                let t0 = Instant::now();
+                while !t.is_finished() && t0.elapsed() < Duration::from_secs(5) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                assert!(t.is_finished(), "{} lets the held enqueue go", if close_instead { "Close" } else { "Submit" });
+                t.join().unwrap();
+                if !close_instead {
+                    submit(q);
+                    let done = || dst.iter().all(|d| d.iter().all(|b| std::ptr::read_volatile(b) == 0x3C));
+                    let t0 = Instant::now();
+                    while !done() && t0.elapsed() < Duration::from_secs(5) {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    assert!(done(), "all three requests ran");
+                    queue_close(q);
+                }
+                queue_release(q);
+            }
+        }
+    }
+
     #[test]
     fn a_refused_factory_iid_returns_e_nointerface_and_clears_out() {
         unsafe {
@@ -1608,6 +1812,70 @@ mod tests {
         assert_eq!(Request::parse(&request(7 << BCPACK_SHIFT, 0x1000, 24, 0x2000, 0, 20)).check(false), Err(E_DESTINATION_SIZE), "BCPack BC7 part block");
         assert_eq!(Request::parse(&request(4 << BCPACK_SHIFT, 0x1000, 12, 0x2000, 0, 20)).check(false), Err(E_DESTINATION_SIZE), "BCPack BC4 part block");
         assert_eq!(Request::parse(&request(0, 0, 64, 0x2000, 0, 64)).check(false), Err(E_ACCESS_VIOLATION));
+    }
+
+    /// A destination (or memory source) in a GPU view of the title's memory is reached at the CPU
+    /// view behind it – the CPU cannot touch the GPU view, and such a request failed with
+    /// E_ACCESS_VIOLATION; a range that runs past the view is refused, and every other address,
+    /// every one without view windows too, is used as it is.
+    #[test]
+    fn a_range_in_a_gpu_view_is_reached_at_its_cpu_view() {
+        use crate::hle::kernelx::mirrors;
+        const SIZE: usize = 67 << 16;
+        // (addresses far above anything Windows hands out: only the pairing is used)
+        let (c, g) = (0x7250_0000_0000usize, 0x7258_0000_0000usize);
+        mirrors::reserved(c, SIZE, 0x2040_2000, 0x04);
+        assert!(mirrors::reserved(g, SIZE, 0x2040_2000, 0x801));
+        let view = |a: usize| (g..g + SIZE).contains(&a);
+        assert_eq!(cpu_range_in(g + 0x1_2340, 0x800, view), Some(c + 0x1_2340));
+        assert_eq!(cpu_range_in(g + SIZE - 0x100, 0x100, view), Some(c + SIZE - 0x100));
+        assert_eq!(cpu_range_in(g + SIZE - 0x100, 0x101, view), None, "past the view's end");
+        assert_eq!(cpu_range_in(g, 0, view), Some(c));
+        assert_eq!(cpu_range_in(c + 0x40, 0x100, view), Some(c + 0x40), "the CPU view itself");
+        assert_eq!(cpu_range_in(g + 0x40, 0x100, |_| false), Some(g + 0x40), "no view windows: as it was");
+        mirrors::released(c);
+        assert_eq!(cpu_range_in(g + 0x40, 0x100, view), Some(g + 0x40), "unpaired: as it was (and refused where it is written)");
+    }
+
+    /// A range over GPU-view pages the queue's page mappings keep apart is refused (it would be
+    /// written into another page's bytes); one inside a single page is reached where that page is
+    /// kept, and one over pages never named at the CPU view, as before.
+    #[test]
+    fn a_range_over_gpu_view_pages_kept_apart_is_refused() {
+        use crate::hle::d3d12x::view_want::cpu_run;
+        use crate::hle::kernelx::{self, mirrors::{self, PAGE}};
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+        unsafe {
+            if crate::gpu::uma::get().is_none() {
+                return crate::gpu::recomp::runner::skip_test("no unified memory");
+            }
+            // a pair of views of a size of the test's own, and two physical pages at their home:
+            // the pool
+            let size = 229 * PAGE;
+            let c = VirtualAlloc(std::ptr::null(), size, MEM_RESERVE, PAGE_READWRITE) as usize;
+            let g = VirtualAlloc(std::ptr::null(), size, MEM_RESERVE, PAGE_READWRITE) as usize;
+            assert!(c != 0 && g != 0);
+            mirrors::reserved(c, size, 0x2040_2000, 0x04);
+            assert!(mirrors::reserved(g, size, 0x2040_2000, 0x801));
+            let (mut n, mut pages) = (2usize, [0usize; 2]);
+            assert_eq!(kernelx::AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut n, pages.as_mut_ptr()), 1);
+            let home = kernelx::MapTitlePhysicalPages(std::ptr::null_mut(), 2, 0, 4, pages.as_mut_ptr()) as usize;
+            assert_ne!(home, 0);
+            // pool page 1 at view page 0, pool page 0 at view page 1: kept apart
+            let ranges: [[u32; 3]; 2] = [[0, 1, 1], [0, 0, 1]];
+            let batch = [g as u64, 2, ranges.as_ptr() as u64];
+            assert!(mirrors::apply_batches(1, batch.as_ptr() as usize, home, 2).is_some());
+            let view = |a: usize| (g..g + size).contains(&a);
+            assert_eq!(cpu_run(g as u64, 2 * PAGE as u64), None);
+            assert_eq!(cpu_range_in(g + PAGE - 8, 16, view), None, "over two pages kept apart");
+            assert_eq!(cpu_range_in(g + 8, 16, view), Some(home + PAGE + 8), "inside one: where it is kept");
+            assert_eq!(cpu_range_in(g + PAGE + 8, 16, view), Some(home + 8));
+            assert_eq!(cpu_range_in(g + 2 * PAGE, 2 * PAGE, view), Some(c + 2 * PAGE), "pages never named: the CPU view");
+            kernelx::FreeTitlePhysicalPages(std::ptr::null_mut(), 2, pages.as_mut_ptr());
+            mirrors::released(c);
+            VirtualFree(c as *mut c_void, 0, MEM_RELEASE);
+            VirtualFree(g as *mut c_void, 0, MEM_RELEASE);
+        }
     }
 
     #[test]

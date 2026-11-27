@@ -83,6 +83,11 @@ pub(super) fn unmark(page: usize) -> bool {
     LAZY.write().unwrap_or_else(|e| e.into_inner()).remove(&page)
 }
 
+/// Whether `page` is mapped and still not committed.
+pub(super) fn is_marked(page: usize) -> bool {
+    LAZY.read().unwrap_or_else(|e| e.into_inner()).contains(&page)
+}
+
 /// The lazy pages of `[p, p + len)` committed – memory a kernel call or XCL writes.
 pub fn ensure(p: usize, len: usize) {
     if len == 0 {

@@ -14,6 +14,153 @@ fn prog(list: &[(&str, &str, &[(&str, u64)], Option<u32>)]) -> Vec<u8> {
     v
 }
 
+/// One console wave in two hardware halves (33 to 64 threads a group): the halves of a compute
+/// or mesh group exchange through the bounded counters, as those of larger groups do, and meet
+/// at no group barrier after the one at the program's start. A barrier at every exchange hung NVIDIA
+/// GPUs when several such programs ran at once (#1727; the change is #1741's).
+#[test]
+fn a_single_split_wave_of_a_compute_group_exchanges_without_a_group_barrier() {
+    use crate::gpu::recomp::CsInterface;
+    // v1 = lane 32's v0: the lower half needs the upper half's value
+    let code = prog(&[("V_READLANE_B32", "ENC_VOP3", &[("VDST", 1), ("SRC0", 256), ("SRC1", 160)], None)]);
+    let o = KernelOptions { wave64: true, split: true, mem_windows: 1, sampler_base: 0 };
+    let dis = |threads: u32, code: &[u8]| {
+        let cs = CsInterface { threads: [threads, 1, 1], user_sgprs: 0, tgid: [false; 3], tg_size: false, tid_components: 1 };
+        super::validate::disassemble(&super::kernel::translate_compute(code, o, &cs).unwrap_or_else(|e| panic!("{threads} threads: {e}")).dxil)
+    };
+    // (barrier mode 9: the thread group's sync with its memory fence, `ops::barrier::GROUP_SYNC`)
+    let syncs = |d: &str| d.matches("@dx.op.barrier(i32 80, i32 9)").count();
+    let Ok(alone) = dis(32, &code) else {
+        crate::gpu::recomp::runner::skip_test("no DXC");
+        return;
+    };
+    assert_eq!(syncs(&alone), 1, "the start's barrier:
+{alone}");
+    assert!(alone.matches("atomicrmw").count() < 3, "a half without a partner does not wait for one:
+{alone}");
+    for threads in [33, 64, 128] {
+        let d = dis(threads, &code).unwrap();
+        assert_eq!(syncs(&d), 1, "{threads} threads: a group barrier at the exchange:
+{d}");
+        assert!(d.matches("atomicrmw").count() >= 3, "{threads} threads: the exchange's counters:
+{d}");
+    }
+    // the text before the start's barrier, and after it
+    let at_start = |d: &str| d.split_at(d.find("@dx.op.barrier(i32 80, i32 9)").expect("the start's barrier")).0.to_string();
+    // the value (`%N`) the first line of `pre` that `hit` accepts defines
+    fn def(pre: &str, hit: impl Fn(&str) -> bool) -> Option<String> {
+        pre.lines().find(|l| hit(l)).and_then(|l| l.trim().split_once(" = ")).map(|(n, _)| n.to_string())
+    }
+    // a zero stored through that address in `pre`
+    fn zeroed(pre: &str, at: Option<String>) -> bool {
+        at.is_some_and(|p| pre.contains(&format!("store i32 0, i32 addrspace(3)* {p},")))
+    }
+    // without LDS: slots and counters of their own (one console wave: 4 slot words, 2 counters),
+    // the counters zeroed before the start's barrier
+    let d = dis(64, &code).unwrap();
+    assert!(d.contains("@xcl_xs = external addrspace(3) global [4 x i32]") && d.contains("@xcl_xc = external addrspace(3) global [2 x i32]"), "the spin storage:
+{d}");
+    let pre = at_start(&d);
+    assert!(zeroed(&pre, def(&pre, |l| l.contains("addrspace(3)* @xcl_xc, i32 0, i32 %"))), "the counters zeroed before the start's barrier:
+{d}");
+    // a mesh program's compute pass of one console wave (48 or 64 threads) exchanges the same way
+    for threads in [48, 64] {
+        let ms = crate::gpu::recomp::MsInterface { outputs: vec![], threads, max_vertices: 64, max_primitives: 64 };
+        let d = super::validate::disassemble(&super::kernel::translate_mesh(&code, o, &ms).unwrap_or_else(|e| panic!("mesh, {threads} threads: {e}")).dxil).unwrap();
+        assert_eq!(syncs(&d), 1, "mesh, {threads} threads: a group barrier at the exchange:
+{d}");
+        assert!(d.contains("@xcl_xc = external addrspace(3) global [2 x i32]") && d.matches("atomicrmw").count() >= 3, "mesh, {threads} threads: the exchange's counters:
+{d}");
+        let pre = at_start(&d);
+        assert!(zeroed(&pre, def(&pre, |l| l.contains("addrspace(3)* @xcl_xc, i32 0, i32 %"))), "mesh, {threads} threads: the counters zeroed before the start's barrier:
+{d}");
+    }
+    // with the program's LDS the counters live in its top words
+    let with_lds = prog(&[
+        ("DS_WRITE_B32", "ENC_DS", &[("ADDR", 1), ("DATA0", 0)], None),
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 1), ("SRC0", 256), ("SRC1", 160)], None),
+    ]);
+    let d = dis(64, &with_lds).unwrap();
+    assert_eq!(syncs(&d), 1, "a group barrier at the exchange (LDS):
+{d}");
+    assert!(d.matches("atomicrmw").count() >= 3, "the exchange's counters (LDS):
+{d}");
+    // the HLSL layout: the thread counter in the top word (8191), the two counters below it
+    // (8189, 8190: zeroed before the start's barrier), the 4 slot words below them (from
+    // 8192 - 4 - 2 - 1 = 8185), and the program's LDS clamped below the slots (8184)
+    let pre = at_start(&d);
+    let rest = &d[pre.len()..];
+    let index = def(&pre, |l| l.ends_with(", 8189"));
+    let counter = index.and_then(|i| def(&pre, |l| l.contains("@xcl_lds, i32 0, i32 ") && l.ends_with(&format!(" {i}"))));
+    assert!(pre.contains("@xcl_lds, i32 0, i32 8191") && zeroed(&pre, counter), "the top word and the counters zeroed before the start's barrier:
+{d}");
+    assert!(rest.contains(", 8185"), "the slots from word 8185:
+{d}");
+    assert_eq!(rest.matches(", 8189").count(), 2, "this half's and the partner's counter:
+{d}");
+    assert!(rest.contains("i32 8184)"), "the program's LDS below the exchange:
+{d}");
+}
+
+/// The split form keeps the console wave's order of LDS accesses (`Lw::lds_in_order`): an LDS
+/// read after a write, and a write after a read, meet the other half first (the kernel form's
+/// group barrier, a compute group's counters); a read with no write since the last meet does
+/// not, and a half without a partner and the native form never do. In a loop the meet is
+/// conditional on the bits, and still validates.
+#[test]
+fn split_lds_reads_meet_after_writes() {
+    use crate::gpu::recomp::CsInterface;
+    type Inst<'a> = (&'a str, &'a str, &'a [(&'a str, u64)], Option<u32>);
+    let write: Inst = ("DS_WRITE_B32", "ENC_DS", &[("ADDR", 1), ("DATA0", 0)], None);
+    let read: Inst = ("DS_READ_B32", "ENC_DS", &[("VDST", 2), ("ADDR", 1)], None);
+    let syncs = |d: &str| d.matches("@dx.op.barrier(i32 80, i32 9)").count();
+    let kernel = |list: &[Inst], split: bool| {
+        let o = KernelOptions { wave64: true, split, mem_windows: 1, sampler_base: 0 };
+        super::validate::disassemble(&translate(&prog(list), o).unwrap_or_else(|e| panic!("{e}")))
+    };
+    let Ok(rw) = kernel(&[write, read], true) else {
+        crate::gpu::recomp::runner::skip_test("no DXC");
+        return;
+    };
+    let w = syncs(&kernel(&[write], true).unwrap());
+    assert_eq!(syncs(&rw), w + 1, "the read meets after the write:\n{rw}");
+    assert_eq!(syncs(&kernel(&[write, write], true).unwrap()), w, "a write after a write");
+    assert_eq!(syncs(&kernel(&[read, write], true).unwrap()), w + 1, "the write meets after the read");
+    assert_eq!(syncs(&kernel(&[write, read, read], true).unwrap()), w + 1, "the second read: the halves met since the write");
+    assert_eq!(syncs(&kernel(&[write, read, write], true).unwrap()), w + 2, "a meet before the read and before the second write");
+    let native = |list: &[Inst]| syncs(&kernel(list, false).unwrap());
+    assert_eq!(native(&[write, read]), native(&[write]), "the native form");
+    // a loop: read, write, three times – each waits for the other from the second pass on
+    let looped = |body: &[Inst]| {
+        let mut l: Vec<Inst> = vec![("S_MOV_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 131)], None)];
+        l.extend_from_slice(body);
+        // back to the loop's first instruction: the DS instructions are 2 words each
+        let back = 0x1_0000 - (2 * body.len() as u64 + 3);
+        l.extend_from_slice(&[
+            ("S_SUB_U32", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 0), ("SSRC1", 129)], None),
+            ("S_CMP_LG_U32", "ENC_SOPC", &[("SSRC0", 0), ("SSRC1", 128)], None),
+        ]);
+        let mut code = prog(&l);
+        code.truncate(code.len() - 4);
+        code.extend(encode("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", back)], None).unwrap());
+        code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+        let o = KernelOptions { wave64: true, split: true, mem_windows: 1, sampler_base: 0 };
+        syncs(&super::validate::disassemble(&translate(&code, o).unwrap_or_else(|e| panic!("{e}"))).unwrap())
+    };
+    assert!(looped(&[read, write]) >= looped(&[read]) + 2, "the loop's read and write meet when the bits are set");
+    // compute groups: the counters' meet (two more atomics), none without a partner half
+    let atomics = |threads: u32, list: &[Inst]| {
+        let cs = CsInterface { threads: [threads, 1, 1], user_sgprs: 0, tgid: [false; 3], tg_size: false, tid_components: 1 };
+        let o = KernelOptions { wave64: true, split: true, mem_windows: 1, sampler_base: 0 };
+        let d = super::validate::disassemble(&super::kernel::translate_compute(&prog(list), o, &cs).unwrap_or_else(|e| panic!("{threads} threads: {e}")).dxil).unwrap();
+        d.matches("atomicrmw").count()
+    };
+    for threads in [64, 128] {
+        assert_eq!(atomics(threads, &[write, read]), atomics(threads, &[write]) + 2, "{threads} threads");
+    }
+    assert_eq!(atomics(32, &[write, read]), atomics(32, &[write]), "32 threads: no partner half");
+}
+
 #[test]
 fn straight_line_and_loop_kernels_validate() {
     let code = prog(&[
@@ -329,7 +476,19 @@ fn geometry_mode_validates() {
     for (name, code, g) in cases {
         for split in [true, false] {
             let o = KernelOptions { wave64: true, split, mem_windows: 1, sampler_base: 0 };
-            super::kernel::translate_geometry(&code, o, &g).unwrap_or_else(|e| panic!("{name} split {split}: {}", &e[..e.len().min(3000)]));
+            match super::kernel::translate_geometry(&code, o, &g) {
+                Ok(_) => {}
+                // a split pass with an ES phase is left to the HLSL path (the safe barrier):
+                // complete there, and DXC compiles it
+                Err(e) if e.contains("split wave64 geometry: the ES phase exchanges at group barriers") => {
+                    let t = crate::gpu::recomp::translate_geometry(&code, g.clone(), true, 1).unwrap_or_else(|e| panic!("{name} HLSL: {e}"));
+                    assert!(t.complete(), "{name}: {:?}", t.unsupported_why);
+                    if crate::gpu::recomp::dxc::location().is_ok() {
+                        crate::gpu::recomp::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{name} HLSL: {e}"));
+                    }
+                }
+                Err(e) => panic!("{name} split {split}: {}", &e[..e.len().min(3000)]),
+            }
         }
     }
 }
@@ -434,7 +593,7 @@ fn ps_get_lod_with_a_static_sampler() {
     let k = super::kernel::translate_pixel(&code, ko, &psi).unwrap_or_else(|e| panic!("{}", &e[..e.len().min(800)]));
     assert_eq!(k.static_samplers, vec![(linear, false)], "one static sampler, shared by get_lod and sample");
     if crate::gpu::recomp::dxc::location().is_ok() {
-        super::coverage::translate_mode(&code, &Mode::Pixel(psi), ko, true).unwrap_or_else(|e| panic!("{}", &e[..e.len().min(800)]));
+        super::coverage::translate_mode(&code, &Mode::Pixel(psi), ko, true, &[]).unwrap_or_else(|e| panic!("{}", &e[..e.len().min(800)]));
     }
 }
 
@@ -610,6 +769,365 @@ fn window_at_lowers_to_32bit_carry_without_int64() {
         let body0 = dis0.split("define void @main()").nth(1).and_then(|s| s.split("\n}\n").next()).expect("main body");
         assert!(!dis0.contains("64-bit integers") && !body0.contains("i64"), "zero-offset window_at must not emit i64:\n{dis0}");
         assert!(!body0.contains("icmp ult"), "zero-offset window_at must not emit carry compare:\n{dis0}");
+    }
+}
+
+/// A loop that only ends when its counter wraps to 0, then global_store_dword [v0 * 4], the
+/// counter (the recompiler tests' `endless_loop_program`).
+fn endless_loop() -> Vec<u8> {
+    prog(&[
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 10), ("SSRC0", 128)], None),
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 10), ("SSRC0", 10), ("SSRC1", 129)], None),
+        ("S_CMP_LG_U32", "ENC_SOPC", &[("SSRC0", 10), ("SSRC1", 128)], None),
+        ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0xFFFD)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", 10)], None),
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 6), ("SRC0", 130), ("VSRC1", 0)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 7), ("SRC0", 128)], None),
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 6), ("DATA", 4), ("SADDR", 0x7D)], None),
+    ])
+}
+
+/// The same loop inside one of three passes (`endless_loop_entered_three_times`).
+fn endless_loop_entered_three_times() -> Vec<u8> {
+    prog(&[
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 11), ("SSRC0", 128)], None),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 12), ("SSRC0", 128)], None),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 10), ("SSRC0", 128)], None),
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 10), ("SSRC0", 10), ("SSRC1", 129)], None),
+        ("S_CMP_LG_U32", "ENC_SOPC", &[("SSRC0", 10), ("SSRC1", 128)], None),
+        ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0xFFFD)], None),
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 12), ("SSRC0", 12), ("SSRC1", 10)], None),
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 11), ("SSRC0", 11), ("SSRC1", 129)], None),
+        ("S_CMP_LG_U32", "ENC_SOPC", &[("SSRC0", 11), ("SSRC1", 131)], None),
+        ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0xFFF8)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", 12)], None),
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 6), ("SRC0", 130), ("VSRC1", 0)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 7), ("SRC0", 128)], None),
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 6), ("DATA", 4), ("SADDR", 0x7D)], None),
+    ])
+}
+
+/// The blocks of the emitted `main`: (label, predecessors, text); the entry block is `%0`.
+fn main_blocks(dis: &str) -> Vec<(String, Vec<String>, String)> {
+    let body = dis.split("define void @main()").nth(1).and_then(|s| s.split("\n}\n").next()).expect("main body");
+    let mut out = vec![("%0".to_string(), Vec::new(), String::new())];
+    for line in body.lines() {
+        if let Some(rest) = line.strip_prefix("; <label>:") {
+            let (label, preds) = rest.split_once(';').unwrap_or((rest, ""));
+            let preds = preds.trim().strip_prefix("preds = ").unwrap_or("").split(", ").filter(|p| !p.is_empty()).map(str::to_string).collect();
+            out.push((format!("%{}", label.trim()), preds, String::new()));
+        } else {
+            let last = out.last_mut().unwrap();
+            last.2.push_str(line);
+            last.2.push('\n');
+        }
+    }
+    out
+}
+
+/// What a direct compute program's text shows of its loop counts (`kernel::loop_passes`):
+/// (loads of `IO_LOOP_BUDGET`, `sub ..., 1` decrements, and with one load the count `cap`
+/// made of it, the phis that take it from the entry block, the other blocks they take it from).
+fn loop_counts(dis: &str) -> (usize, usize, Option<(String, Vec<String>, Vec<String>)>) {
+    let slot = format!("i32 {}, i32 undef, i8 1, i32 4)", crate::gpu::recomp::IO_LOOP_BUDGET * 4);
+    let loads: Vec<&str> = dis.lines().filter(|l| l.contains("@dx.op.rawBufferLoad.i32(") && l.contains(&slot)).collect();
+    let subs = dis.lines().filter(|l| l.trim_end().ends_with(", 1") && l.contains(" = sub i32 %")).count();
+    let [load] = loads[..] else { return (loads.len(), subs, None) };
+    let name = |l: &str| l.trim().split_once(" = ").map(|(n, _)| n.to_string()).expect("a definition");
+    let def = |hit: &str| name(dis.lines().find(|l| l.contains(hit)).unwrap_or_else(|| panic!("no {hit}:\n{dis}")));
+    // %v = extractvalue (the load), %z = icmp eq i32 %v, 0, %cap = select i1 %z, i32 65536, …
+    let v = def(&format!("extractvalue %dx.types.ResRet.i32 {}, 0", name(load)));
+    let z = def(&format!("= icmp eq i32 {v}, 0"));
+    let cap = def(&format!("= select i1 {z}, i32 65536, i32 %"));
+    let at_entry = dis.lines().filter(|l| l.contains(" = phi i32 ") && l.contains(&format!("[ {cap}, %0 ]"))).map(name).collect();
+    let again = main_blocks(dis).into_iter().filter(|(b, _, _)| b != "%0" && dis.contains(&format!("[ {cap}, {b} ]"))).map(|(b, _, _)| b).collect();
+    (1, subs, Some((cap, at_entry, again)))
+}
+
+/// Whether the count `n` leaves the program at 0: `%z = icmp eq i32 n, 0` drives a `br i1 %z`
+/// whose taken label is the block that returns.
+fn leaves_to_ret(dis: &str, n: &str) -> bool {
+    let name = |l: &str| l.trim().split_once(" = ").map(|(n, _)| n.to_string());
+    let Some(z) = dis.lines().find(|l| l.contains(&format!("= icmp eq i32 {n}, 0"))).and_then(name) else { return false };
+    let br = format!("br i1 {z}, label ");
+    let Some(to) = dis.lines().find_map(|l| l.trim().strip_prefix(br.as_str())).and_then(|r| r.split(',').next()) else { return false };
+    main_blocks(dis).iter().any(|(b, _, text)| b == to && text.contains("ret void"))
+}
+
+/// The count phis of `dis` that take `cap` from block `b`.
+fn count_phis(dis: &str, cap: &str, b: &str) -> Vec<String> {
+    dis.lines().filter(|l| l.contains(" = phi i32 ") && l.contains(&format!("[ {cap}, {b} ]"))).filter_map(|l| l.trim().split_once(" = ").map(|(n, _)| n.to_string())).collect()
+}
+
+/// The direct translator counts each entry of a compute program's loop as the HLSL path does
+/// (`only_compute_programs_with_a_loop_read_the_dispatch_loop_budget`): `IO_LOOP_BUDGET` is
+/// loaded once, every loop has a count besides the lane's budget, and the outer loop's head
+/// sets the inner loop's count back. A loop-free compute program and other entries have neither.
+#[test]
+fn direct_compute_loops_count_each_entry() {
+    use crate::gpu::recomp::CsInterface;
+    let cs = CsInterface { threads: [8, 4, 2], user_sgprs: 2, tgid: [false; 3], tg_size: false, tid_components: 1 };
+    let straight = prog(&[
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", 2)], None),
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 6), ("SRC0", 130), ("VSRC1", 0)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 7), ("SRC0", 128)], None),
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 6), ("DATA", 4), ("SADDR", 0x7D)], None),
+    ]);
+    for (wave64, split) in [(false, false), (true, true)] {
+        let o = KernelOptions { wave64, split, mem_windows: 1, sampler_base: 0 };
+        let dis = |code: &[u8]| super::validate::disassemble(&super::kernel::translate_compute(code, o, &cs).unwrap_or_else(|e| panic!("{e}")).dxil);
+        let Ok(one) = dis(&endless_loop()) else {
+            return crate::gpu::recomp::runner::skip_test("no DXC");
+        };
+        // one loop: its count, set at the entry, and the lane's budget, both counted down at its head
+        let (loads, subs, counts) = loop_counts(&one);
+        let (_, at_entry, again) = counts.unwrap_or_default();
+        assert_eq!((loads, subs, at_entry.len(), again.len()), (1, 2, 1, 0), "wave64 {wave64}:\n{one}");
+        assert!(leaves_to_ret(&one, &at_entry[0]), "wave64 {wave64}: a count of 0 in {} ends the program:\n{one}", at_entry[0]);
+        // nested: the outer count set at the entry; the inner one set back to `cap` on a path
+        // from the outer loop's head, after the outer count was counted down there
+        let nested = dis(&endless_loop_entered_three_times()).unwrap();
+        let (loads, subs, counts) = loop_counts(&nested);
+        let (cap, at_entry, again) = counts.unwrap_or_default();
+        assert_eq!((loads, subs, at_entry.len(), again.len()), (1, 4, 1, 1), "wave64 {wave64}:\n{nested}");
+        let inner = count_phis(&nested, &cap, &again[0]);
+        assert_eq!(inner.len(), 1, "wave64 {wave64}:\n{nested}");
+        for n in [&at_entry[0], &inner[0]] {
+            assert!(leaves_to_ret(&nested, n), "wave64 {wave64}: a count of 0 in {n} ends the program:\n{nested}");
+        }
+        let blocks = main_blocks(&nested);
+        let mut b = again[0].clone();
+        let after_outer_head = loop {
+            let (_, preds, text) = blocks.iter().find(|(l, _, _)| *l == b).expect("the block");
+            if text.contains(&format!("= sub i32 {}, 1", at_entry[0])) {
+                break true;
+            }
+            match &preds[..] {
+                [p] => b = p.clone(),
+                _ => break false,
+            }
+        };
+        assert!(after_outer_head, "wave64 {wave64}: the inner count is set back in {} after {} - 1:\n{nested}", again[0], at_entry[0]);
+        // neither for a loop-free compute program nor for a kernel with the loop
+        let none = dis(&straight).unwrap();
+        assert_eq!(loop_counts(&none), (0, 0, None), "wave64 {wave64}:\n{none}");
+        let kernel = super::validate::disassemble(&translate(&endless_loop(), o).unwrap()).unwrap();
+        assert_eq!(loop_counts(&kernel), (0, 1, None), "wave64 {wave64}:\n{kernel}");
+    }
+}
+
+/// The compute entry loads the dispatch's thread limits (`recomp::IO_THREAD_LIMIT`) in one
+/// 3-dword load and lets only the lanes below them into the program. Without a group barrier the
+/// lanes past them leave at once and the running lanes' vector writes stay unguarded, as before
+/// (the one conditional branch is the entry's); with one they stay, out of EXEC, and the store
+/// is guarded. Wave32, wave64 and the split form (with and without a partner half).
+#[test]
+fn the_compute_entry_lets_only_the_lanes_below_the_thread_limits_in() {
+    use crate::gpu::recomp::{CsInterface, IO_THREAD_LIMIT};
+    let code = |barrier: bool| {
+        let mut l: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = vec![
+            ("V_LSHL_ADD_U32", "ENC_VOP3", &[("VDST", 4), ("SRC0", 2), ("SRC1", 134), ("SRC2", 256)], None),
+            ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 6), ("SRC0", 130), ("VSRC1", 4)], None),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 7), ("SRC0", 128)], None),
+            ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 6), ("DATA", 4), ("SADDR", 0x7D)], None),
+        ];
+        if barrier {
+            l.insert(0, ("S_BARRIER", "ENC_SOPP", &[], None));
+        }
+        prog(&l)
+    };
+    let load = format!("i32 {}, i32 undef, i8 7, i32 4)", IO_THREAD_LIMIT[0] * 4);
+    for (wave64, split, threads) in [(false, false, 32), (true, false, 64), (true, true, 64), (true, true, 32)] {
+        let o = KernelOptions { wave64, split, mem_windows: 1, sampler_base: 0 };
+        let cs = CsInterface { threads: [threads, 1, 1], user_sgprs: 2, tgid: [true, false, false], tg_size: false, tid_components: 1 };
+        // (a split wave64 of 64 threads is two hardware waves: its barrier is the HLSL path's)
+        for barrier in [false, true].into_iter().filter(|&b| !(b && split && threads == 64)) {
+            let what = format!("wave64 {wave64}, split {split}, {threads} threads, barrier {barrier}");
+            let k = super::kernel::translate_compute(&code(barrier), o, &cs).unwrap_or_else(|e| panic!("{what}: {e}"));
+            let Ok(dis) = super::validate::disassemble(&k.dxil) else {
+                return crate::gpu::recomp::runner::skip_test("no DXC");
+            };
+            assert_eq!(dis.matches(&load).count(), 1, "{what}: the limits in one load\n{dis}");
+            if !split || threads == 32 {
+                assert_eq!(dis.matches("br i1 ").count(), if barrier { 2 } else { 1 }, "{what}\n{dis}");
+                // the entry's branch: on the group (a folded count) and, without a barrier, the
+                // lane's place inside the limits too
+                let cond = dis.lines().find_map(|l| l.trim().strip_prefix("br i1 ")).and_then(|r| r.split(',').next()).unwrap();
+                let def = dis.lines().find(|l| l.trim().starts_with(&format!("{cond} = "))).unwrap();
+                assert_eq!(def.contains("= and i1 "), !barrier, "{what}: {def}\n{dis}");
+            }
+        }
+    }
+}
+
+/// A loop of `passes` passes (0: one that only ends when its counter wraps to 0) inside one
+/// of `entries` passes; each pass stores the inner passes run so far to [v0 * 4], so what a
+/// thread stored last is what it ran before its loops (or its program) ended.
+fn counted_loops(passes: u32, entries: u32) -> Vec<u8> {
+    prog(&[
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 11), ("SSRC0", 128)], None),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 12), ("SSRC0", 128)], None),
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 6), ("SRC0", 130), ("VSRC1", 0)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 7), ("SRC0", 128)], None),
+        // the outer loop
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 10), ("SSRC0", 128)], None),
+        // the inner loop
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 10), ("SSRC0", 10), ("SSRC1", 129)], None),
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 12), ("SSRC0", 12), ("SSRC1", 129)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", 12)], None),
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 6), ("DATA", 4), ("SADDR", 0x7D)], None),
+        ("S_CMP_LG_U32", "ENC_SOPC", &[("SSRC0", 10), ("SSRC1", 255)], Some(passes)),
+        ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0xFFF8)], None),
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 11), ("SSRC0", 11), ("SSRC1", 129)], None),
+        ("S_CMP_LG_U32", "ENC_SOPC", &[("SSRC0", 11), ("SSRC1", 255)], Some(entries)),
+        ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0xFFF3)], None),
+    ])
+}
+
+/// One loop that only ends when its counter wraps to 0, storing its passes so far to [v0 * 4]
+/// in each.
+fn endless_storing_loop() -> Vec<u8> {
+    prog(&[
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 6), ("SRC0", 130), ("VSRC1", 0)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 7), ("SRC0", 128)], None),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 10), ("SSRC0", 128)], None),
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 10), ("SSRC0", 10), ("SSRC1", 129)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", 10)], None),
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 6), ("DATA", 4), ("SADDR", 0x7D)], None),
+        ("S_CMP_LG_U32", "ENC_SOPC", &[("SSRC0", 10), ("SSRC1", 128)], None),
+        ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0xFFFA)], None),
+    ])
+}
+
+/// The direct translator's compute loops on the GPU (the HLSL path's
+/// `gpu_compute_loop_passes_follow_the_dispatch`): an entry of a loop runs the passes the
+/// dispatch's share gives a thread (`IO_LOOP_BUDGET` among the group's threads, between 1024
+/// and 65 536; 0: the lane's 65 536), the same in every thread, in wave32 and split wave64. A
+/// loop that runs out ends the thread's program (the HLSL path goes on after it): the last
+/// store shows where. Each entry of an inner loop has a fresh count: three entries of 1024
+/// passes run under a share of 1024, and a 1025th pass in one entry ends the program.
+#[test]
+fn gpu_direct_compute_loop_passes_follow_the_dispatch() {
+    use crate::gpu::recomp::{runner, CsInterface, IO_LOOP_BUDGET, KERNEL_SGPRS};
+    match runner::wave32_supported() {
+        Ok(true) => {}
+        Ok(false) => return runner::skip_test("no wave32"),
+        Err(e) => return runner::skip_test(&e),
+    }
+    let threads = 64u32;
+    let cs = CsInterface { threads: [threads, 1, 1], user_sgprs: 2, tgid: [false; 3], tg_size: false, tid_components: 1 };
+    for wave64 in [false, true] {
+        let o = KernelOptions { wave64, split: wave64, mem_windows: 1, sampler_base: 0 };
+        let run = |code: &[u8], slot: u32| -> u32 {
+            let k = super::kernel::translate_compute(code, o, &cs).unwrap_or_else(|e| panic!("{e}"));
+            let mut io = vec![0u32; KERNEL_SGPRS];
+            io[IO_LOOP_BUDGET] = slot;
+            let mem = runner::dispatch(&k.dxil, [1, 1, 1], &io, &vec![0xFFFF_FFFFu32; threads as usize]).expect("GPU run");
+            for (t, &got) in mem.iter().take(threads as usize).enumerate() {
+                assert_eq!(got, mem[0], "wave64 {wave64}, slot {slot}: thread {t}");
+            }
+            mem[0]
+        };
+        // (the slot, passes): not known; 5000 a thread; shares below and above the bounds
+        for (slot, passes) in [(0u32, 65_536u32), (threads * 5000, 5000), (1, 1024), (u32::MAX, 65_536)] {
+            assert_eq!(run(&endless_storing_loop(), slot), passes, "wave64 {wave64}, slot {slot}");
+        }
+        assert_eq!(run(&counted_loops(1024, 3), 1), 3 * 1024, "wave64 {wave64}: three entries of 1024");
+        assert_eq!(run(&counted_loops(1025, 3), 1), 1024, "wave64 {wave64}: a 1025th pass");
+        assert_eq!(run(&counted_loops(1025, 3), 0), 3 * 1025, "wave64 {wave64}: no share");
+        assert_eq!(run(&counted_loops(0, 1), 1), 1024, "wave64 {wave64}: an endless inner loop");
+    }
+}
+
+/// Constant data after the program (`kernel::translate_entry_rodata`), as the HLSL kernel's
+/// `gpu_loads_read_the_constant_data_after_the_program`: `s_getpc_b64` plus the compiler's
+/// offset is its address, and `s_load` / `global_load` (with windows `s_buffer_load` too) read
+/// it from the module's table – with one window, two windows (switch) and heap windows, where
+/// window 0 holds other bytes at the table's offset. Any other address still reads the memory.
+#[test]
+fn gpu_direct_loads_read_the_constant_data_after_the_program() {
+    use super::kernel::{translate_entry_rodata, Entry};
+    use crate::gpu::recomp::{runner, HEAP_WINDOWS};
+    let body = |table: u32| {
+        prog(&[
+            ("S_GETPC_B64", "ENC_SOP1", &[("SDST", 0)], None), // s[0:1] = 4
+            ("S_ADD_U32", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 0), ("SSRC1", 255)], Some(table.wrapping_sub(4))),
+            ("S_ADDC_U32", "ENC_SOP2", &[("SDST", 1), ("SSRC0", 1), ("SSRC1", 128)], None),
+            ("GLOBAL_LOAD_DWORDX3", "ENC_FLAT_GLBL", &[("VDST", 5), ("ADDR", 10), ("SADDR", 0), ("OFFSET", 0)], None),
+            ("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 20), ("SBASE", 0), ("OFFSET", 4), ("SOFFSET", 125)], None),
+            ("S_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 24), ("SBASE", 0), ("OFFSET", 8), ("SOFFSET", 125)], None),
+            // memory, not the data: v[12:13] and s[2:3]
+            ("GLOBAL_LOAD_DWORD", "ENC_FLAT_GLBL", &[("VDST", 8), ("ADDR", 12), ("SADDR", 0x7D), ("OFFSET", 0)], None),
+            ("S_LOAD_DWORDX2", "ENC_SMEM", &[("SDATA", 28), ("SBASE", 1), ("OFFSET", 0), ("SOFFSET", 125)], None),
+            // the V# s[4:7]
+            ("S_BUFFER_LOAD_DWORDX2", "ENC_SMEM", &[("SDATA", 30), ("SBASE", 2), ("OFFSET", 4), ("SOFFSET", 125)], None),
+        ])
+    };
+    // as in retail data: program, guard s_endpgm, block (u32 N, N dwords, s_endpgm)
+    let block = body(0).len() as u32 + 4;
+    let code = body(block + 4);
+    let table: Vec<u32> = (0..8).map(|i| 0x7AB1_E000 + i).collect();
+    let mut data = vec![table.len() as u32];
+    data.extend(&table);
+    data.push(0xBF81_0000);
+    let rodata = vec![(block, data)];
+    let split = runner::split_wave64();
+    let direct = |windows: u32, rodata: &[(u32, Vec<u32>)]| {
+        let o = KernelOptions { wave64: true, split, mem_windows: windows, sampler_base: 0 };
+        translate_entry_rodata(&code, o, Entry::Kernel, rodata).unwrap_or_else(|e| panic!("windows {windows:#x}: {}", &e[..e.len().min(800)]))
+    };
+    // (translations are validated in test builds)
+    let one = direct(1, &rodata).dxil;
+    assert_eq!(direct(1, &[]).dxil, translate(&code, KernelOptions { wave64: true, split, mem_windows: 1, sampler_base: 0 }).unwrap(), "no data, no table");
+    assert_ne!(one, direct(1, &[]).dxil);
+    match (runner::adapter(), runner::wave64_programs_supported()) {
+        (Ok(_), Ok(true)) => {}
+        (a, w) => return runner::skip_test(if a.is_err() || w.is_err() { "no GPU" } else { "no wave64" }),
+    }
+    let check = |r: &runner::KernelResult, buffer: [u32; 2], what: &str| {
+        assert_eq!(r.sgpr[20], table[1], "{what}: s_load_dword of the table");
+        assert_eq!(r.sgpr[24..28], table[2..6], "{what}: s_load_dwordx4 of the table");
+        assert_eq!(r.sgpr[28..30], [4242, 4343], "{what}: s_load from memory");
+        assert_eq!(r.sgpr[30..32], buffer, "{what}: s_buffer_load");
+        for l in 0..64usize {
+            let k = l % 6;
+            assert_eq!(r.vgpr[l][5..8], table[k..k + 3], "{what}, lane {l}: three dwords of the table from {k}");
+            assert_eq!(r.vgpr[l][8], 7000 + l as u32, "{what}, lane {l}: memory outside the data");
+        }
+    };
+    // one window: nothing of the code is in the memory (and a V# is always memory)
+    let mut st = runner::KernelState::default();
+    st.sgpr[2] = 0x900;
+    st.sgpr[4..7].copy_from_slice(&[0x900, 0, 64]);
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        r[10] = 4 * (l as u32 % 6);
+        r[12] = 0x800 + 4 * l as u32;
+    }
+    let mut mem = vec![0u32; 1024];
+    mem[0x240..0x243].copy_from_slice(&[4242, 4343, 4444]);
+    for l in 0..64 {
+        mem[0x200 + l] = 7000 + l as u32;
+    }
+    check(&runner::run(&one, &st, &mem).unwrap(), [4343, 4444], "one window");
+    // several windows: a code address is in none of them, and window 0 holds other bytes at
+    // the table's offset; the V# is on the table
+    let arena = crate::gpu::uma::Uma::with_windows(2, 1 << 20).unwrap();
+    let (w0, w1) = (arena.window(0).0 as u64, arena.window(1).0 as u64);
+    let word = |a: u64| unsafe { &mut *(a as *mut u32) };
+    for k in 0..16u64 {
+        *word(w0 + block as u64 + 4 * k) = 0xBAD0_0000 + k as u32;
+    }
+    *word(w1 + 0x900) = 4242;
+    *word(w1 + 0x904) = 4343;
+    st.sgpr[2..4].copy_from_slice(&[(w1 + 0x900) as u32, (w1 >> 32) as u32]);
+    st.sgpr[4..7].copy_from_slice(&[block + 4, crate::gpu::recomp::CODE_ADDRESS_HI, 64]);
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        *word(w1 + 0x800 + 4 * l as u64) = 7000 + l as u32;
+        r[12] = (w1 + 0x800 + 4 * l as u64) as u32;
+        r[13] = (w1 >> 32) as u32;
+    }
+    for (windows, what) in [(2, "two windows"), (2 | HEAP_WINDOWS, "heap windows")] {
+        check(&runner::run_in_arena(&direct(windows, &rodata).dxil, &st, &arena).unwrap(), [table[1], table[2]], what);
     }
 }
 

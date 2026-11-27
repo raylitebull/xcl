@@ -10,6 +10,7 @@ use std::sync::OnceLock;
 use crate::config::Config;
 use crate::util::glob_match;
 
+pub mod api_cost;
 pub mod acphal;
 pub mod bcpack;
 pub mod bink;

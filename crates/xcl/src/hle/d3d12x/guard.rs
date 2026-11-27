@@ -233,6 +233,13 @@ pub fn make_call_tracer(original: usize, name: String) -> usize {
     p as usize
 }
 
+/// `before(return address, data, frame)` and then `original`, with every argument (registers,
+/// floating-point ones and the stack) as the caller passed it; `before` returns 0. `frame`: the
+/// saved r9, r8, rdx, rcx at +0x68, +0x70, +0x78, +0x80.
+pub fn make_before(original: usize, data: u64, before: unsafe extern "system" fn(usize, u64, *const u64) -> usize) -> usize {
+    thunk(Tail::GuardOr(original), data, before as usize)
+}
+
 /// Thunk: `decide(return address, data)` with all argument registers preserved, then `tail`.
 fn thunk(tail: Tail, data: u64, decide: usize) -> usize {
     let mut c: Vec<u8> = Vec::with_capacity(128);
@@ -328,6 +335,23 @@ mod tests {
         let t = make_call_tracer(halves as usize, "unit!halves".into());
         let f: extern "system" fn(u64, u64, u64, u64, u64, f64) -> f64 = unsafe { std::mem::transmute(t) };
         assert_eq!(f(1, 2, 3, 4, 5, 6.0), 327160.5);
+    }
+
+    static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    unsafe extern "system" fn note_first(_caller: usize, data: u64, frame: *const u64) -> usize {
+        SEEN.store(*frame.add(0x80 / 8) * 100 + data, std::sync::atomic::Ordering::Relaxed);
+        0
+    }
+
+    /// The hook before a call sees its first argument (the object) and its data; the original
+    /// then gets every argument and its result goes back.
+    #[test]
+    fn a_hook_before_a_call_sees_the_object_and_forwards_everything() {
+        let t = make_before(original as usize, 7, note_first);
+        let f: extern "system" fn(u64, u64, u64, u64, u64, f64) -> u64 = unsafe { std::mem::transmute(t) };
+        assert_eq!(f(1, 2, 3, 4, 5, 6.0), 654321);
+        assert_eq!(SEEN.load(std::sync::atomic::Ordering::Relaxed), 107);
     }
 
     #[test]

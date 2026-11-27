@@ -80,11 +80,32 @@ pub fn fspx(blob: &[u8]) -> Option<Fspx<'_>> {
 /// Memory windows of the title's unified memory (1 without it), with `HEAP_WINDOWS` when
 /// shaders take them from the descriptor heap (`heap_windows`).
 pub fn mem_windows() -> u32 {
+    let title = TITLE_WINDOWS.load(std::sync::atomic::Ordering::Relaxed);
+    if title != 0 {
+        return windows_for(title & !super::HEAP_WINDOWS, title & super::HEAP_WINDOWS != 0 && !SWITCH_FORM.with(|s| s.get()));
+    }
     let n = crate::gpu::uma::get().map_or(1, |u| u.shader_windows() as u32);
-    if n > 1 && heap_windows() && !SWITCH_FORM.with(|s| s.get()) {
+    windows_for(n, heap_windows() && !SWITCH_FORM.with(|s| s.get()))
+}
+
+/// The title's windows (`mem_windows` with `HEAP_WINDOWS`) for a process without its memory: a
+/// shader preparation worker builds the title's pipelines with them (0: none given).
+static TITLE_WINDOWS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// `mem_windows` is `windows` from here on (a preparation worker: `uma::leave_out`).
+pub fn set_title_windows(windows: u32) {
+    TITLE_WINDOWS.store(windows, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `n` windows as shaders take them: from the descriptor heap (`heap`), or in the switch form
+/// over the root UAVs – of which there are `MAX_WINDOWS`, so never more there (the HLSL path
+/// refused a wider switch, and DXIL quietly made it 4: a 16-window run whose heap views could
+/// not be made, or a pipeline the driver refused with them, lost every shader on HLSL).
+fn windows_for(n: u32, heap: bool) -> u32 {
+    if n > 1 && heap {
         n | super::HEAP_WINDOWS
     } else {
-        n
+        n.min(crate::gpu::uma::MAX_WINDOWS as u32)
     }
 }
 
@@ -154,7 +175,9 @@ fn shader_cache() -> &'static Mutex<ShaderCache> {
 /// fills the caches without a title: the same keys as at its run).
 pub fn console_to_dxil_in(blob: &[u8], stage: Stage, sampler_base: u32, split_wave64: bool, windows: u32) -> Result<Compiled, String> {
     let compile_one = || compile_console_shader(blob, stage, sampler_base, windows, split_wave64);
-    if !cache_allowed(stage, |name| std::env::var_os(name).is_some()) {
+    // (the compute shader `XCL_DEBUG_CS_SUB` names: neither the memory nor the disk entry of its
+    // bytes, which hold it unchanged – translated again, and the result kept in neither)
+    if !cache_allowed(stage, |name| std::env::var_os(name).is_some()) || cs_subs(blob, stage).is_some() {
         return compile_one().map(|(c, _)| c);
     }
     let key = ShaderKey {
@@ -270,6 +293,8 @@ mod translated {
             let id = if Backend::current() != Backend::Hlsl {
                 identity_for(&id.to_string(), &format!("dispatch-split-{}", crate::gpu::dxil::kernel::dispatch_piece_limit()))
             } else { id };
+            // `XCL_X_LDS_ORDER=0`: the split wave64 form without its LDS order, in both translators
+            let id = if crate::gpu::recomp::emit::lds_order_wanted() { id } else { identity_for(&id.to_string(), "xcl-x-lds-order-0") };
             // `XCL_PER_LANE=1` (direct compute only): its entries under their own identity
             if Backend::current() != Backend::Hlsl && crate::gpu::recomp::lower_dxil::enabled() {
                 identity_for(&id.to_string(), concat!("xcl-per-lane-", env!("XCL_PER_LANE_SOURCE_ID")))
@@ -543,6 +568,16 @@ mod translated {
         for id in [ident, rerouted] {
             if let Some(c) = load_in(&file(dir, id, blob, stage, sampler_base, windows, split), id, blob) {
                 super::dxc::note_memory_hit();
+                if stage == Stage::Compute {
+                    super::note_compute_path(
+                        blob,
+                        match (id == rerouted, Backend::current()) {
+                            (true, _) => "direct DXIL (its HLSL is enormous), from the translated cache",
+                            (false, Backend::Hlsl) => "HLSL, from the translated cache",
+                            (false, _) => "direct DXIL or its HLSL fallback (XCL_DIRECT_DXIL), from the translated cache",
+                        },
+                    );
+                }
                 return Ok(c);
             }
         }
@@ -583,15 +618,18 @@ fn enormous(stage: Stage, hlsl_len: usize) -> bool {
 /// The program's DXIL, and whether it is an `enormous` one the direct translator made (its
 /// disk cache entry then follows that translator's version: `translated::cached`).
 fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split_wave64: bool) -> Result<(Compiled, bool), String> {
+    // `XCL_DEBUG_CS_SUB` names this compute shader: the HLSL path, whatever its size
+    let cs_subs = cs_subs(blob, stage);
     // `XCL_DIRECT_DXIL=1`: compute shaders through the direct DXIL translator, the HLSL path
     // for what it cannot translate yet
-    if stage == Stage::Compute && crate::gpu::dxil::kernel::enabled() {
+    if stage == Stage::Compute && cs_subs.is_none() && crate::gpu::dxil::kernel::enabled() {
         if dxc::defer() {
             return Err("DXIL not compiled yet".into());
         }
         match direct_compute(blob, sampler_base, windows, split_wave64) {
             Ok(c) => {
                 crate::gpu::dxil::coverage::record_translated("CS");
+                note_compute_path(blob, "direct DXIL (XCL_DIRECT_DXIL)");
                 return Ok((c, false));
             }
             Err(e) => direct_fallback("CS", &e),
@@ -613,7 +651,7 @@ fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows:
         }
     }
     let (mut t, profile) = console_translation(blob, stage, sampler_base, windows, split_wave64)?;
-    if enormous(stage, t.hlsl.len()) && !crate::gpu::dxil::kernel::enabled() {
+    if cs_subs.is_none() && enormous(stage, t.hlsl.len()) && !crate::gpu::dxil::kernel::enabled() {
         if dxc::defer() {
             return Err("DXIL not compiled yet".into());
         }
@@ -625,6 +663,7 @@ fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows:
                     t.hlsl.len() >> 10,
                     c.dxil.len() >> 10
                 );
+                note_compute_path(blob, "direct DXIL (its HLSL is enormous)");
                 return Ok((c, true));
             }
             Err(e) => direct_fallback("CS", &e),
@@ -640,16 +679,13 @@ fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows:
     }
     // `XCL_DEBUG_PS_SUB=hash:from=>to||from=>to…` (one pixel shader): every `from` in its HLSL
     // becomes `to`
-    if let Some(subs) = (stage == Stage::Pixel).then(|| std::env::var("XCL_DEBUG_PS_SUB").ok()).flatten().and_then(|v| {
-        let (h, rest) = v.split_once(':')?;
-        (u64::from_str_radix(h.trim(), 16).ok()? == crate::gpu::shader::fnv64(blob)).then(|| rest.to_string())
-    }) {
-        for sub in subs.split("||") {
-            let Some((from, to)) = sub.split_once("=>") else { continue };
-            let n = t.hlsl.matches(from).count();
-            crate::xlog_info!("[SHADER] XCL_DEBUG_PS_SUB: {n} occurrence(s) of {from:?} replaced");
-            t.hlsl = t.hlsl.replace(from, to);
+    if let Some(v) = (stage == Stage::Pixel).then(|| std::env::var("XCL_DEBUG_PS_SUB").ok()).flatten() {
+        if let Some(subs) = debug_subs(&v, crate::gpu::shader::fnv64(blob)) {
+            apply_debug_subs(&mut t.hlsl, &subs, "XCL_DEBUG_PS_SUB");
         }
+    }
+    if let Some(subs) = &cs_subs {
+        apply_debug_subs(&mut t.hlsl, subs, "XCL_DEBUG_CS_SUB");
     }
     // `XCL_DEBUG_PS_EXPR=hash:expression` (one pixel shader): its target 0 gets that HLSL
     // expression, e.g. `float4(xi.a1.rgb, 1)` – an input or a register made visible
@@ -660,7 +696,50 @@ fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows:
         t.hlsl = t.hlsl.replacen("    if (!xcl_live) discard;\n    return xo;\n}", &format!("    xo.t0 = {expr};\n    return xo;\n}}"), 1);
     }
     let dxil = dxc::compile_cached(&t.hlsl, "main", profile)?.0;
+    if stage == Stage::Compute {
+        note_compute_path(blob, if cs_subs.is_some() { "HLSL, with XCL_DEBUG_CS_SUB" } else { "HLSL" });
+    }
     Ok((Compiled { dispatch_chain: None, dxil, samplers: t.static_samplers }, false))
+}
+
+/// `XCL_DEBUG_PS_SUB` / `XCL_DEBUG_CS_SUB` = `hash:from=>to||from=>to…` (a dump hash, hex): the
+/// (from, to) pairs when `hash` is `wanted`; None for another shader or a value of another form.
+/// A part without `=>` is left out.
+fn debug_subs(v: &str, wanted: u64) -> Option<Vec<(String, String)>> {
+    let (h, rest) = v.split_once(':')?;
+    (u64::from_str_radix(h.trim(), 16).ok()? == wanted).then(|| rest.split("||").filter_map(|s| s.split_once("=>")).map(|(f, t)| (f.to_string(), t.to_string())).collect())
+}
+
+/// Every `from` of `subs` in `hlsl` becomes its `to`, one log line each with the occurrences.
+fn apply_debug_subs(hlsl: &mut String, subs: &[(String, String)], switch: &str) {
+    for (from, to) in subs {
+        let n = hlsl.matches(from.as_str()).count();
+        crate::xlog_info!("[SHADER] {switch}: {n} occurrence(s) of {from:?} replaced");
+        *hlsl = hlsl.replace(from.as_str(), to);
+    }
+}
+
+/// `XCL_DEBUG_CS_SUB=hash:from=>to||from=>to…` (one compute shader, by its dump hash): every
+/// `from` in its HLSL becomes `to`. That shader takes the HLSL path (not direct DXIL, however
+/// large) and none of the caches of its console bytes (`console_to_dxil_in`); other compute
+/// shaders are not changed. The pairs for `blob`, if it is the one.
+fn cs_subs(blob: &[u8], stage: Stage) -> Option<Vec<(String, String)>> {
+    static V: OnceLock<Option<String>> = OnceLock::new();
+    let v = V.get_or_init(|| std::env::var("XCL_DEBUG_CS_SUB").ok()).as_deref()?;
+    (stage == Stage::Compute).then(|| debug_subs(v, crate::gpu::shader::fnv64(blob))).flatten()
+}
+
+/// How each compute program (by dump hash) was translated last in this process (`compute_path`)
+static COMPUTE_PATHS: Mutex<Option<HashMap<u64, &'static str>>> = Mutex::new(None);
+
+fn note_compute_path(blob: &[u8], path: &'static str) {
+    COMPUTE_PATHS.lock().unwrap().get_or_insert_with(HashMap::new).insert(crate::gpu::shader::fnv64(blob), path);
+}
+
+/// The path that made the DXIL of the compute program of dump hash `hash` in this process (HLSL,
+/// direct DXIL, from the translated cache): None when it was not translated here.
+pub fn compute_path(hash: u64) -> Option<&'static str> {
+    COMPUTE_PATHS.lock().unwrap().as_ref()?.get(&hash).copied()
 }
 
 /// Every `X_T.Sample(args)` of generated HLSL as `X_T.SampleLevel(args, 0.0f)`.
@@ -905,7 +984,9 @@ fn cached_shader(
 }
 
 fn cache_allowed(stage: Stage, present: impl Fn(&str) -> bool) -> bool {
-    !["XCL_RECOMP_NO_STRUCTURED", "XCL_RECOMP_WHY", "XCL_X64_ALL_MASKS", "XCL_WAVE64_SPIN", "XCL_DXIL_NO_OPT"]
+    // (`XCL_SAFE_BARRIER` changes both translators' barriers and which one takes a compute or
+    // mesh program, and is not in the translated cache's identity)
+    !["XCL_RECOMP_NO_STRUCTURED", "XCL_RECOMP_WHY", "XCL_X64_ALL_MASKS", "XCL_WAVE64_SPIN", "XCL_SAFE_BARRIER", "XCL_DXIL_NO_OPT"]
         .iter()
         .any(|name| present(name))
         && (stage != Stage::Pixel
@@ -923,15 +1004,36 @@ fn cache_allowed(stage: Stage, present: impl Fn(&str) -> bool) -> bool {
 /// s0…s3 are the driver's, so what is above 4 is the root arguments its compiler passed in
 /// registers. None: not a console compute shader.
 pub fn compute_user_sgprs(blob: &[u8]) -> Option<u32> {
+    compute_interface(blob).map(|cs| cs.user_sgprs)
+}
+
+/// The dispatch ABI of a console compute program: its user SGPRs and the console's group shape
+/// (`numthreads`). None: not a console compute program.
+pub fn compute_interface(blob: &[u8]) -> Option<super::CsInterface> {
     if let Some(f) = fspx(blob) {
-        return Some(super::CsInterface::from_rsrc2(f.threads, f.rsrc2).user_sgprs);
+        return Some(super::CsInterface::from_rsrc2(f.threads, f.rsrc2));
     }
     let sh = xbox::parse(blob)?;
     let f = sh.fssm.iter().find(|f| f.stages.first().is_some_and(|s| s.hw == 6))?;
     match interface(blob, &sh, f)? {
-        Mode::Compute(cs) => Some(cs.user_sgprs),
+        Mode::Compute(cs) => Some(cs),
         _ => None,
     }
+}
+
+/// A console compute shader's thread group size, whether its program is wave64 and the bytes
+/// of its RDNA2 code (`XCL_GPU_PROFILE` names a program by them). None: not a console compute
+/// shader.
+pub fn compute_shape(blob: &[u8]) -> Option<([u32; 3], bool, usize)> {
+    if let Some(f) = fspx(blob) {
+        return Some((f.threads, super::detect_wave64(f.code), f.code.len()));
+    }
+    let sh = xbox::parse(blob)?;
+    let f = sh.fssm.iter().find(|f| f.stages.first().is_some_and(|s| s.hw == 6))?;
+    let Mode::Compute(cs) = interface(blob, &sh, f)? else { return None };
+    let p = f.programs.first()?;
+    let code = f.data.get(p.offset..p.offset + p.len)?;
+    Some((cs.threads, super::fssm_wave64(f, code), code.len()))
 }
 
 /// The HLSL and profile a console program compiles from at pipeline creation (for
@@ -948,6 +1050,21 @@ fn direct_fallback(stage: &str, err: &str) {
     crate::xlog_info!("[SHADER] direct DXIL fallback stage={stage} reason=\"{reason}\" detail=\"{}\" – HLSL path", err.lines().next().unwrap_or(""));
 }
 
+/// Whether the program takes an address in its code region for something else than a far jump
+/// (`rdna2::resolve_far_jumps`): an `s_getpc_b64` the compiler emits to reach the constant
+/// data after the program.
+fn takes_code_address(code: &[u8]) -> bool {
+    let mut insts = Vec::new();
+    let mut off = 0usize;
+    while off + 4 <= code.len() {
+        let Ok(d) = crate::gpu::rdna2::decode(&code[off..], off as u64) else { return false };
+        off += d.len;
+        insts.push(d);
+    }
+    crate::gpu::rdna2::resolve_far_jumps(&mut insts);
+    (0..insts.len()).any(|i| insts[i].inst.name == "S_GETPC_B64" && !insts.get(i + 3).is_some_and(|s| s.far_target.is_some()))
+}
+
 /// A console compute shader through the direct DXIL translator (`gpu::dxil::kernel`).
 /// FSPX (driver) containers are left to the HLSL path.
 fn direct_compute(blob: &[u8], sampler_base: u32, windows: u32, split_wave64: bool) -> Result<Compiled, String> {
@@ -956,10 +1073,13 @@ fn direct_compute(blob: &[u8], sampler_base: u32, windows: u32, split_wave64: bo
     let Some(Mode::Compute(cs)) = interface(blob, &sh, f) else { return Err("not a compute interface".into()) };
     let p = f.programs.first().ok_or("FSSM without a program")?;
     let code = &f.data[p.offset..p.offset + p.len];
+    // the constant data the program reads from its own code region (`Options::rodata`)
+    let rodata = f.rodata(p);
     let wave64 = super::fssm_wave64(f, code);
     let o = crate::gpu::dxil::kernel::KernelOptions { wave64, split: wave64 && split_wave64, mem_windows: windows, sampler_base };
     // `XCL_PER_LANE=1`: the per-lane form first, #1426's per-instruction form where it refuses
-    if super::lower_dxil::enabled() {
+    // (and for a program that reads constant data in its code: the per-lane form has no table)
+    if super::lower_dxil::enabled() && !(!rodata.is_empty() && takes_code_address(code)) {
         match super::lower_dxil::compute_with(code, &cs, o) {
             Ok(k) => {
                 crate::gpu::dxil::coverage::record_translated("CS per-lane");
@@ -972,7 +1092,7 @@ fn direct_compute(blob: &[u8], sampler_base: u32, windows: u32, split_wave64: bo
             }
         }
     }
-    let k = crate::gpu::dxil::kernel::translate_compute_on(code, o, &cs, split_wave64)?;
+    let k = crate::gpu::dxil::kernel::translate_compute_rodata(code, o, &cs, split_wave64, &rodata)?;
     dump_direct(blob, &k.dxil);
     Ok(Compiled { dispatch_chain: k.dispatch_chain, dxil: k.dxil, samplers: k.static_samplers })
 }
@@ -1003,11 +1123,12 @@ fn direct_graphics(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32) -
     let p = f.programs.first().ok_or("FSSM without a program")?;
     let code = &f.data[p.offset..p.offset + p.len];
     let o = crate::gpu::dxil::kernel::KernelOptions { wave64: super::fssm_wave64(f, code), split: false, mem_windows: windows, sampler_base };
-    let k = match (&mode, stage) {
-        (Mode::Vertex(vs), Stage::Vertex) => crate::gpu::dxil::kernel::translate_vertex(code, o, vs)?,
-        (Mode::Pixel(ps), Stage::Pixel) => crate::gpu::dxil::kernel::translate_pixel(code, o, ps)?,
+    let entry = match (&mode, stage) {
+        (Mode::Vertex(vs), Stage::Vertex) => crate::gpu::dxil::kernel::Entry::Vertex(vs.clone()),
+        (Mode::Pixel(ps), Stage::Pixel) => crate::gpu::dxil::kernel::Entry::Pixel(ps.clone()),
         _ => return Err("the shader stage does not match its slot in the PSO".into()),
     };
+    let k = crate::gpu::dxil::kernel::translate_entry_rodata(code, o, entry, &f.rodata(p))?;
     dump_direct(blob, &k.dxil);
     Ok(Compiled { dispatch_chain: None, dxil: k.dxil, samplers: k.static_samplers })
 }
@@ -1047,7 +1168,7 @@ pub(crate) fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32, 
     };
     let p = f.programs.first().ok_or("FSSM without a program")?;
     let code = &f.data[p.offset..p.offset + p.len];
-    let t = translate(code, &Options { mode, wave64: super::fssm_wave64(f, code), split_wave64, static_sampler_base: sampler_base, mem_windows: windows, ..Default::default() })?;
+    let t = translate(code, &Options { mode, wave64: super::fssm_wave64(f, code), split_wave64, static_sampler_base: sampler_base, mem_windows: windows, rodata: f.rodata(p), ..Default::default() })?;
     if !t.complete() {
         let missing: Vec<&String> = t.unsupported.keys().collect();
         return Err(format!("incomplete translation, missing: {missing:?}"));
@@ -1090,6 +1211,7 @@ fn finish_two_pass(t: super::Translation, record: super::MsInterface, ps: Option
 fn compile_console_mesh(
     blob: &[u8],
     code: &[u8],
+    rodata: Vec<(u32, Vec<u32>)>,
     ms: &super::MsInterface,
     wave64: bool,
     windows: u32,
@@ -1106,7 +1228,7 @@ fn compile_console_mesh(
             mem_windows: windows,
             sampler_base: 0,
         };
-        match crate::gpu::dxil::kernel::translate_mesh(code, o, ms) {
+        match crate::gpu::dxil::kernel::translate_entry_rodata(code, o, crate::gpu::dxil::kernel::Entry::Mesh(ms.clone()), &rodata) {
             Ok(k) => {
                 crate::gpu::dxil::coverage::record_translated("MS");
                 dump_direct(blob, &k.dxil);
@@ -1115,7 +1237,7 @@ fn compile_console_mesh(
             Err(e) => direct_fallback("MS", &e),
         }
     }
-    let t = super::translate_mesh(code, ms.clone(), wave64, split_wave64, windows)?;
+    let t = translate(code, &Options { mode: Mode::Mesh(ms.clone()), wave64, split_wave64, mem_windows: windows, rodata, ..Default::default() })?;
     if !t.complete() {
         let missing: Vec<&String> = t.unsupported.keys().collect();
         return Err(format!("incomplete translation, missing: {missing:?}"));
@@ -1131,7 +1253,7 @@ fn console_mesh_with(
     windows: u32,
     cache_dir: &std::path::Path,
     cache: &Mutex<ShaderCache>,
-    compile: impl FnOnce(&[u8], &super::MsInterface, bool) -> Result<Compiled, String>,
+    compile: impl FnOnce(&[u8], Vec<(u32, Vec<u32>)>, &super::MsInterface, bool) -> Result<Compiled, String>,
 ) -> Result<TwoPass, String> {
     let sh = xbox::parse(blob).ok_or("not a console shader container")?;
     let f = sh.fssm.iter().find(|f| f.stages.first().is_some_and(|s| s.hw == 7)).ok_or("no NGG hardware variant")?;
@@ -1142,7 +1264,7 @@ fn console_mesh_with(
     let code = &f.data[p.offset..p.offset + p.len];
     let wave64 = super::fssm_wave64(f, code);
     let split = wave64 && split_wave64;
-    let compile_one = || compile(code, ms, wave64);
+    let compile_one = || compile(code, f.rodata(p), ms, wave64);
     // Cache the mesh compute pass in RAM (`ShaderCache` + in-flight coalescing) and on disk
     // (`translated/v2`, namespaced by backend) across all `(MS, PS)` pipelines that share it.
     let cs = if cache_allowed(Stage::Mesh, |name| std::env::var_os(name).is_some()) {
@@ -1167,8 +1289,8 @@ fn console_mesh_with(
 pub fn console_mesh(blob: &[u8], ps: Option<&[u8]>, split_wave64: bool) -> Result<TwoPass, String> {
     let windows = mem_windows();
     let dir = dxc::cache_dir();
-    console_mesh_with(blob, ps, split_wave64, windows, &dir, shader_cache(), |code, ms, wave64| {
-        compile_console_mesh(blob, code, ms, wave64, windows, split_wave64)
+    console_mesh_with(blob, ps, split_wave64, windows, &dir, shader_cache(), |code, rodata, ms, wave64| {
+        compile_console_mesh(blob, code, rodata, ms, wave64, windows, split_wave64)
     })
 }
 
@@ -1307,10 +1429,11 @@ pub(crate) fn dispatch_slabs(grid: [u32; 3], most: u64) -> Vec<([u32; 3], [u32; 
 }
 
 /// A chain's dispatch of `grid` groups, `most` of them at once (`dispatch_slabs`). `used`: the
-/// list (or one before it) has used `scratch`.
+/// list (or one before it) has used `scratch`. `bind` sets each piece on `list` (on a title's
+/// list: past the hook of a title's SetPipelineState).
 pub(crate) unsafe fn record_dispatch_chain<'a>(
     list: &ID3D12GraphicsCommandList, grid: [u32; 3], most: u64, scratch: &ID3D12Resource, used: bool,
-    pieces: impl IntoIterator<Item = &'a ID3D12PipelineState> + Clone,
+    pieces: impl IntoIterator<Item = &'a ID3D12PipelineState> + Clone, bind: impl Fn(&ID3D12PipelineState),
 ) {
     list.SetComputeRootUnorderedAccessView(6, scratch.GetGPUVirtualAddress());
     for (slab, (origin, size)) in dispatch_slabs(grid, most).into_iter().enumerate() {
@@ -1322,7 +1445,7 @@ pub(crate) unsafe fn record_dispatch_chain<'a>(
         }
         let constants = [x, y, z, i as u32, ox, oy, oz, 0];
         list.SetComputeRoot32BitConstants(7, 8, constants.as_ptr().cast(), 0);
-        list.SetPipelineState(piece);
+        bind(piece);
         list.Dispatch(x, y, z);
     }
     }
@@ -1415,6 +1538,24 @@ mod slab_tests {
 #[cfg(test)]
 mod shader_cache_tests {
     use super::*;
+
+    /// The switch form (no heap windows, or a pipeline retried in it) has 4 root UAVs: a wider
+    /// count there is 4, which every translator takes; the heap form keeps all of them.
+    #[test]
+    fn the_switch_form_never_asks_for_more_windows_than_root_uavs() {
+        let heap = super::super::HEAP_WINDOWS;
+        assert_eq!(windows_for(16, false), 4);
+        assert_eq!(windows_for(8, false), 4);
+        assert_eq!(windows_for(16, true), 16 | heap);
+        assert_eq!((windows_for(4, false), windows_for(4, true)), (4, 4 | heap));
+        assert_eq!((windows_for(1, false), windows_for(1, true)), (1, 1));
+        for n in [1u32, 2, 4, 8, 16] {
+            for h in [false, true] {
+                let w = windows_for(n, h);
+                assert!(super::super::valid_window_count((w & !heap) as usize, w & heap != 0), "{n} windows, heap {h}: {w:#x}");
+            }
+        }
+    }
 
     #[test]
     fn translated_identity_tracks_sources_and_dxc() {
@@ -1950,9 +2091,9 @@ mod shader_cache_tests {
         let compiles = AtomicUsize::new(0);
 
         let run = |c: &Mutex<ShaderCache>| {
-            console_mesh_with(&blob, None, false, 1, &dir, c, |code, ms, wave64| {
+            console_mesh_with(&blob, None, false, 1, &dir, c, |code, rodata, ms, wave64| {
                 compiles.fetch_add(1, Ordering::SeqCst);
-                compile_console_mesh(&blob, code, ms, wave64, 1, false)
+                compile_console_mesh(&blob, code, rodata, ms, wave64, 1, false)
             })
         };
 
@@ -1988,8 +2129,9 @@ mod shader_cache_tests {
 
     #[test]
     fn shader_cache_bypasses_debug_overrides() {
-        for name in ["XCL_RECOMP_NO_STRUCTURED", "XCL_RECOMP_WHY", "XCL_X64_ALL_MASKS", "XCL_WAVE64_SPIN", "XCL_DXIL_NO_OPT"] {
+        for name in ["XCL_RECOMP_NO_STRUCTURED", "XCL_RECOMP_WHY", "XCL_X64_ALL_MASKS", "XCL_WAVE64_SPIN", "XCL_SAFE_BARRIER", "XCL_DXIL_NO_OPT"] {
             assert!(!cache_allowed(Stage::Compute, |v| v == name));
+            assert!(!cache_allowed(Stage::Mesh, |v| v == name));
             assert!(!cache_allowed(Stage::Vertex, |v| v == name));
             assert!(!cache_allowed(Stage::Pixel, |v| v == name));
         }
@@ -2003,6 +2145,27 @@ mod shader_cache_tests {
             assert!(cache_allowed(Stage::Compute, |v| v == name));
         }
         assert!(cache_allowed(Stage::Pixel, |_| false));
+    }
+
+    /// `XCL_DEBUG_PS_SUB` / `XCL_DEBUG_CS_SUB`: the pairs of the shader named, none for another.
+    #[test]
+    fn a_debug_substitution_names_one_shader_by_its_dump_hash() {
+        let pairs = |v: &[(&str, &str)]| v.iter().map(|(f, t)| (f.to_string(), t.to_string())).collect::<Vec<_>>();
+        let v = "00000000DEADBEEF:r0.x=>0.0f||max(a, b)=>a";
+        assert_eq!(debug_subs(v, 0xdead_beef), Some(pairs(&[("r0.x", "0.0f"), ("max(a, b)", "a")])));
+        assert_eq!(debug_subs(" deadbeef :x=>y", 0xdead_beef), Some(pairs(&[("x", "y")])));
+        assert_eq!(debug_subs(v, 0xdead_bee0), None, "another shader");
+        assert_eq!(debug_subs("deadbeef", 0xdead_beef), None, "no substitutions");
+        assert_eq!(debug_subs("nothex:x=>y", 0xdead_beef), None);
+        // a part without `=>` is left out; `to` may hold a `:`
+        assert_eq!(debug_subs("deadbeef:x||a=>b?c:d", 0xdead_beef), Some(pairs(&[("a", "b?c:d")])));
+        let mut hlsl = "float r0 = a; r0 = a + a;".to_string();
+        apply_debug_subs(&mut hlsl, &pairs(&[("a", "1.0f"), ("r0", "q")]), "XCL_DEBUG_CS_SUB");
+        assert_eq!(hlsl, "flo1.0ft q = 1.0f; q = 1.0f + 1.0f;");
+        // with the switch unset no compute shader is named
+        if std::env::var_os("XCL_DEBUG_CS_SUB").is_none() {
+            assert_eq!(cs_subs(b"console", Stage::Compute), None);
+        }
     }
 
     #[test]

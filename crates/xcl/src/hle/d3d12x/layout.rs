@@ -56,4 +56,19 @@ mod tests {
         let g = parse_guid(dev.iid);
         assert_eq!(guid_string(&g), "189819f1-1db6-4b57-be54-1821339b85f7");
     }
+
+    /// A method is at the same slot in every version of an interface (`real::pc_slot!`).
+    #[test]
+    fn a_method_stays_at_its_slot_in_later_versions() {
+        for base in ["ID3D12GraphicsCommandList", "ID3D12CommandQueue", "ID3D12Fence", "ID3D12Resource"] {
+            let b = find(base).unwrap();
+            let versions = chain(base);
+            assert!(!versions.is_empty());
+            for i in versions {
+                for m in b.methods {
+                    assert_eq!(slot(i, m), slot(b, m), "{}::{m}", i.name);
+                }
+            }
+        }
+    }
 }

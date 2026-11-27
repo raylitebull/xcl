@@ -52,6 +52,8 @@ static PRESENTX_LOCK: Mutex<()> = Mutex::new(());
 /// command queue #30 PresentX(planeCount, planes, parameters): plane 0's first resource is
 /// the frame; S_OK always (a console present does not fail for the title).
 pub unsafe extern "system" fn present_x(queue: *mut c_void, plane_count: u32, planes: *const u8, _params: *const u8) -> i32 {
+    // (`XCL_LOOK_STATS=2`: a frame's time on the thread that submits, added up)
+    let _cost = super::look_stats::deep().then(|| crate::hle::api_cost::time(crate::hle::api_cost::Call::Present));
     if plane_count == 0 || planes.is_null() || !crate::gpu::shader::readable(planes as usize, 0x18) {
         return 0;
     }
@@ -115,6 +117,9 @@ fn source_uv_rect(rect: Option<[i32; 4]>, w: u32, h: u32) -> [f32; 4] {
 
 unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u8) {
     let frames = BOUNDARIES.fetch_add(1, Ordering::Relaxed) + 1;
+    super::targets::frame_end();
+    super::gpu_times::present(frames);
+    super::bvh_want::frame();
     if frames % 300 == 0 {
         // the title's frame rate, for comparing runs (every 300 frames)
         static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
@@ -138,6 +143,9 @@ unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u
         }
     }
     let extracted = extract_planes(plane_count, planes);
+    if super::capture::enabled() {
+        super::capture::present(queue as usize, &extracted.iter().map(|e| e.0).collect::<Vec<_>>(), frames);
+    }
     if extracted.is_empty() || !enabled() {
         return;
     }
@@ -252,6 +260,15 @@ pub fn rtv_resource(handle: usize) -> Option<usize> {
     RTVS.lock().unwrap().as_ref()?.get(&handle).copied()
 }
 
+/// The resource `r` while a view still names it (AddRef'd), for `XCL_DUMP_TARGETS`.
+pub(super) unsafe fn view_resource(r: usize) -> Option<ID3D12Resource> {
+    let g = RTVS.lock().unwrap();
+    if !g.as_ref()?.values().any(|&v| v == r) {
+        return None;
+    }
+    ID3D12Resource::from_raw_borrowed(&(r as *mut c_void)).cloned()
+}
+
 /// The resource bound as render target 0 on `list` (`XCL_TRACE_FRAME`).
 pub fn rt0_resource(list: usize) -> Option<usize> {
     let h = *LISTS.lock().unwrap().as_ref()?.get(&list)?;
@@ -298,6 +315,11 @@ pub fn known_queues() -> Vec<usize> {
 }
 
 static EXECUTES: AtomicU64 = AtomicU64::new(0);
+
+/// XCL is presenting on this thread (its own copy of the frame is being submitted).
+pub(super) fn presenting() -> bool {
+    IN_PRESENT.with(|c| c.get())
+}
 
 /// (PresentX calls, ExecuteCommandLists calls) so far
 pub fn activity() -> (u64, u64) {
@@ -350,6 +372,7 @@ pub fn on_queue_console_method(_info: &StubInfo, _caller: usize) {
     }
     BOUNDARIES.fetch_add(1, Ordering::Relaxed);
     LAST_BOUNDARY_MS.store(now_ms(), Ordering::Relaxed);
+    let _cost = super::look_stats::deep().then(|| crate::hle::api_cost::time(crate::hle::api_cost::Call::Present));
     unsafe { present_now(Duration::from_millis(4), None) };
 }
 
@@ -924,13 +947,17 @@ unsafe impl Send for Presenter {}
 static PRESENTER: Mutex<Option<Presenter>> = Mutex::new(None);
 
 unsafe fn transition(res: &ID3D12Resource, before: D3D12_RESOURCE_STATES, after: D3D12_RESOURCE_STATES) -> D3D12_RESOURCE_BARRIER {
+    transition_sub(res, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, before, after)
+}
+
+unsafe fn transition_sub(res: &ID3D12Resource, sub: u32, before: D3D12_RESOURCE_STATES, after: D3D12_RESOURCE_STATES) -> D3D12_RESOURCE_BARRIER {
     D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
         Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
         Anonymous: D3D12_RESOURCE_BARRIER_0 {
             Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
                 pResource: std::mem::transmute_copy(res),
-                Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                Subresource: sub,
                 StateBefore: before,
                 StateAfter: after,
             }),
@@ -1084,7 +1111,11 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, Vec<(usize, 
         return; // swap chain is bound to the first queue we presented from
     }
     // rotate to the oldest in-flight allocator slot and wait only for its fence (frame N-2)
-    if let Err(e) = prepare_pipelined_slot(p, is_frame) {
+    let waited = {
+        let _cost = super::look_stats::deep().then(|| crate::hle::api_cost::time(crate::hle::api_cost::Call::PresentCopyWait));
+        prepare_pipelined_slot(p, is_frame)
+    };
+    if let Err(e) = waited {
         p.disabled = matches!(&e, FenceError::Removed(_));
         if !matches!(&e, FenceError::Timeout(_)) {
             crate::xlog_error!("present: previous copy: {e}");
@@ -1101,8 +1132,44 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, Vec<(usize, 
     if p.alloc.Reset().is_err() || p.list.Reset(&p.alloc, None).is_err() {
         return;
     }
-    let due = frame_dump_due();
+    // `XCL_DUMP_TARGETS`: a busy frame's render targets go with its picture (copied in the
+    // state the title left them, as `XCL_TRACE_FRAME`'s; its frame dump is also the
+    // `last_frame_dump` of the report)
+    let targets = super::targets::take_pending();
+    let dumping_targets = targets.is_some();
+    let due = frame_dump_due() || dumping_targets;
     let mut dumps = Vec::new();
+    for (tag, res, d) in targets.map_or(Vec::new(), |f| super::targets::to_dump(PRESENTS.load(Ordering::Relaxed), &f)) {
+        if let Some((buffer, footprint)) = readback_copy(&p.list, &res, &d) {
+            dumps.push(FrameDump { _source: res, buffer, footprint, format: d.Format, tag });
+        }
+    }
+    // and what each depth UAV twin holds (`depth_uav`; it rests in UNORDERED_ACCESS)
+    if dumping_targets {
+        for (tag, twin) in super::depth_uav::twins_to_dump() {
+            let d = twin.GetDesc();
+            p.list.ResourceBarrier(&[transition(&twin, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+            let copied = readback_copy(&p.list, &twin, &d);
+            p.list.ResourceBarrier(&[transition(&twin, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
+            if let Some((buffer, footprint)) = copied {
+                dumps.push(FrameDump { _source: twin, buffer, footprint, format: d.Format, tag });
+            }
+        }
+        // and the small 3D textures (`lut3d`), from the state the title's work left them in
+        for (tag, tex, d, state) in super::lut3d::to_dump() {
+            let moved = super::lut3d::needs_transition(state);
+            if moved {
+                p.list.ResourceBarrier(&[transition_sub(&tex, 0, state, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+            }
+            let copied = readback_copy(&p.list, &tex, &d);
+            if moved {
+                p.list.ResourceBarrier(&[transition_sub(&tex, 0, D3D12_RESOURCE_STATE_COPY_SOURCE, state)]);
+            }
+            if let Some((buffer, footprint)) = copied {
+                dumps.push(FrameDump { _source: tex, buffer, footprint, format: d.Format, tag });
+            }
+        }
+    }
     let mut composited = false;
     if resolved.len() > 1 {
         if p.compositor.is_none() {
@@ -1178,12 +1245,11 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, Vec<(usize, 
     if due && trace_frame() {
         let busiest = busiest_rt();
         let followed = FOLLOWED.lock().unwrap();
+        // (a followed target is an address too: taken only while an RTV still holds it)
         let targets = busiest
             .into_iter()
-            .chain(followed.iter().copied())
-            .filter_map(|r| {
-                let rr = r as *mut c_void;
-                let res = ID3D12Resource::from_raw_borrowed(&rr)?.clone();
+            .chain(followed.iter().filter_map(|&r| view_resource(r)))
+            .filter_map(|res| {
                 let d = res.GetDesc();
                 if d.SampleDesc.Count > 1 {
                     return None;
@@ -1213,7 +1279,14 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, Vec<(usize, 
         crate::xlog_error!("present: submit copy: {e}");
         return;
     }
-    if let Err(e) = sc.Present(0, DXGI_PRESENT(0)).ok() {
+    if dumping_targets {
+        super::targets::submitted();
+    }
+    let presented = {
+        let _in_driver = super::watch::in_driver(super::watch::Call::Present);
+        sc.Present(0, DXGI_PRESENT(0)).ok()
+    };
+    if let Err(e) = presented {
         let e = fence::api_error(&p.dev, "Present", e);
         p.disabled = matches!(&e, FenceError::Removed(_));
         crate::xlog_error!("present: {e}");
@@ -1224,6 +1297,17 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, Vec<(usize, 
         match fence::wait(&p.fence, p.value, &p.dev, Some(p.event), 2000) {
             Ok(()) => {
                 for dump in p.dumps.drain(..) {
+                    if dump.tag.starts_with("twin") {
+                        super::depth_uav::log_values(&dump.buffer, &dump.footprint, &dump.tag);
+                        continue;
+                    }
+                    if dump.tag.starts_with("lut") {
+                        super::lut3d::log_values(&dump.buffer, &dump.footprint, &dump.tag);
+                        continue;
+                    }
+                    if dump.tag.starts_with("target") {
+                        super::targets::log_census(&dump.buffer, &dump.footprint, &dump.tag);
+                    }
                     write_frame(&dump.buffer, &dump.footprint, dump.format, &dump.tag);
                 }
                 mark_pipe_drained(p);
@@ -1231,7 +1315,13 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, Vec<(usize, 
             }
             Err(e) => {
                 p.disabled = matches!(&e, FenceError::Removed(_));
-                crate::xlog_error!("present: frame dump copy: {e}");
+                // (a copy queued behind the title's work is no stopped GPU: not the fence's
+                // text, which a watchdog reads as one; its buffers stay on the ring slot)
+                if let FenceError::Timeout(ms) = e {
+                    crate::xlog_warn!("present: frame dump copy: not finished after {ms} ms – this dump is skipped");
+                } else {
+                    crate::xlog_error!("present: frame dump copy: {e}");
+                }
                 if p.disabled {
                     return;
                 }
@@ -1331,6 +1421,56 @@ fn rgb(format: DXGI_FORMAT, t: u32) -> Option<[u8; 3]> {
     })
 }
 
+/// A texel of `format` (its bytes: `targets::texel_bytes` of them) as a colour to look at, for
+/// the formats `rgb` does not take: a frame's HDR and data targets (`XCL_DUMP_TARGETS`). A
+/// float channel is tone-mapped as the HDR formats are, its sign dropped (a normal, a motion
+/// vector); an integer target shows its low bytes. A flat picture over a scene that was drawn
+/// could not be followed through these: they were written black, "format not decoded".
+fn texel_rgb(format: DXGI_FORMAT, t: &[u8]) -> Option<[u8; 3]> {
+    let u16_at = |i: usize| u16::from_le_bytes([t[i], t[i + 1]]);
+    let u32_at = |i: usize| u32::from_le_bytes([t[i], t[i + 1], t[i + 2], t[i + 3]]);
+    // (NaN and infinities: white, so that they show)
+    let tm = |v: f32| if v.is_finite() { ((v.abs() / (1.0 + v.abs())).sqrt() * 255.0) as u8 } else { 255 };
+    let half = |i: usize| half_float(u16_at(i));
+    let float = |i: usize| f32::from_bits(u32_at(i));
+    if t.len() < super::targets::texel_bytes(format) {
+        return None;
+    }
+    Some(match format {
+        DXGI_FORMAT_R16G16B16A16_FLOAT | DXGI_FORMAT_R16G16B16A16_TYPELESS => [tm(half(0)), tm(half(2)), tm(half(4))],
+        DXGI_FORMAT_R16G16B16A16_UNORM => [t[1], t[3], t[5]],
+        DXGI_FORMAT_R32G32B32A32_FLOAT | DXGI_FORMAT_R32G32B32A32_TYPELESS => [tm(float(0)), tm(float(4)), tm(float(8))],
+        DXGI_FORMAT_R16G16_FLOAT | DXGI_FORMAT_R16G16_TYPELESS => [tm(half(0)), tm(half(2)), 0],
+        DXGI_FORMAT_R16G16_UNORM => [t[1], t[3], 0],
+        DXGI_FORMAT_R32G32_FLOAT => [tm(float(0)), tm(float(4)), 0],
+        DXGI_FORMAT_R32G32_UINT => [t[0], t[4], t[1]],
+        DXGI_FORMAT_R32_FLOAT | DXGI_FORMAT_D32_FLOAT | DXGI_FORMAT_R32_TYPELESS => [tm(float(0)); 3],
+        DXGI_FORMAT_R32_UINT => [t[0], t[1], t[2]],
+        DXGI_FORMAT_R16_FLOAT | DXGI_FORMAT_R16_TYPELESS => [tm(half(0)); 3],
+        DXGI_FORMAT_R16_UNORM | DXGI_FORMAT_D16_UNORM => [t[1]; 3],
+        DXGI_FORMAT_R16_UINT => [t[0], t[1], 0],
+        DXGI_FORMAT_R8G8_UNORM | DXGI_FORMAT_R8G8_TYPELESS => [t[0], t[1], 0],
+        DXGI_FORMAT_R8_UNORM | DXGI_FORMAT_A8_UNORM | DXGI_FORMAT_R8_TYPELESS => [t[0]; 3],
+        DXGI_FORMAT_R8_UINT => [t[0].wrapping_mul(37), t[0].wrapping_mul(91), t[0].wrapping_mul(151)],
+        DXGI_FORMAT_R8G8B8A8_TYPELESS => [t[0], t[1], t[2]],
+        DXGI_FORMAT_B8G8R8A8_TYPELESS => [t[2], t[1], t[0]],
+        DXGI_FORMAT_R10G10B10A2_TYPELESS => return rgb(DXGI_FORMAT_R10G10B10A2_UNORM, u32_at(0)),
+        _ if t.len() >= 4 => return rgb(format, u32_at(0)),
+        _ => return None,
+    })
+}
+
+/// An IEEE half float.
+pub(super) fn half_float(h: u16) -> f32 {
+    let (sign, e, m) = (if h >> 15 != 0 { -1.0f32 } else { 1.0 }, (h >> 10 & 31) as i32, (h & 0x3FF) as f32 / 1024.0);
+    sign * match e {
+        0 => m * 2f32.powi(-14),
+        31 if m == 0.0 => f32::INFINITY,
+        31 => f32::NAN,
+        _ => (1.0 + m) * 2f32.powi(e - 15),
+    }
+}
+
 /// the largest render target the draws `XCL_TRACE_SHADERS` picked drew into (AddRef'd): the
 /// one the `XCL_TRACE_FRAME` dumps show instead of the busiest
 static WATCHED_RT: Mutex<Option<usize>> = Mutex::new(None);
@@ -1372,17 +1512,23 @@ pub unsafe fn watch_rt(rt: usize) {
 }
 
 /// the single-sampled resource bound as a render target most often (`XCL_TRACE_FRAME`; a
-/// multisampled one cannot be copied to a buffer – the present list would not close)
-fn busiest_rt() -> Option<usize> {
+/// multisampled one cannot be copied to a buffer – the present list would not close).
+///
+/// `USES` and the watched target are addresses, not references. A target is taken only while an
+/// RTV still names it, which holds it (`view_resource`): a retail title's world releases
+/// transient targets all the time, and GetDesc on one of those addresses ended the process (an
+/// access violation under `present_now`, in every trace run that also dumped frames or targets).
+unsafe fn busiest_rt() -> Option<ID3D12Resource> {
     if let Some(r) = *WATCHED_RT.lock().unwrap() {
-        return Some(r);
+        return view_resource(r);
     }
-    let single = |r: usize| unsafe { ID3D12Resource::from_raw_borrowed(&(r as *mut c_void)).is_some_and(|x| x.GetDesc().SampleDesc.Count <= 1) };
-    USES.lock().unwrap().as_ref()?.iter().filter(|(&r, u)| u[USE_RT] > 0 && single(r)).max_by_key(|(_, u)| u[USE_RT]).map(|(&r, _)| r)
+    let mut bound: Vec<(usize, u64)> = USES.lock().unwrap().as_ref()?.iter().filter(|(_, u)| u[USE_RT] > 0).map(|(&r, u)| (r, u[USE_RT])).collect();
+    bound.sort_by_key(|&(_, binds)| std::cmp::Reverse(binds));
+    bound.into_iter().find_map(|(r, _)| view_resource(r).filter(|x| x.GetDesc().SampleDesc.Count <= 1))
 }
 
 /// an 11- / 10-bit unsigned float (5-bit exponent) -> f32
-fn small_float(v: u32, mantissa_bits: u32) -> f32 {
+pub(super) fn small_float(v: u32, mantissa_bits: u32) -> f32 {
     let (e, m) = (v >> mantissa_bits, v & ((1 << mantissa_bits) - 1));
     let m = m as f32 / (1u32 << mantissa_bits) as f32;
     match e {
@@ -1415,12 +1561,18 @@ unsafe fn write_frame(rb: &ID3D12Resource, fp: &D3D12_PLACED_SUBRESOURCE_FOOTPRI
     }
     let (mut lit, mut decoded) = (0usize, true);
     let mut raw: HashMap<u32, usize> = HashMap::new();
+    // (a texel of 1, 2, 8 or 16 bytes is read at its own size: read as 4 bytes at a 4-byte
+    // stride, an HDR target showed every other half texel and a one-byte one ran past its row)
+    let bytes = super::targets::texel_bytes(format);
     for y in (0..oh).rev() {
         let start = bmp.len();
         for x in 0..ow {
-            let t = ((p as *const u8).add(fp.Offset as usize + step * y * pitch + 4 * step * x) as *const u32).read_unaligned();
+            let texel = std::slice::from_raw_parts((p as *const u8).add(fp.Offset as usize + step * y * pitch + bytes * step * x), bytes);
+            let mut first = [0u8; 4];
+            first[..bytes.min(4)].copy_from_slice(&texel[..bytes.min(4)]);
+            let t = u32::from_le_bytes(first);
             *raw.entry(t).or_default() += 1;
-            let c = rgb(format, t).unwrap_or_else(|| {
+            let c = texel_rgb(format, texel).unwrap_or_else(|| {
                 decoded = false;
                 [0; 3]
             });
@@ -1476,6 +1628,31 @@ impl Drop for Presenter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dumped_texels_of_hdr_and_data_formats_have_a_colour() {
+        assert_eq!(half_float(0x3C00), 1.0);
+        assert_eq!(half_float(0xC000), -2.0);
+        assert_eq!(half_float(0x0000), 0.0);
+        assert!(half_float(0x0001) > 0.0 && half_float(0x0001) < 1e-6, "a denormal");
+        assert!(half_float(0x7C00).is_infinite() && half_float(0x7E00).is_nan());
+        // RGBA16F (1, 0, 4, 1): tone-mapped x / (1 + x), square root
+        let hdr: Vec<u8> = [0x3C00u16, 0, 0x4400, 0x3C00].iter().flat_map(|h| h.to_le_bytes()).collect();
+        assert_eq!(texel_rgb(DXGI_FORMAT_R16G16B16A16_FLOAT, &hdr), Some([180, 0, 228]));
+        // a NaN shows (white), a negative value by its size
+        let odd: Vec<u8> = [0x7E00u16, 0xBC00, 0, 0].iter().flat_map(|h| h.to_le_bytes()).collect();
+        assert_eq!(texel_rgb(DXGI_FORMAT_R16G16B16A16_FLOAT, &odd), Some([255, 180, 0]));
+        assert_eq!(texel_rgb(DXGI_FORMAT_R8_UNORM, &[200]), Some([200; 3]));
+        assert_eq!(texel_rgb(DXGI_FORMAT_R32_UINT, &[1, 2, 3, 4]), Some([1, 2, 3]));
+        assert_eq!(texel_rgb(DXGI_FORMAT_R16G16_UNORM, &[0, 10, 0, 20]), Some([10, 20, 0]));
+        assert_eq!(texel_rgb(DXGI_FORMAT_R32_FLOAT, &1.0f32.to_le_bytes()), Some([180; 3]));
+        // the formats `rgb` knows go through it
+        assert_eq!(texel_rgb(DXGI_FORMAT_R8G8B8A8_UNORM, &[1, 2, 3, 4]), Some([1, 2, 3]));
+        assert_eq!(texel_rgb(DXGI_FORMAT_B8G8R8A8_UNORM, &[1, 2, 3, 4]), Some([3, 2, 1]));
+        // fewer bytes than the format's texel: no colour (and no read past them)
+        assert_eq!(texel_rgb(DXGI_FORMAT_R16G16B16A16_FLOAT, &hdr[..4]), None);
+        assert_eq!(texel_rgb(DXGI_FORMAT_BC1_UNORM, &[0; 4]), None, "a format with no texels of its own");
+    }
 
     #[test]
     fn present_ring_overlaps_previous_frame_and_drains_cleanly() {
@@ -1682,7 +1859,10 @@ mod frame_dump_tests {
             write_frame(&buffer, &fp, fp.Footprint.Format, "frame");
             let bright = last_frame_dump().unwrap();
             assert_eq!(bright.non_dark_samples, Some(bright.sampled_pixels));
-            write_frame(&buffer, &fp, DXGI_FORMAT_R32_FLOAT, "frame");
+            // (a format no dump decodes, at the footprint's 4 bytes a texel: shared-exponent
+            // RGB is no render target's)
+            assert_eq!(texel_rgb(DXGI_FORMAT_R9G9B9E5_SHAREDEXP, &[31, 0, 0, 255]), None);
+            write_frame(&buffer, &fp, DXGI_FORMAT_R9G9B9E5_SHAREDEXP, "frame");
             let json = serde_json::to_value(last_frame_dump().unwrap()).unwrap();
             assert!(json["non_dark_samples"].is_null(), "undecoded is different from dark");
         }

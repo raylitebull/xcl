@@ -127,7 +127,8 @@ pub(super) unsafe fn free(addr: *mut c_void, size: usize, flags: u32) -> Option<
         }
         let len = if size == 0 { r.end - base } else { size };
         super::super::d3d12x::sparse::decommitted(base, len);
-        return Some(mem::VirtualFree(addr, len, mem::MEM_DECOMMIT));
+        // (the place of a page a tile shows may lie here: `source_part`)
+        return Some(super::source_going(base, len, false, || mem::VirtualFree(addr, len, mem::MEM_DECOMMIT)));
     }
     if start != base || (flags != PRESERVE && flags != mem::MEM_RELEASE) || (flags == mem::MEM_RELEASE && size != 0)
         || (flags == PRESERVE && size != 0 && size != r.end - base)
@@ -136,7 +137,7 @@ pub(super) unsafe fn free(addr: *mut c_void, size: usize, flags: u32) -> Option<
     }
     if !r.placeholder {
         super::super::d3d12x::sparse::decommitted(base, r.end - base);
-        if mem::VirtualFree(addr, r.end - base, mem::MEM_DECOMMIT) == 0 {
+        if super::source_going(base, r.end - base, false, || mem::VirtualFree(addr, r.end - base, mem::MEM_DECOMMIT)) == 0 {
             return Some(0);
         }
     }

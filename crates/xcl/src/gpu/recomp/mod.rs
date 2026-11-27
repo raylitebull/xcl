@@ -204,6 +204,31 @@ pub const GS_PRIMS_PER_GROUP: u32 = 21;
 pub const IO_GS_PRIMS: usize = 110;
 pub const IO_GS_VERTICES: usize = 111;
 pub const IO_UMA_BASE_HI: usize = 112;
+/// io slot of a compute dispatch's loop budget (`dispatch_loop_budget`): the passes the lanes
+/// of one of its thread groups may run together in one entry of a loop, 0 = not known (an
+/// indirect dispatch, a test: 65 536 a lane, as the lane's whole budget).
+pub const IO_LOOP_BUDGET: usize = 113;
+/// io slot (trap-temp range) of a compute dispatch whose groups were folded: the console's group
+/// count in X, 0 when not folded. The console takes up to 2^32 − 1 groups a dimension, D3D12
+/// 65 535 – a dispatch of more in X (and 1 in Y) runs as 65 535 × ⌈n / 65 535⌉ groups, and
+/// the translated program takes `gid.x + gid.y · 65 535` as its group in X, leaving out the
+/// groups at or past `n` (a retail game's 72 512 × 1 × 1 hung the GPU).
+pub const IO_GROUP_LIMIT: usize = 114;
+/// Groups a folded dispatch has in X.
+pub const FOLD_X: u32 = 65_535;
+/// High dword `s_getpc_b64` gives a program that has constant data in its code region
+/// (`Options::rodata`) and several memory windows: its code addresses are then above every
+/// address a title can have (user space ends at 0x7FFF_FFFF_FFFF), so a load from the data is
+/// told from a load of the title's memory at the same low dword (descriptor tables in window 0).
+pub const CODE_ADDRESS_HI: u32 = 0xC0DE;
+/// io slots (trap-temp range, after `IO_GROUP_LIMIT`) of a `DispatchX` with thread dimensions
+/// (flag 0x20): the thread count of each axis when it is not a whole number of groups (0: the
+/// last group is whole), so the program can leave the lanes past it out of EXEC. Written by
+/// D3D12.X; every compute prologue reads the three at once (one 12-byte load: they must stay
+/// consecutive) and leaves a lane out of its EXEC when its thread along an axis (the console's
+/// group, unfolded, times the group size plus its thread in the group) is at or past the count.
+pub const IO_THREAD_LIMIT: [usize; 3] = [115, 116, 117];
+const _: () = assert!(IO_THREAD_LIMIT[1] == IO_THREAD_LIMIT[0] + 1 && IO_THREAD_LIMIT[2] == IO_THREAD_LIMIT[0] + 2);
 
 impl GsInterface {
     /// bytes of one ES vertex in LDS (ESGS item: 16 per ES output register)
@@ -528,11 +553,17 @@ pub struct Options {
     /// structured control flow when the program allows it (false, or `XCL_RECOMP_NO_STRUCTURED`:
     /// always the guarded block chain)
     pub structured: bool,
+    /// constant data the console compiler put in the code region after the program
+    /// (`xbox::Fssm::rodata`): (address from the program's start, dwords). The program finds
+    /// it with `s_getpc_b64` and reads it with `s_load` / `global_load`; the title's memory does
+    /// not hold the code, so a load at a code address in one of these ranges takes the dwords
+    /// from the shader (`CODE_ADDRESS_HI`)
+    pub rodata: Vec<(u32, Vec<u32>)>,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, split_wave64: false, static_sampler_base: 0, mem_windows: 1, heap_windows: false, structured: true }
+        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, split_wave64: false, static_sampler_base: 0, mem_windows: 1, heap_windows: false, structured: true, rodata: Vec::new() }
     }
 }
 
@@ -641,11 +672,31 @@ impl Conts {
 }
 
 /// At the top of every emitted loop: a lane's loop iterations are capped (`xcl_budget`, in
-/// the prelude: 65 536) – console code that loops on what XCL passed it wrong (an address, a
+/// the prelude: 65 536; in a compute program each entry of a loop besides, by the dispatch's
+/// size: `Em::loop_guard`, `dispatch_loop_budget`) – console code that loops on what XCL passed it wrong (an address, a
 /// count) must not keep the PC GPU busy for minutes (a process with such work in flight cannot
 /// even be terminated). Once the budget is spent every loop
 /// leaves at its next iteration and the program runs to its end.
 const LOOP_GUARD: &str = "if (xcl_budget == 0u) break; xcl_budget--;";
+
+/// The passes all the lanes of one compute dispatch may run together in one entry of a loop
+/// before the loop is ended (`Em::loop_guard`). 65 536 passes a lane keep a small dispatch
+/// busy for a moment and a large one for far longer than Windows waits for the GPU (2 s, then
+/// the device is removed): a retail program of 4 x 4 x 4 threads given a loop count that never
+/// comes, dispatched as 16 x 16 x 16 groups on an RTX 3060 Ti, measured 0.47 ms a pass – 31 s
+/// for 65 536 of them, 0.5 s for the 1024 a lane that this many passes in all leave it.
+pub const DISPATCH_LOOP_PASSES: u64 = 1 << 28;
+/// The passes of one entry of a loop a lane has however large its dispatch is: a working
+/// program's loop is not cut short because many threads run it.
+pub const DISPATCH_LOOP_PASSES_MIN: u32 = 1024;
+
+/// What a compute dispatch of `groups` thread groups puts into `IO_LOOP_BUDGET`: its share of
+/// `DISPATCH_LOOP_PASSES` for one group. The program divides it by its threads per group
+/// (between `DISPATCH_LOOP_PASSES_MIN` and 65 536 a lane); never 0, which means "not known".
+pub fn dispatch_loop_budget(groups: [u32; 3]) -> u32 {
+    let n: u64 = groups.iter().map(|&g| g.max(1) as u64).product();
+    (DISPATCH_LOOP_PASSES / n).clamp(1, u32::MAX as u64) as u32
+}
 
 /// Structured code longer than this many bytes per byte of program falls back to the `pc` form.
 /// Each guard of the structured form lists every pending skip flag, so it grows with the
@@ -1098,7 +1149,11 @@ fn emit_structured(
         }
         let raised: BTreeSet<u64> = match it {
             Item::Loop { a, b, latch, entry } => {
-                body.push_str(&format!("{ipad}[loop] for (;;) {{\n{ipad}    {LOOP_GUARD}\n"));
+                let (before, guard) = em.loop_guard();
+                if !before.is_empty() {
+                    body.push_str(&format!("{ipad}{before}\n"));
+                }
+                body.push_str(&format!("{ipad}[loop] for (;;) {{\n{ipad}    {guard}\n"));
                 let (lcont, lin) = if entry.is_none() { (cont.enter(Some(a)), &inner) } else { (cont.enter(None), &none) };
                 let mut r = emit_structured(c, em, body, entry.unwrap_or(a), latch, None, nest + 1, &lcont, lin, d + 1, blocks, flags);
                 for &t in &r {
@@ -1219,7 +1274,11 @@ fn emit_range(c: &Ctx, em: &mut emit::Em, body: &mut String, lo: u64, hi: u64, d
         let start = c.leaders[i];
         let inner = c.loops.iter().filter(|&&(a, b)| a == start && b <= hi && (a, b) != (lo, hi)).max_by_key(|x| x.1).copied();
         if let Some((a, b)) = inner {
-            body.push_str(&format!("{pad}[loop] while (pc >= {a}u && pc < {b}u) {{\n{pad}    {LOOP_GUARD}\n"));
+            let (before, guard) = em.loop_guard();
+            if !before.is_empty() {
+                body.push_str(&format!("{pad}{before}\n"));
+            }
+            body.push_str(&format!("{pad}[loop] while (pc >= {a}u && pc < {b}u) {{\n{pad}    {guard}\n"));
             emit_range(c, em, body, a, b, depth + 1, blocks, flags);
             body.push_str(&format!("{pad}}}\n"));
             i = c.leaders.partition_point(|&l| l < b);
@@ -1425,46 +1484,121 @@ fn scalar_constant(d: &Decoded, code: u64) -> Option<u32> {
 }
 
 /// S# built from constants in the code – how the console compiler places the static
-/// samplers of a root signature: for each MIMG instruction whose four sampler SGPRs were all
-/// set by s_mov / s_movk / s_brev with constants earlier in its block, those words.
-pub(crate) fn constant_samplers(insts: &[Decoded], leaders: &BTreeSet<u64>) -> BTreeMap<u64, [u32; 4]> {
-    let mut known: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
-    let mut out = BTreeMap::new();
-    for d in insts {
-        if leaders.contains(&d.pc) {
-            known.clear();
-        }
-        let f = |n: &str| rdna2::field_value(d.enc, &d.words, n);
-        if d.enc.name == "ENC_MIMG" {
-            if let Some(s) = f("SSAMP").map(|v| v * rdna2::register_scale("SSAMP")) {
-                if let (Some(a), Some(b), Some(c), Some(e)) = (known.get(&s), known.get(&(s + 1)), known.get(&(s + 2)), known.get(&(s + 3))) {
-                    out.insert(d.pc, [*a, *b, *c, *e]);
+/// samplers of a root signature: for each MIMG instruction whose four sampler SGPRs hold
+/// constants set by s_mov / s_movk / s_brev on every path that reaches it, those words.
+///
+/// The constants are followed through the program's branches (the compiler sets an S# before a
+/// loop or an `if` and samples inside it): a register is a constant at a block's start when
+/// every block that leads there leaves it with the same one. A program with a branch whose
+/// target is not known is read block by block, as nothing is known at a block's start then.
+///
+/// `follow`: the stages that draw (vertex and pixel programs). The other programs are read
+/// block by block as before: on a retail title, compute programs read this way gave garbage
+/// counts to `ExecuteIndirect` (2 055 in 75 s, none before) and the device hung.
+pub(crate) fn constant_samplers(insts: &[Decoded], leaders: &BTreeSet<u64>, follow: bool) -> BTreeMap<u64, [u32; 4]> {
+    type Known = std::collections::HashMap<u64, u32>;
+    // one block's instructions on `known`; the S# of its MIMG instructions into `out`
+    fn run(block: &[Decoded], known: &mut Known, mut out: Option<&mut BTreeMap<u64, [u32; 4]>>) {
+        for d in block {
+            let f = |n: &str| rdna2::field_value(d.enc, &d.words, n);
+            if d.enc.name == "ENC_MIMG" {
+                if let (Some(out), Some(s)) = (out.as_deref_mut(), f("SSAMP").map(|v| v * rdna2::register_scale("SSAMP"))) {
+                    if let (Some(a), Some(b), Some(c), Some(e)) = (known.get(&s), known.get(&(s + 1)), known.get(&(s + 2)), known.get(&(s + 3))) {
+                        out.insert(d.pc, [*a, *b, *c, *e]);
+                    }
                 }
             }
-        }
-        let set: Vec<(u64, u32)> = match d.inst.name {
-            "S_MOV_B32" => f("SDST").zip(f("SSRC0").and_then(|c| scalar_constant(d, c))).map(|(r, v)| vec![(r, v)]).unwrap_or_default(),
-            "S_MOVK_I32" => f("SDST").zip(f("SIMM16")).map(|(r, v)| vec![(r, v as u16 as i16 as i32 as u32)]).unwrap_or_default(),
-            // a constant with only high bits set, as the compiler writes it: `s_brev_b32 s66, 40`
-            "S_BREV_B32" => f("SDST").zip(f("SSRC0").and_then(|c| scalar_constant(d, c))).map(|(r, v)| vec![(r, v.reverse_bits())]).unwrap_or_default(),
-            // 64-bit moves of inline integers (sign-extended): S# words that are 0 / -1
-            "S_MOV_B64" => match (f("SDST"), f("SSRC0")) {
-                (Some(r), Some(c @ 128..=208)) => {
-                    let v = scalar_constant(d, c).unwrap() as i32 as i64;
-                    vec![(r, v as u32), (r + 1, (v >> 32) as u32)]
-                }
+            let set: Vec<(u64, u32)> = match d.inst.name {
+                "S_MOV_B32" => f("SDST").zip(f("SSRC0").and_then(|c| scalar_constant(d, c))).map(|(r, v)| vec![(r, v)]).unwrap_or_default(),
+                "S_MOVK_I32" => f("SDST").zip(f("SIMM16")).map(|(r, v)| vec![(r, v as u16 as i16 as i32 as u32)]).unwrap_or_default(),
+                // a constant with only high bits set, as the compiler writes it: `s_brev_b32 s66, 40`
+                "S_BREV_B32" => f("SDST").zip(f("SSRC0").and_then(|c| scalar_constant(d, c))).map(|(r, v)| vec![(r, v.reverse_bits())]).unwrap_or_default(),
+                // 64-bit moves of inline integers (sign-extended): S# words that are 0 / -1
+                "S_MOV_B64" => match (f("SDST"), f("SSRC0")) {
+                    (Some(r), Some(c @ 128..=208)) => {
+                        let v = scalar_constant(d, c).unwrap() as i32 as i64;
+                        vec![(r, v as u32), (r + 1, (v >> 32) as u32)]
+                    }
+                    // a 32-bit literal, zero-extended: `s_mov_b64 s[18:19], 0x18500000`
+                    (Some(r), Some(255)) => d.literal.map(|v| vec![(r, v), (r + 1, 0)]).unwrap_or_default(),
+                    _ => Vec::new(),
+                },
+                // a run of set bits: `s_bfm_b32 s17, 12, 12` is 0x00fff000
+                "S_BFM_B32" => match (f("SDST"), f("SSRC0").and_then(|c| scalar_constant(d, c)), f("SSRC1").and_then(|c| scalar_constant(d, c))) {
+                    (Some(r), Some(a), Some(b)) => vec![(r, ((1u32 << (a & 31)) - 1) << (b & 31))],
+                    _ => Vec::new(),
+                },
                 _ => Vec::new(),
-            },
-            _ => Vec::new(),
-        };
-        for w in rdna2::sgpr_uses(d).1 {
-            known.remove(&w);
-        }
-        for (r, v) in set {
-            if r < 106 {
-                known.insert(r, v);
+            };
+            for w in rdna2::sgpr_uses(d).1 {
+                known.remove(&w);
+            }
+            for (r, v) in set {
+                if r < 106 {
+                    known.insert(r, v);
+                }
             }
         }
+    }
+    // the blocks, in address order
+    let mut starts: Vec<usize> = insts.iter().enumerate().filter(|(i, d)| *i == 0 || leaders.contains(&d.pc)).map(|(i, _)| i).collect();
+    starts.push(insts.len());
+    let blocks: Vec<&[Decoded]> = starts.windows(2).map(|w| &insts[w[0]..w[1]]).filter(|b| !b.is_empty()).collect();
+    let at: std::collections::HashMap<u64, usize> = blocks.iter().enumerate().map(|(k, b)| (b[0].pc, k)).collect();
+    // where each block goes on; None: somewhere that is not known
+    let next: Option<Vec<Vec<usize>>> = blocks
+        .iter()
+        .enumerate()
+        .map(|(k, b)| {
+            let d = b.last().unwrap();
+            let after = (k + 1 < blocks.len()).then_some(k + 1);
+            Some(match (rdna2::branch_target(d), d.inst.name) {
+                (Some(t), n) if n.starts_with("S_CBRANCH") => after.into_iter().chain([*at.get(&t)?]).collect(),
+                (Some(t), "S_BRANCH" | "S_SETPC_B64") => vec![*at.get(&t)?],
+                (Some(_), _) => return None,
+                (None, "S_ENDPGM") => Vec::new(),
+                (None, _) if d.inst.flags & rdna2::F_TERMINATOR != 0 => return None,
+                _ => after.into_iter().collect(),
+            })
+        })
+        .collect();
+    let mut out = BTreeMap::new();
+    let Some(next) = next.filter(|_| follow) else {
+        for b in &blocks {
+            run(b, &mut Known::new(), Some(&mut out));
+        }
+        return out;
+    };
+    // what is known at each block's start (None: not reached yet): what every way in agrees on
+    let mut start: Vec<Option<Known>> = vec![None; blocks.len()];
+    let mut work: Vec<usize> = Vec::new();
+    if !blocks.is_empty() {
+        start[0] = Some(Known::new());
+        work.push(0);
+    }
+    while let Some(k) = work.pop() {
+        let mut known = start[k].clone().unwrap_or_default();
+        run(blocks[k], &mut known, None);
+        for &n in &next[k] {
+            let changed = match &mut start[n] {
+                slot @ None => {
+                    *slot = Some(known.clone());
+                    true
+                }
+                Some(have) => {
+                    let before = have.len();
+                    have.retain(|r, v| known.get(r) == Some(v));
+                    have.len() != before
+                }
+            };
+            if changed {
+                work.push(n);
+            }
+        }
+    }
+    for (k, b) in blocks.iter().enumerate() {
+        // (a block nothing leads to: nothing known at its start)
+        run(b, &mut start[k].clone().unwrap_or_default(), Some(&mut out));
     }
     out
 }
@@ -1549,7 +1683,8 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
     let mut em = emit::Em::new(opt.clone());
     em.coherent_mem = matches!(opt.mode, Mode::Compute(_)) && needs_coherent_mem(&insts);
     em.configure_round_modes(&insts, branches == 0);
-    em.static_ss = constant_samplers(&insts, &leaders);
+    em.writes_lds = emit::lds_order_wanted() && emit::writes_lds(&insts);
+    em.static_ss = constant_samplers(&insts, &leaders, matches!(opt.mode, Mode::Vertex(_) | Mode::Pixel(_)));
     // split wave64: masks only read lane by lane skip the halves' exchange (geometry mode
     // continues from the ES into the GS through s_setpc: left as it is); pixel shaders: they
     // skip the quad reads that give the helper lanes' bits

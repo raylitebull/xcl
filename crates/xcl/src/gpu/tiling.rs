@@ -178,6 +178,26 @@ impl Layout {
         }
     }
 
+    /// How many elements of a row lie together in memory, at any multiple of that many: up to 16
+    /// bytes of them.
+    fn run(&self) -> usize {
+        let e = 1u32 << self.elem_log2;
+        let mut run = 16 / e as usize;
+        while run > 1 {
+            let low = run as u32 * e - 1;
+            let clear = |t: &[u32]| t.iter().all(|o| o & low == 0);
+            let together = self.block_w.is_multiple_of(run)
+                && self.ox.chunks_exact(run).all(|c| c[0] & low == 0 && c.iter().enumerate().all(|(k, &o)| o == c[0] + k as u32 * e))
+                && [&self.oy, &self.oz, &self.hx, &self.hy, &self.hz].iter().all(|t| clear(t))
+                && self.base_xor as u32 & low == 0;
+            if together {
+                break;
+            }
+            run /= 2;
+        }
+        run
+    }
+
     /// surface `w` × `h` elements: (blocks per row, blocks per column)
     pub fn blocks(&self, w: usize, h: usize) -> (usize, usize) {
         (w.div_ceil(self.block_w), h.div_ceil(self.block_h))
@@ -258,6 +278,25 @@ pub fn image_layout(t: &super::desc::Image, cfg: PipeConfig) -> Option<(Layout, 
     let mut l = Layout::new(t.swizzle_mode, e, cfg)?;
     l.base_xor = (t.address as usize) & (l.block_bytes - 1);
     Some((l, t.width.div_ceil(side) as usize, t.height.div_ceil(side) as usize))
+}
+
+/// Part of a level: the elements `x0..x1` of its rows `y0..y1`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Rect {
+    pub x0: usize,
+    pub y0: usize,
+    pub x1: usize,
+    pub y1: usize,
+}
+
+/// `N` bytes from each of `runs` (XOR `at`) of a block, one after another to `to`.
+#[inline(always)]
+unsafe fn copy_runs<'a, const N: usize>(block: *const u8, runs: impl Iterator<Item = &'a u32>, at: u32, to: *mut u8) {
+    let mut to = to as *mut [u8; N];
+    for x in runs {
+        to.write_unaligned((block.add((x ^ at) as usize) as *const [u8; N]).read_unaligned());
+        to = to.add(1);
+    }
 }
 
 /// One mip level of a tiled surface, in elements.
@@ -468,6 +507,152 @@ impl Chain {
         out
     }
 
+    /// The first level in the mip tail (the number of levels when there is none).
+    pub fn first_tail(&self) -> usize {
+        self.levels.iter().position(|l| l.tail.is_some()).unwrap_or(self.levels.len())
+    }
+
+    /// The bytes of a slice level `i` takes (the levels in the mip tail share its block).
+    pub fn level_bytes(&self, i: usize) -> std::ops::Range<usize> {
+        if self.levels[i].tail.is_some() {
+            return 0..self.layout.block_bytes;
+        }
+        // (from the smallest level to mip 0, see `new_3d`)
+        self.levels[i].offset..if i == 0 { self.slice_bytes } else { self.levels[i - 1].offset }
+    }
+
+    /// The parts of a slice's levels (level, elements of it) the bytes `ranges` of the slice hold:
+    /// whole blocks of a level, as few rectangles as rows of them give, and the level as a whole
+    /// when most of its blocks are among them. `ranges` (from, to) are sorted and disjoint. (2D: a
+    /// 3D texture's slices are layers.)
+    pub fn parts(&self, ranges: &[(usize, usize)]) -> Vec<(usize, Rect)> {
+        let t = &self.layout;
+        let mut out = Vec::new();
+        let first_tail = self.first_tail();
+        for i in first_tail..self.levels.len() {
+            if ranges.first().is_some_and(|r| r.0 < t.block_bytes) {
+                out.push((i, Rect { x0: 0, y0: 0, x1: self.levels[i].width, y1: self.levels[i].height }));
+            }
+        }
+        // (row of blocks, first block, past the last one) of a level, in their order in memory
+        let mut spans: Vec<(usize, usize, usize)> = Vec::new();
+        for i in 0..first_tail {
+            let l = &self.levels[i];
+            let whole = self.level_bytes(i);
+            let row = l.pitch.div_ceil(t.block_w).max(1);
+            spans.clear();
+            let mut blocks = 0;
+            for &(from, to) in &ranges[ranges.partition_point(|r| r.1 <= whole.start)..] {
+                if from >= whole.end {
+                    break;
+                }
+                let (from, to) = (from.max(whole.start) - whole.start, to.min(whole.end) - whole.start);
+                let (mut k, end) = (from / t.block_bytes, to.div_ceil(t.block_bytes));
+                while k < end {
+                    let (y, x) = (k / row, k % row);
+                    let n = (row - x).min(end - k);
+                    k += n;
+                    // (a linear surface's "blocks" are 256 bytes of a row: whole rows of those)
+                    let (x, n) = if t.block_h == 1 { (0, row) } else { (x, n) };
+                    match spans.last_mut() {
+                        Some(s) if s.0 == y && x <= s.2 => {
+                            blocks += (x + n).saturating_sub(s.2);
+                            s.2 = s.2.max(x + n);
+                        }
+                        _ => {
+                            spans.push((y, x, x + n));
+                            blocks += n;
+                        }
+                    }
+                }
+            }
+            if spans.is_empty() {
+                continue;
+            }
+            if blocks * 4 >= (whole.len() / t.block_bytes) * 3 {
+                out.push((i, Rect { x0: 0, y0: 0, x1: l.width, y1: l.height }));
+                continue;
+            }
+            let from = out.len();
+            for &(y, x0, x1) in &spans {
+                let r = Rect { x0: x0 * t.block_w, y0: y * t.block_h, x1: (x1 * t.block_w).min(l.width), y1: ((y + 1) * t.block_h).min(l.height) };
+                // (padding blocks beyond the level)
+                if r.x0 >= r.x1 || r.y0 >= r.y1 {
+                    continue;
+                }
+                match out[from..].last_mut() {
+                    Some((_, p)) if p.x0 == r.x0 && p.x1 == r.x1 && p.y1 == r.y0 => p.y1 = r.y1,
+                    _ => out.push((i, r)),
+                }
+            }
+        }
+        out
+    }
+
+    /// The rows of blocks of level `i` that hold the rows of `r` (0..1 for a level in the tail),
+    /// and in each the blocks that hold its columns.
+    pub fn blocks_of(&self, i: usize, r: Rect) -> (std::ops::Range<usize>, std::ops::Range<usize>) {
+        let (t, l) = (&self.layout, &self.levels[i]);
+        ((r.y0 + l.origin.1) / t.block_h..(r.y1 + l.origin.1).div_ceil(t.block_h), (r.x0 + l.origin.0) / t.block_w..(r.x1 + l.origin.0).div_ceil(t.block_w))
+    }
+
+    /// Where block (`bx`, `by`) of level `i` begins in its slice.
+    pub fn block_at(&self, i: usize, bx: usize, by: usize) -> usize {
+        let l = &self.levels[i];
+        l.offset + (by * l.pitch.div_ceil(self.layout.block_w).max(1) + bx) * self.layout.block_bytes
+    }
+
+    /// The elements of `r` that are in blocks `blocks` of block row `by` of level `i` in array
+    /// slice `slice` → linear rows, `pitch` bytes apart; `dst` is where `r`'s first element goes.
+    /// `src` holds those blocks' bytes, one after another.
+    ///
+    /// # Safety
+    /// `dst` takes `r`'s rows `pitch` bytes apart; `src` is the length of the blocks.
+    pub unsafe fn detile_blocks(&self, src: &[u8], i: usize, slice: usize, by: usize, blocks: std::ops::Range<usize>, r: Rect, dst: *mut u8, pitch: usize) {
+        let (t, l) = (&self.layout, &self.levels[i]);
+        assert!(src.len() >= blocks.len() * t.block_bytes);
+        // in the coordinates of the blocks (a level in the tail lies somewhere in its block)
+        let (x0, x1) = (r.x0 + l.origin.0, r.x1 + l.origin.0);
+        let (y0, y1) = ((r.y0 + l.origin.1).max(by * t.block_h), (r.y1 + l.origin.1).min((by + 1) * t.block_h));
+        let e = t.elem_log2;
+        let hi = |tab: &[u32], c: usize| tab[c % tab.len()];
+        let z = t.oz[slice % t.block_d] ^ hi(&t.hz, slice / t.block_d);
+        let run = t.run();
+        for (n, bx) in blocks.enumerate() {
+            let (from, to) = (x0.max(bx * t.block_w), x1.min((bx + 1) * t.block_w));
+            if from >= to {
+                continue;
+            }
+            let block = src[n * t.block_bytes..][..t.block_bytes].as_ptr();
+            let fixed = hi(&t.hx, bx) ^ hi(&t.hy, by) ^ z ^ t.base_xor as u32;
+            // whole runs of elements that lie together, then the rest one by one
+            let (a, b) = (from - bx * t.block_w, to - bx * t.block_w);
+            let (ra, rb) = (a.next_multiple_of(run), b / run * run);
+            let columns = &t.ox[..t.block_w];
+            for y in y0..y1 {
+                let at = t.oy[y - by * t.block_h] ^ fixed;
+                let row = dst.add((y - l.origin.1 - r.y0) * pitch + ((from - x0) << e));
+                // SAFETY: an offset is inside the block (`every_pattern_is_a_permutation_of_its_block`)
+                let one = |x: usize| std::ptr::copy_nonoverlapping(block.add((columns[x] ^ at) as usize), row.add((x - a) << e), 1 << e);
+                if ra >= rb {
+                    (a..b).for_each(one);
+                    continue;
+                }
+                (a..ra).for_each(one);
+                let runs = columns[ra..rb].iter().step_by(run);
+                let to = row.add((ra - a) << e);
+                match run << e {
+                    16 => copy_runs::<16>(block, runs, at, to),
+                    8 => copy_runs::<8>(block, runs, at, to),
+                    4 => copy_runs::<4>(block, runs, at, to),
+                    2 => copy_runs::<2>(block, runs, at, to),
+                    _ => copy_runs::<1>(block, runs, at, to),
+                }
+                (rb..b).for_each(one);
+            }
+        }
+    }
+
     /// linear rows of level `i` → its place in array slice `slice` (`dst`, `slice_bytes` long)
     pub fn tile_level(&self, dst: &mut [u8], i: usize, slice: usize, linear: &[u8]) {
         let l = self.levels[i];
@@ -571,6 +756,130 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A level detiled block by block, in rectangles of it, is the level `detile_level` gives:
+    /// every mode (linear too), element size and level (mip tails too), a base swizzle, slices.
+    #[test]
+    fn blocks_of_a_level_detile_as_the_level_does() {
+        let mut seed = 0x9E37_79B9u32;
+        let mut random = |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed as usize % n
+        };
+        for mode in MODES.into_iter().chain([0]) {
+            for e in 0..5u32 {
+                for (k, cfg) in configs().into_iter().enumerate() {
+                    let mut lay = Layout::new(mode, e, cfg).unwrap();
+                    if mode != 0 && k % 2 == 1 {
+                        lay.base_xor = (lay.block_bytes / 2) & !((1 << e) - 1);
+                    }
+                    let es = 1usize << e;
+                    let (w, h) = [(77, 45), (300, 130), (64, 64)][random(3)];
+                    let c = Chain::new(lay, w, h, 1, 9);
+                    for slice in [0usize, 3] {
+                        let mem: Vec<u8> = (0..c.slice_bytes).map(|i| ((i + slice * 7) * 131 % 251) as u8).collect();
+                        for (i, l) in c.levels.iter().enumerate() {
+                            let want = c.detile_level(&mem, i, slice);
+                            // the level cut into rectangles at block borders, each with its own pitch
+                            let mut got = vec![0xEEu8; l.width * l.height * es];
+                            let (bw, bh) = if l.tail.is_some() { (l.width, l.height) } else { (c.layout.block_w, c.layout.block_h) };
+                            let mut y0 = 0;
+                            while y0 < l.height {
+                                let y1 = (y0 + bh * (1 + random(3))).min(l.height);
+                                let mut x0 = 0;
+                                while x0 < l.width {
+                                    let r = Rect { x0, y0, x1: (x0 + bw * (1 + random(3))).min(l.width), y1 };
+                                    let pitch = (r.x1 - r.x0) * es + random(3) * 64;
+                                    let mut out = vec![0xEEu8; pitch * (r.y1 - r.y0) + 64];
+                                    let (rows, columns) = c.blocks_of(i, r);
+                                    for by in rows {
+                                        let (from, n) = (c.block_at(i, columns.start, by), columns.len() * c.layout.block_bytes);
+                                        unsafe { c.detile_blocks(&mem[from..from + n], i, slice, by, columns.clone(), r, out.as_mut_ptr(), pitch) };
+                                    }
+                                    for y in r.y0..r.y1 {
+                                        let row = (r.x1 - r.x0) * es;
+                                        got[(y * l.width + r.x0) * es..][..row].copy_from_slice(&out[(y - r.y0) * pitch..][..row]);
+                                        assert!(out[(y - r.y0) * pitch + row..(y - r.y0 + 1) * pitch].iter().all(|&b| b == 0xEE), "mode {mode} e{e} level {i}: bytes past a row written");
+                                    }
+                                    x0 = r.x1;
+                                }
+                                y0 = y1;
+                            }
+                            assert!(got == want, "mode {mode} e{e} {cfg:?} {w}x{h} level {i} slice {slice}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// `parts` of some bytes: the rectangles hold every element those bytes are part of, and none
+    /// that lies in no block of theirs (unless the level goes as a whole).
+    #[test]
+    fn parts_of_some_bytes_are_the_blocks_they_are_in() {
+        let cfg = PipeConfig { pipes_log2: 5, pkrs_log2: 3 };
+        let mut seed = 0x1234_5679u32;
+        let mut random = |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed as usize % n
+        };
+        for mode in [0u32, 1, 5, 9, 21, 25, 27] {
+            for e in [0u32, 2, 3, 4] {
+                for (w, h, mips) in [(700u32, 300u32, 1u32), (1030, 260, 11), (64, 64, 7), (33, 900, 4)] {
+                    let c = Chain::new(Layout::new(mode, e, cfg).unwrap(), w, h, 1, mips);
+                    for round in 0..6 {
+                        // a few sorted ranges of whole 4 KiB pages (the last one may be a part)
+                        let mut ranges: Vec<(usize, usize)> = Vec::new();
+                        let mut at = random(c.slice_bytes.div_ceil(0x1000)) * 0x1000;
+                        for _ in 0..1 + round {
+                            let to = (at + 0x1000 * (1 + random(5))).min(c.slice_bytes);
+                            if at >= to {
+                                break;
+                            }
+                            ranges.push((at, to));
+                            at = to + 0x1000 * (1 + random(60));
+                        }
+                        if ranges.is_empty() {
+                            continue;
+                        }
+                        let parts = c.parts(&ranges);
+                        let in_ranges = |a: usize, b: usize| ranges.iter().any(|r| a < r.1 && r.0 < b);
+                        for (i, l) in c.levels.iter().enumerate() {
+                            let mine: Vec<Rect> = parts.iter().filter(|p| p.0 == i).map(|p| p.1).collect();
+                            assert!(mine.iter().all(|r| r.x0 < r.x1 && r.y0 < r.y1 && r.x1 <= l.width && r.y1 <= l.height), "{mine:?} of {l:?}");
+                            let whole = mine.len() == 1 && mine[0] == (Rect { x0: 0, y0: 0, x1: l.width, y1: l.height });
+                            for y in 0..l.height {
+                                for x in 0..l.width {
+                                    let n = mine.iter().filter(|r| (r.x0..r.x1).contains(&x) && (r.y0..r.y1).contains(&y)).count();
+                                    let o = c.element_at(l, x, y, 0);
+                                    if in_ranges(o, o + (1 << e)) {
+                                        assert_eq!(n, 1, "mode {mode} e{e} {w}x{h} level {i}: element ({x}, {y}) is in {n} parts of {mine:?}, {ranges:x?}");
+                                    } else if n > 0 && !whole {
+                                        let block = l.offset + (o - l.offset) / c.layout.block_bytes * c.layout.block_bytes;
+                                        // (linear: a row of 256-byte pieces goes as a whole)
+                                        let row = if mode == 0 { l.pitch << e } else { c.layout.block_bytes };
+                                        let block = if mode == 0 { l.offset + (o - l.offset) / row * row } else { block };
+                                        assert!(in_ranges(block, block + row), "mode {mode} e{e} {w}x{h} level {i}: element ({x}, {y}) of no written block");
+                                    }
+                                    assert!(n <= 1);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // all of a slice's bytes: every level as a whole
+        let c = Chain::new(Layout::new(27, 2, cfg).unwrap(), 1030, 260, 1, 11);
+        let parts = c.parts(&[(0, c.slice_bytes)]);
+        assert_eq!(parts.len(), 11);
+        assert!(parts.iter().all(|&(i, r)| r == Rect { x0: 0, y0: 0, x1: c.levels[i].width, y1: c.levels[i].height }));
+        assert!(c.parts(&[]).is_empty());
     }
 
     /// every mode, element size and pipe configuration: the in-block mapping is a permutation

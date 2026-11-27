@@ -84,8 +84,18 @@ fn direct_or(code: &[u8], opt: &Options, hlsl: Vec<u8>) -> Vec<u8> {
     let o = KernelOptions { wave64: opt.wave64, split, mem_windows, sampler_base: opt.static_sampler_base };
     match &opt.mode {
         Mode::Kernel => translate(code, o).unwrap_or_else(|e| panic!("direct DXIL: {e}")),
-        Mode::Compute(cs) => translate_compute(code, o, cs).unwrap_or_else(|e| panic!("direct DXIL: {e}")).dxil,
-        Mode::Mesh(ms) => crate::gpu::dxil::kernel::translate_mesh(code, o, ms).unwrap_or_else(|e| panic!("direct DXIL: {e}")).dxil,
+        // (a group barrier in a group of several hardware waves is left to the HLSL path, as
+        // the runtime's fallback does: `dxil::lower`'s s_barrier)
+        Mode::Compute(cs) => match translate_compute(code, o, cs) {
+            Ok(k) => k.dxil,
+            Err(e) if e.contains("s_barrier in a group of several hardware waves") => hlsl,
+            Err(e) => panic!("direct DXIL: {e}"),
+        },
+        Mode::Mesh(ms) => match crate::gpu::dxil::kernel::translate_mesh(code, o, ms) {
+            Ok(k) => k.dxil,
+            Err(e) if e.contains("s_barrier in a group of several hardware waves") => hlsl,
+            Err(e) => panic!("direct DXIL: {e}"),
+        },
         Mode::Vertex(vs) => crate::gpu::dxil::kernel::translate_vertex(code, o, vs).unwrap_or_else(|e| panic!("direct DXIL: {e}")).dxil,
         Mode::Pixel(ps) => crate::gpu::dxil::kernel::translate_pixel(code, o, ps).unwrap_or_else(|e| panic!("direct DXIL: {e}")).dxil,
         _ => hlsl,
@@ -3110,6 +3120,73 @@ fn static_sampler_word_from_s_brev_is_a_constant() {
     assert!(!t.hlsl.contains("SamplerDescriptorHeap"), "no sampler heap lookup left");
 }
 
+/// An S# the compiler builds with `s_movk_i32`, `s_bfm_b32 s25, 12, 12` (a run of set bits:
+/// 0x00fff000) and a 64-bit move of a 32-bit literal for words 2 and 3 is a static sampler.
+/// Before, s_bfm and the literal move were not constants and the taps of a history
+/// reprojection sampled through sampler-heap entry 0 (point, wrap, mip 0).
+#[test]
+fn static_sampler_words_from_s_bfm_and_a_64_bit_literal_move_are_constants() {
+    let clamp = 2 | 2 << 3 | 2 << 6;
+    let linear = [clamp, 0x00FF_F000u32, 0x1850_0000u32, 0];
+    let code = prog(&[
+        ("S_MOVK_I32", "ENC_SOPK", &[("SDST", 24), ("SIMM16", clamp as u64)], None),
+        ("S_BFM_B32", "ENC_SOP2", &[("SDST", 25), ("SSRC0", 128 + 12), ("SSRC1", 128 + 12)], None),
+        ("S_MOV_B64", "ENC_SOP1", &[("SDST", 26), ("SSRC0", 255)], Some(linear[2])),
+        ("IMAGE_SAMPLE_LZ", "ENC_MIMG", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0xF), ("DIM", 1)], None),
+    ]);
+    let t = translate(&code, &Options::default()).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    assert_eq!(t.static_samplers, vec![(linear, false)], "the S# built with s_bfm and a 64-bit literal move is a static sampler");
+    assert!(!t.hlsl.contains("SamplerDescriptorHeap"), "no sampler heap lookup left");
+}
+
+/// An S# set before a branch and sampled after it (the compiler sets the S# of a blur's taps
+/// before the loop, of an effect before its `if`) is a static sampler all the same: the
+/// constants are followed into the next block. Before, a block's start forgot them and the
+/// shader sampled through sampler-heap entry 0 (point, wrap, mip 0).
+#[test]
+fn static_sampler_set_before_a_branch_is_a_constant_after_it() {
+    let clamp = 2 | 2 << 3 | 2 << 6;
+    let linear = [clamp, 0x00FF_F000u32, 0x0050_0000u32, 0];
+    let code = prog(&[
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 24), ("SSRC0", 255)], Some(linear[0])),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 25), ("SSRC0", 255)], Some(linear[1])),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 26), ("SSRC0", 255)], Some(linear[2])),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 27), ("SSRC0", 128)], None),
+        // (both ways go to the next instruction: it starts a block)
+        ("S_CBRANCH_EXECZ", "ENC_SOPP", &[("SIMM16", 0)], None),
+        ("IMAGE_SAMPLE_LZ", "ENC_MIMG", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0xF), ("DIM", 1)], None),
+    ]);
+    let pixel = Options { mode: Mode::Pixel(crate::gpu::recomp::PsInterface::default()), ..Default::default() };
+    let t = translate(&code, &pixel).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    assert_eq!(t.static_samplers, vec![(linear, false)], "the S# set before the branch is a static sampler");
+    assert!(!t.hlsl.contains("SamplerDescriptorHeap"), "no sampler heap lookup left");
+    // a program that does not draw is read block by block, as before
+    let t = translate(&code, &Options::default()).unwrap();
+    assert!(t.static_samplers.is_empty(), "{:?}", t.static_samplers);
+}
+
+/// Two ways into a block that leave different words in an S# register: not a constant there,
+/// the sampler is looked up as before.
+#[test]
+fn an_s_word_that_differs_by_the_way_in_is_no_constant() {
+    let clamp = 2 | 2 << 3 | 2 << 6;
+    let code = prog(&[
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 24), ("SSRC0", 255)], Some(clamp)),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 25), ("SSRC0", 255)], Some(0x00FF_F000)),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 26), ("SSRC0", 255)], Some(0x0050_0000)),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 27), ("SSRC0", 128)], None),
+        // over the next move (two dwords): one way keeps the first s26, the other sets another
+        ("S_CBRANCH_EXECZ", "ENC_SOPP", &[("SIMM16", 2)], None),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 26), ("SSRC0", 255)], Some(0)),
+        ("IMAGE_SAMPLE_LZ", "ENC_MIMG", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0xF), ("DIM", 1)], None),
+    ]);
+    let pixel = Options { mode: Mode::Pixel(crate::gpu::recomp::PsInterface::default()), ..Default::default() };
+    let t = translate(&code, &pixel).unwrap();
+    assert!(t.static_samplers.is_empty(), "{:?}", t.static_samplers);
+}
+
 /// The same program on the GPU: the texel a point sampler picks at a texel boundary.
 #[test]
 fn gpu_static_sampler_word_from_s_brev() {
@@ -3639,6 +3716,89 @@ fn gpu_mesh_mode_two_passes() {
     let ps16 = dxc::compile(&format!("struct V {{ float4 pos : SV_Position;{fields} }};\nfloat4 main(V v) : SV_Target0 {{ return v.t0 + v.t15; }}\n"), "main", "ps_6_6", &[]).unwrap();
     let (px16, _) = runner::mesh_draw_split(&cs, &msb16, &ps16, 2, split, ms.record_dwords(), &sg, &mem, 32, [-1.0; 4]).unwrap();
     assert!(px16 == px, "split pass-through draws the same pixels");
+}
+
+/// A mesh program's thread past its record's vertices or primitives exports nothing. A record
+/// has `max_vertices` vertex slots and `max_primitives` primitive slots, a group can have more
+/// threads, and the console's hardware drops what goes past the room the program asked for.
+/// In compute a store past the record lands in the next record, and past the last record of
+/// the buffer it is a store to an unmapped address (the record buffer is a root UAV: nothing
+/// bounds it). Here every one of 128 threads exports a position and a primitive with room for
+/// 64 and 32: the record's own slots are written and nothing lands behind it (the buffer has
+/// room for a second record, so the test faults no device without the bound either).
+#[test]
+fn gpu_mesh_mode_exports_stay_inside_the_record() {
+    use super::{dxc, mesh_passthrough, MsInterface, MESH_HEADER};
+    const MARK: u32 = 1 << 10 | 2 << 20;
+    let sig = |name: &str, sv: u32, reg: u32| crate::gpu::dxbc::SigElement {
+        name: name.into(),
+        index: 0,
+        system_value: sv,
+        component_type: 3,
+        register: reg,
+        mask: 0xF,
+        rw_mask: 0xF,
+        stream: 0,
+    };
+    let ms = MsInterface { outputs: vec![sig("SV_Position", 1, 0)], threads: 128, max_vertices: 64, max_primitives: 32 };
+    let exp = |tgt: u64, en: u64, v: [u64; 4], done: u64| -> (&'static str, &'static str, Vec<(&'static str, u64)>, Option<u32>) {
+        ("EXP", "ENC_EXP", vec![("TGT", tgt), ("EN", en), ("VSRC0", v[0]), ("VSRC1", v[1]), ("VSRC2", v[2]), ("VSRC3", v[3]), ("DONE", done)], None)
+    };
+    let mut list: Vec<(&str, &str, Vec<(&str, u64)>, Option<u32>)> = vec![
+        ("S_MOV_B32", "ENC_SOP1", vec![("SDST", 124), ("SSRC0", 255)], Some(1 << 12 | 3)), // 1 primitive, 3 vertices
+        ("S_SENDMSG", "ENC_SOPP", vec![("SIMM16", 9)], None),
+        ("S_BARRIER", "ENC_SOPP", vec![], None),
+        ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 10), ("SRC0", 242)], None), // 1.0
+        ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 21), ("SRC0", 255)], Some(MARK)),
+    ];
+    // (every thread of both waves exports: nothing masks EXEC)
+    list.push(exp(12, 0xF, [10, 10, 10, 10], 1));
+    list.push(exp(20, 1, [21, 0, 0, 0], 1));
+    let refs: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = list.iter().map(|(a, b, c, d)| (*a, *b, c.as_slice(), *d)).collect();
+    let code = prog(&refs);
+    // the HLSL form says it in text (no GPU needed)
+    let hlsl = translate(&code, &Options { mode: Mode::Mesh(ms.clone()), wave64: true, ..Default::default() }).unwrap();
+    assert!(hlsl.complete(), "{:?}", hlsl.unsupported_why);
+    assert!(hlsl.hlsl.contains("bool xcl_vok = xcl_slot < 64u;") && hlsl.hlsl.contains("bool xcl_pok = xcl_slot < 32u;"), "{}", hlsl.hlsl);
+    // (every store into a vertex or primitive slot has its bound; the header's has none to need)
+    let count = |what: &str| hlsl.hlsl.matches(what).count();
+    assert_eq!((count("res.Store((xcl_vtx"), count("res.Store(xcl_prm")), (4, 1), "{}", hlsl.hlsl);
+    assert_eq!((count("if (xcl_vok) res.Store((xcl_vtx"), count("if (xcl_pok) res.Store(xcl_prm")), (4, 1), "an export without its bound:\n{}", hlsl.hlsl);
+    // a title's layout on a 32-lane GPU: split wave64, 16 memory windows from the descriptor
+    // heap (the direct translator leaves this s_barrier of two console waves to the HLSL path)
+    let split = translate(&code, &Options { mode: Mode::Mesh(ms.clone()), wave64: true, split_wave64: true, mem_windows: super::HEAP_WINDOWS | 16, ..Default::default() }).unwrap();
+    assert!(split.complete(), "split, 16 heap windows: {:?}", split.unsupported_why);
+    if std::env::var("XCL_SAFE_BARRIER").map_or(true, |v| v.trim() != "0") {
+        assert!(split.hlsl.contains("xcl_s_barrier();"), "split, 16 heap windows: expected xcl_s_barrier()");
+    }
+    if dxc::location().is_ok() {
+        dxc::compile(&split.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("split, 16 heap windows: {e}\n{}", split.hlsl));
+    } else {
+        runner::skip_test("no DXC");
+    }
+    if !gpu_ready() || !mesh_ready() {
+        return;
+    }
+    let opt = on_gpu(Options { mode: Mode::Mesh(ms.clone()), wave64: true, ..Default::default() });
+    let t = translate(&code, &opt).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    let cs = direct_or(&code, &opt, dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap());
+    let pass = mesh_passthrough(&ms);
+    let msb = dxc::compile(&pass, "main", "ms_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{pass}"));
+    let ps = dxc::compile("struct V { float4 pos : SV_Position; };\nfloat4 main(V v) : SV_Target0 { return 1; }\n", "main", "ps_6_6", &[]).unwrap();
+    let (rd, vd) = (ms.record_dwords(), ms.vert_dwords());
+    // one group, and a buffer of two records: what a thread past the record's slots wrote
+    // would be in the second
+    let (_, rec) = runner::mesh_draw(&cs, &msb, &ps, 1, 2 * rd, &vec![0u32; 128], &vec![0u32; 256], 32, [-1.0; 4]).unwrap();
+    assert_eq!(rec.len(), 2 * rd);
+    assert_eq!((rec[0], rec[1]), (3, 1), "GS_ALLOC_REQ counts");
+    for v in [0usize, 31, 63] {
+        assert_eq!(f32::from_bits(rec[MESH_HEADER + v * vd]), 1.0, "vertex {v} of the record");
+    }
+    for p in [0usize, 31] {
+        assert_eq!(rec[MESH_HEADER + 64 * vd + p], MARK, "primitive {p} of the record");
+    }
+    assert_eq!(rec[rd..].iter().position(|&w| w != 0), None, "a thread past the record's slots wrote behind it");
 }
 
 #[test]
@@ -4350,7 +4510,10 @@ fn gpu_uma_import_check_at_init() {
     }
     assert_eq!(crate::hle::d3d12x::backend(), crate::hle::d3d12x::Backend::Real, "real D3D12.X backend");
     let s = crate::hle::d3d12x::real::stats().uma_import_check;
-    assert!(s.starts_with("ok") || s.starts_with("off"), "{s}");
+    // a committed window the GPU only has a copy of (no host-memory heaps): there is no import
+    // to check, and only that window may say so
+    let shadowed = crate::gpu::uma::get().is_some_and(|u| u.shadowed());
+    assert!(s.starts_with("ok") || s.starts_with("off") || (shadowed && s.starts_with("not run: the coherent window has a copy in video memory")), "{s}");
 }
 
 /// End-to-end GPU test of the sparse-window VRAM runtime layout:
@@ -4372,12 +4535,15 @@ fn gpu_sparse_vram_descriptors_buffers_and_xmem() {
     }
     assert_eq!(crate::hle::d3d12x::backend(), crate::hle::d3d12x::Backend::Real, "real D3D12.X backend");
     let u = crate::gpu::uma::get().expect("UMA");
-    assert_eq!(u.shader_windows(), 4, "runtime layout has 4 shader windows");
+    // 4 windows, or 16 with `XCL_UMA_WINDOWS=16` (windows 0..3 as with 4; then view windows and
+    // windows without memory)
+    assert_eq!(u.shader_windows(), crate::gpu::uma::configured_runtime_windows(), "runtime layout has the configured shader windows");
     assert!(u.is_sparse_window(0) && u.is_sparse_window(1) && u.is_sparse_window(2), "windows 0..2 sparse VRAM");
     assert!(u.is_committed_window(3), "window 3 coherent committed RAM");
     let windows = crate::hle::d3d12x::real::uma_window_vas();
-    assert_eq!(windows.len(), 4);
-    assert!(windows.iter().all(|&va| va != 0), "all 4 window GPU VAs must be valid: {windows:x?}");
+    assert_eq!(windows.len(), u.shader_windows());
+    assert!(windows.iter().enumerate().all(|(k, &va)| (va != 0) == (u.window(k).1 > 0)), "every window with memory has a GPU VA, the others none: {windows:x?}");
+    assert!(windows[..4].iter().all(|&va| va != 0), "the 4 root-UAV windows' GPU VAs must be valid: {windows:x?}");
 
     // 1. Console descriptor heap in Window 0 sparse VRAM (32-bit hi = 0 table addressing)
     let heap_obj = 0xDEAD_5EA7usize;
@@ -4469,7 +4635,8 @@ fn gpu_sparse_vram_descriptors_buffers_and_xmem() {
             list.SetComputeRootSignature(&rs);
             list.SetComputeRootUnorderedAccessView(0, crate::hle::d3d12x::real::uma_va_of(io_buf).unwrap());
             list.SetComputeRootUnorderedAccessView(1, crate::hle::d3d12x::real::uma_va_of(res_buf).unwrap());
-            for (k, &va) in windows.iter().enumerate() {
+            // (the root signature has 4 window UAVs, u2..u5, whatever the layout)
+            for (k, &va) in windows.iter().take(crate::gpu::uma::MAX_WINDOWS).enumerate() {
                 list.SetComputeRootUnorderedAccessView(2 + k as u32, va);
             }
             list.Dispatch(1, 1, 1);
@@ -4484,8 +4651,19 @@ fn gpu_sparse_vram_descriptors_buffers_and_xmem() {
             }
         };
 
+        // a window the GPU has a copy of: what the shader stored comes back on request
+        let gpu_wrote = || {
+            if u.shadowed() {
+                crate::hle::d3d12x::sparse::readback_now(out_buf, 256);
+            }
+        };
+
         // Submit 1: reads slot 0 -> in_a (sparse VRAM) + arg_table constant 77 (Window 3)
         record_and_run(1, true);
+        gpu_wrote();
+        // the copy back of what the shader stored lands asynchronously: before a CPU read the
+        // title's lists are done for, XCL settles it (as in Map and the CPU memory waits)
+        crate::hle::d3d12x::sparse::settle_readbacks();
         for l in 0..64usize {
             let got = *((out_buf + 4 * l) as *const u32);
             assert_eq!(got, 1000 + l as u32 + 77, "submit 1 lane {l} mismatch");
@@ -4496,10 +4674,20 @@ fn gpu_sparse_vram_descriptors_buffers_and_xmem() {
         *((in_b + 4 * 3) as *mut u32) = 9999;
         crate::hle::d3d12x::console_heap::write(&slot0, &vsharp(in_b));
         record_and_run(2, false);
+        gpu_wrote();
+        crate::hle::d3d12x::sparse::settle_readbacks();
         for l in 0..64usize {
             let expected = if l == 3 { 9999 + 13 } else { 5000 + 2 * l as u32 + 13 };
             let got = *((out_buf + 4 * l) as *const u32);
             assert_eq!(got, expected, "submit 2 (mutated sparse descriptor + XMem buffer) lane {l} mismatch");
+        }
+
+        // Submits 3..: a constant the CPU rewrites before every submit reaches the shader each time
+        for n in 0..40u32 {
+            *(arg_table as *mut u32) = 100 + n;
+            record_and_run(3 + n as u64, false);
+            gpu_wrote();
+            assert_eq!(*(out_buf as *const u32), 5000 + 100 + n, "submit {} (constant rewritten in window 3)", 3 + n);
         }
 
         // Clean up
@@ -4507,6 +4695,88 @@ fn gpu_sparse_vram_descriptors_buffers_and_xmem() {
         crate::hle::kernelx::XMemFreeDefault(in_a as *mut _, gfx_attrs);
         crate::hle::kernelx::XMemFreeDefault(in_b as *mut _, gfx_attrs);
         assert!(u.free(arg_table) && u.free(out_buf) && u.free(io_buf) && u.free(res_buf));
+    }
+}
+
+/// Constant data after the program (`Options::rodata`): `s_getpc_b64` plus the compiler's
+/// offset is its address, and `s_load` / `global_load` read it from the shader. The memory
+/// does not hold the code (a retail tone-map LUT bake read zeros for its spline coefficients
+/// there and wrote one colour to every texel); any other address still reads the memory.
+#[test]
+fn gpu_loads_read_the_constant_data_after_the_program() {
+    let body = |table: u32| {
+        prog(&[
+            ("S_GETPC_B64", "ENC_SOP1", &[("SDST", 0)], None), // s[0:1] = 4
+            ("S_ADD_U32", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 0), ("SSRC1", 255)], Some(table.wrapping_sub(4))),
+            ("S_ADDC_U32", "ENC_SOP2", &[("SDST", 1), ("SSRC0", 1), ("SSRC1", 128)], None),
+            ("GLOBAL_LOAD_DWORDX3", "ENC_FLAT_GLBL", &[("VDST", 5), ("ADDR", 10), ("SADDR", 0), ("OFFSET", 0)], None),
+            ("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 20), ("SBASE", 0), ("OFFSET", 4), ("SOFFSET", 125)], None),
+            ("S_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 24), ("SBASE", 0), ("OFFSET", 8), ("SOFFSET", 125)], None),
+            // memory, not the data: v[12:13] and s[2:3]
+            ("GLOBAL_LOAD_DWORD", "ENC_FLAT_GLBL", &[("VDST", 8), ("ADDR", 12), ("SADDR", 0x7D), ("OFFSET", 0)], None),
+            ("S_LOAD_DWORDX2", "ENC_SMEM", &[("SDATA", 28), ("SBASE", 1), ("OFFSET", 0), ("SOFFSET", 125)], None),
+        ])
+    };
+    // as in retail data: program, guard s_endpgm, block (u32 N, N dwords, s_endpgm)
+    let block = body(0).len() as u32 + 4;
+    let code = body(block + 4);
+    let table: Vec<u32> = (0..8).map(|i| 0x7AB1_E000 + i).collect();
+    let mut data = vec![table.len() as u32];
+    data.extend(&table);
+    data.push(0xBF81_0000);
+    let rodata = vec![(block, data)];
+    assert!(!translate(&code, &Options::default()).unwrap().hlsl.contains("xcl_gload"), "no data, no loader");
+    if !gpu_ready() {
+        return;
+    }
+    let check = |r: &runner::KernelResult, what: &str| {
+        assert_eq!(r.sgpr[20], table[1], "{what}: s_load_dword of the table");
+        assert_eq!(r.sgpr[24..28], table[2..6], "{what}: s_load_dwordx4 of the table");
+        assert_eq!(r.sgpr[28..30], [4242, 4343], "{what}: s_load from memory");
+        for l in 0..64usize {
+            let k = l % 6;
+            assert_eq!(r.vgpr[l][5..8], table[k..k + 3], "{what}, lane {l}: three dwords of the table from {k}");
+            assert_eq!(r.vgpr[l][8], 7000 + l as u32, "{what}, lane {l}: memory outside the data");
+        }
+    };
+    // one window: nothing of the code is in the memory
+    let mut st = KernelState::default();
+    st.sgpr[2] = 0x900;
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        r[10] = 4 * (l as u32 % 6);
+        r[12] = 0x800 + 4 * l as u32;
+    }
+    let mut mem = vec![0u32; 1024];
+    mem[0x240..0x242].copy_from_slice(&[4242, 4343]);
+    for l in 0..64 {
+        mem[0x200 + l] = 7000 + l as u32;
+    }
+    let t = translate(&code, &Options { rodata: rodata.clone(), ..runner::options(Mode::Kernel) }).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported);
+    let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).map_err(|e| format!("{e}\n{}", t.hlsl)).unwrap();
+    check(&runner::run(&dxil, &st, &mem).unwrap(), "one window");
+    // several windows: a code address is in none of them, and window 0 holds other bytes at
+    // the table's offset
+    let arena = crate::gpu::uma::Uma::with_windows(2, 1 << 20).unwrap();
+    let (w0, w1) = (arena.window(0).0 as u64, arena.window(1).0 as u64);
+    let word = |a: u64| unsafe { &mut *(a as *mut u32) };
+    for k in 0..16u64 {
+        *word(w0 + block as u64 + 4 * k) = 0xBAD0_0000 + k as u32;
+    }
+    *word(w1 + 0x900) = 4242;
+    *word(w1 + 0x904) = 4343;
+    st.sgpr[2..4].copy_from_slice(&[(w1 + 0x900) as u32, (w1 >> 32) as u32]);
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        *word(w1 + 0x800 + 4 * l as u64) = 7000 + l as u32;
+        r[12] = (w1 + 0x800 + 4 * l as u64) as u32;
+        r[13] = (w1 >> 32) as u32;
+    }
+    for heap in [false, true] {
+        let t = translate(&code, &on_gpu(Options { mem_windows: 2, heap_windows: heap, rodata: rodata.clone(), ..Default::default() })).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported);
+        assert!(t.hlsl.contains(&format!("if (xcl_w == 0xC0DEu - xcl_uma_base && a - {block}u < 40u)")), "the data is at code addresses only:\n{}", t.hlsl);
+        let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).map_err(|e| format!("{e}\n{}", t.hlsl)).unwrap();
+        check(&runner::run_in_arena(&dxil, &st, &arena).unwrap(), if heap { "heap windows" } else { "two windows" });
     }
 }
 
@@ -4859,10 +5129,20 @@ fn gpu_geometry_wave32_prefix_count_over_a_mask() {
     } else {
         runner::skip_test("no wave64");
     }
-    // the direct DXIL translator's compute pass computes the same, split and native
+    // the direct DXIL translator's compute pass computes the same, split and native (the split
+    // form with an ES phase is left to the HLSL path while the safe barrier is wanted, as
+    // `pso::console_geometry` falls back)
     let direct = |split: bool| {
         let o = crate::gpu::dxil::kernel::KernelOptions { wave64: true, split, mem_windows: 1, sampler_base: 0 };
-        let cs = crate::gpu::dxil::kernel::translate_geometry(&code, o, &g).unwrap_or_else(|e| panic!("{}", &e[..e.len().min(2000)])).dxil;
+        let cs = match crate::gpu::dxil::kernel::translate_geometry(&code, o, &g) {
+            Ok(k) => k.dxil,
+            Err(e) if e.contains("split wave64 geometry: the ES phase exchanges at group barriers") => {
+                let t = translate_geometry(&code, g.clone(), split, 1).unwrap();
+                assert!(t.complete(), "{:?}", t.unsupported_why);
+                dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}"))
+            }
+            Err(e) => panic!("{}", &e[..e.len().min(2000)]),
+        };
         let mem = runner::dispatch(&cs, [1, 1, 1], &io, &vec![0u32; 0x400 / 4 + 3 * 64]).unwrap();
         let got: Vec<[u32; 3]> = (0..64).map(|l| [0, 1, 2].map(|k| mem[0x100 + 64 * k + l])).collect();
         let wrong: Vec<_> = (0..64).filter(|&l| got[l] != want[l]).map(|l| (l, got[l], want[l])).collect();
@@ -5503,6 +5783,39 @@ fn gpu_bvh64_intersect_ray_across_memory_windows_and_grazing() {
         assert_eq!(q(108), [tri_rel, F, F, F], "lane {l}: 48-bit base box32 in window 1");
         let tri = q(104).map(f32::from_bits);
         assert!(!tri[0].is_infinite() && ((tri[0] / tri[1]) - 5.0).abs() < 1e-4, "lane {l}: 64-bit triangle in window 1 → {tri:?}");
+    }
+}
+
+#[test]
+fn gpu_bvh_node_in_an_unmapped_window_returns_a_miss() {
+    if !gpu_ready() {
+        return;
+    }
+    let arena = crate::gpu::uma::Uma::with_windows(2, 1 << 20).unwrap();
+    let missing_address = arena.window(1).0 as u64 + (1 << 32) + 0x1000;
+    let mut code = encode("IMAGE_BVH64_INTERSECT_RAY", "ENC_MIMG", &[
+        ("VDATA", 100), ("VADDR", 0), ("SRSRC", 2), ("DMASK", 15),
+    ], None).unwrap();
+    code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+    let opt = on_gpu(Options { mem_windows: 2, ..Default::default() });
+    let hlsl = translate(&code, &opt).unwrap();
+    let dxil = direct_or(&code, &opt, super::dxc::compile(&hlsl.hlsl, "main", "cs_6_6", &[]).unwrap());
+    let mut st = KernelState::default();
+    st.sgpr[8..12].copy_from_slice(&crate::gpu::desc::bvh_words(0, true));
+    for (lane, regs) in st.vgpr.iter_mut().enumerate() {
+        let kind = if lane % 2 == 0 { 5 } else { 0 };
+        let node = (missing_address >> 3) | kind;
+        regs[0] = node as u32;
+        regs[1] = (node >> 32) as u32;
+        let ray = [10.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, f32::INFINITY, f32::INFINITY];
+        for (i, v) in ray.into_iter().enumerate() {
+            regs[2 + i] = v.to_bits();
+        }
+    }
+    let res = runner::run_in_arena(&dxil, &st, &arena).unwrap();
+    for (lane, regs) in res.vgpr.iter().enumerate() {
+        let expected = if lane % 2 == 0 { [u32::MAX; 4] } else { [0x7f80_0000, 0x3f80_0000, 0, 0] };
+        assert_eq!(&regs[100..104], &expected, "lane {lane}");
     }
 }
 
@@ -6904,6 +7217,119 @@ fn mesh_split_wave64_form() {
     assert!(super::translate_mesh(&lane, ms, true, true, 1).unwrap().hlsl.contains("xcl_x_rla_uniform("));
 }
 
+/// How the split halves meet (`x64_spin_for`): a group barrier in a group of one console wave,
+/// bounded arrival counters in a group of several; `XCL_WAVE64_SPIN=1` forces the counters,
+/// `=0` keeps the barrier where there is one console wave.
+#[test]
+fn split_wave64_meet_form_by_group_size() {
+    use super::emit::x64_spin_for;
+    use super::CsInterface;
+    for threads in [16u32, 32, 40, 64] {
+        assert!(!x64_spin_for(threads, None), "{threads}: barrier by default");
+        assert!(!x64_spin_for(threads, Some("0")), "{threads}: XCL_WAVE64_SPIN=0");
+        assert!(!x64_spin_for(threads, Some("")), "{threads}: XCL_WAVE64_SPIN empty");
+        assert!(x64_spin_for(threads, Some("1")), "{threads}: XCL_WAVE64_SPIN=1");
+        assert!(x64_spin_for(threads, Some(" 1 ")), "{threads}: XCL_WAVE64_SPIN=' 1 '");
+    }
+    for threads in [65u32, 96, 128, 256, 1024] {
+        for env in [None, Some("0"), Some("1")] {
+            assert!(x64_spin_for(threads, env), "{threads}, {env:?}: several console waves always spin");
+        }
+    }
+    // the emitted form: several console waves spin whatever the environment; for one, the
+    // default (barrier) is checked only when `XCL_WAVE64_SPIN` is unset
+    let env_set = std::env::var_os("XCL_WAVE64_SPIN").is_some();
+    let lane = prog(&[("V_READFIRSTLANE_B32", "ENC_VOP1", &[("VDST", 0), ("SRC0", V)], None)]);
+    for (dims, want) in [([64u32, 1, 1], 0), ([8, 8, 1], 0), ([4, 4, 4], 0), ([40, 1, 1], 0), ([32, 1, 1], 0), ([16, 1, 1], 0), ([256, 1, 1], 1), ([8, 8, 4], 1)] {
+        let threads = dims.iter().product::<u32>();
+        let cs = CsInterface { threads: dims, user_sgprs: 2, tgid: [false; 3], tg_size: false, tid_components: 1 };
+        let t = translate(&lane, &Options { mode: Mode::Compute(cs), wave64: true, split_wave64: true, ..Default::default() }).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        assert!(t.hlsl.contains(&format!("#define XCL_X_THREADS {threads}u")), "{dims:?}");
+        if want == 1 || !env_set {
+            assert!(t.hlsl.contains(&format!("#define XCL_X_SPIN {want}\n")), "{dims:?}");
+        }
+        assert!(t.hlsl.contains("xcl_x_rla_uniform("), "{dims:?}");
+    }
+    // a half without a partner (32 threads or fewer: `xcl_xn == 0`) leaves before either form
+    let t = translate(&lane, &Options { mode: Mode::Compute(CsInterface { threads: [32, 1, 1], user_sgprs: 2, tgid: [false; 3], tg_size: false, tid_components: 1 }), wave64: true, split_wave64: true, ..Default::default() }).unwrap();
+    let meet = &t.hlsl[t.hlsl.find("bool xcl_x_meet()").unwrap()..];
+    let (leave, spin, barrier) = (meet.find("if (xcl_xn == 0u) return false;").unwrap(), meet.find("#if XCL_X_SPIN").unwrap(), meet.find("GroupMemoryBarrierWithGroupSync();").unwrap());
+    assert!(leave < spin && spin < barrier);
+}
+
+/// The split form keeps the console wave's order of LDS accesses across its halves
+/// (`xcl_x_lw`): an LDS read meets the other half first when LDS may have been written since the
+/// halves last met, a write when it may have been read (on the console every lane reads before
+/// any lane of a later instruction writes), an atomic in either case; every meet and `s_barrier`
+/// clears the bits. A program that writes no LDS gets no such meet, nor does the native form.
+#[test]
+fn split_wave64_lds_reads_meet_after_writes() {
+    type Inst = (&'static str, &'static str, &'static [(&'static str, u64)], Option<u32>);
+    let write: Inst = ("DS_WRITE_B32", "ENC_DS", &[("ADDR", 1), ("DATA0", 0)], None);
+    let read: Inst = ("DS_READ_B32", "ENC_DS", &[("VDST", 2), ("ADDR", 1)], None);
+    let add: Inst = ("DS_ADD_U32", "ENC_DS", &[("ADDR", 1), ("DATA0", 0)], None);
+    let barrier: Inst = ("S_BARRIER", "ENC_SOPP", &[], None);
+    let lane: Inst = ("V_READFIRSTLANE_B32", "ENC_VOP1", &[("VDST", 0), ("SRC0", V)], None);
+    // a read waits for writes (bit 1), a write for reads (bit 2), an atomic for both
+    const AFTER_WRITE: &str = "if ((xcl_x_lw & 1u) != 0u) xcl_x_meet();";
+    const AFTER_READ: &str = "if ((xcl_x_lw & 2u) != 0u) xcl_x_meet();";
+    const AFTER_ANY: &str = "if ((xcl_x_lw & 3u) != 0u) xcl_x_meet();";
+    const WROTE: &str = "xcl_x_lw |= 1u;";
+    const READ: &str = "xcl_x_lw |= 2u;";
+    const BOTH: &str = "xcl_x_lw |= 3u;";
+    const CLEAR: &str = "xcl_x_lw = 0u;";
+    let split = Options { mode: Mode::Kernel, wave64: true, split_wave64: true, ..Default::default() };
+    let hlsl = |list: &[Inst], o: &Options| {
+        let t = translate(&prog(list), o).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        if super::dxc::location().is_ok() {
+            super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+        }
+        t.hlsl
+    };
+    let main = |h: &str| h[h.find("void main(").unwrap()..].to_string();
+    // every meet clears the bits, also one without a partner half
+    let h = hlsl(&[write, read], &split);
+    let meet = &h[h.find("bool xcl_x_meet()").unwrap()..];
+    assert!(meet.find(CLEAR).unwrap() < meet.find("if (xcl_xn == 0u) return false;").unwrap(), "{meet}");
+    // the hazard: a write, then a read with nothing between: the read meets first
+    let m = main(&h);
+    let (wrote, wait, at) = (m.find(WROTE).unwrap(), m.find(AFTER_WRITE).unwrap(), m.rfind("= xcl_lds[").unwrap());
+    assert!(wrote < wait && wait < at, "the meet between the write and the read:\n{m}");
+    // the other way round: a read, then a write – the write meets first, so the other half has
+    // read before this one writes
+    let m = main(&hlsl(&[read, write], &split));
+    let (read_at, wait, write_at) = (m.find("= xcl_lds[").unwrap(), m.find(AFTER_READ).unwrap(), m.find("] = v0;").unwrap());
+    assert!(m.find(READ).unwrap() < wait && read_at < wait && wait < write_at, "the meet between the read and the write:\n{m}");
+    // an atomic waits for both and sets both
+    let m = main(&hlsl(&[read, write, add, read], &split));
+    assert_eq!([AFTER_WRITE, AFTER_READ, AFTER_ANY, WROTE, READ, BOTH].map(|x| m.matches(x).count()), [2, 1, 1, 1, 2, 1], "{m}");
+    // s_barrier: both halves made their accesses before it
+    let m = main(&hlsl(&[write, barrier, read], &split));
+    let (sync, clear, wait) = (m.find("GroupMemoryBarrierWithGroupSync();").unwrap(), m.find(CLEAR).unwrap(), m.find(AFTER_WRITE).unwrap());
+    assert!(sync < clear && clear < wait, "{m}");
+    // no LDS write: no bits at all, LDS or not; the native form has none either
+    for (what, list, o) in [
+        ("reads only", &[read, read][..], split.clone()),
+        ("no LDS", &[lane][..], split.clone()),
+        ("native wave64", &[write, read, add][..], Options { split_wave64: false, ..split.clone() }),
+    ] {
+        let m = main(&hlsl(list, &o));
+        assert!(!m.contains("xcl_x_lw"), "{what}:\n{m}");
+    }
+    // a compute group of several console waves (the counters' meet) and one of a single half
+    for threads in [128u32, 32] {
+        let cs = super::CsInterface { threads: [threads, 1, 1], user_sgprs: 2, tgid: [false; 3], tg_size: false, tid_components: 1 };
+        let h = hlsl(&[write, read], &Options { mode: Mode::Compute(cs), ..split.clone() });
+        assert!(h.contains(AFTER_WRITE) && h.contains(WROTE), "{threads} threads");
+    }
+    // `XCL_X_LDS_ORDER=0` turns it off (the earlier form)
+    use super::emit::lds_order_for;
+    assert!(lds_order_for(None) && lds_order_for(Some("1")) && lds_order_for(Some("")));
+    assert!(!lds_order_for(Some("0")) && !lds_order_for(Some(" 0 ")));
+}
+
 /// Operations whose result spans both 32-lane halves of a wave64 – what the split form
 /// exchanges: masks with bits in either half (counted, scanned, branched on), readlane /
 /// readfirstlane of a lane in the other half, ds_bpermute across the halves, a GLC scalar
@@ -7380,8 +7806,18 @@ fn gpu_split_wave64_waves_diverge() {
         let opt = on_gpu(Options { mode: Mode::Compute(cs), wave64: true, ..Default::default() });
         let t = translate(&p, &opt).unwrap();
         assert!(t.complete(), "{:?}", t.unsupported_why);
-        if runner::split_wave64() && std::env::var("XCL_WAVE64_SPIN").map_or(true, |v| v.trim() != "0") {
-            assert!(t.hlsl.contains("[WaveSize(32)]") && t.hlsl.contains("#define XCL_X_SPIN 1"), "{dims:?}");
+        if runner::split_wave64() {
+            assert!(t.hlsl.contains("[WaveSize(32)]"), "{dims:?}");
+            // several console waves per group: counters; one (64 threads): a group barrier
+            // unless `XCL_WAVE64_SPIN` says otherwise
+            let want = match dims {
+                [256, 1, 1] | [8, 8, 4] => Some(1),
+                _ if std::env::var_os("XCL_WAVE64_SPIN").is_some() => None,
+                _ => Some(0),
+            };
+            if let Some(want) = want {
+                assert!(t.hlsl.contains(&format!("#define XCL_X_SPIN {want}\n")), "{dims:?}");
+            }
         }
         let dxil = direct_or(&p, &opt, dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}")));
         let base = 0x100usize;
@@ -7398,6 +7834,174 @@ fn gpu_split_wave64_waves_diverge() {
                 let at = (base + (g * 256 + tid) * 8) / 4;
                 assert_eq!(out[at], want, "{dims:?}, group {g} thread {tid}: loop of wave {w}");
                 assert_eq!(out[at + 1], (w * 64 + (l ^ 33)) as u32, "{dims:?}, group {g} thread {tid}: ds_bpermute");
+            }
+        }
+    }
+}
+
+/// Groups of one console wave (64 threads or fewer), which meet at a group barrier when split
+/// (`x64_spin_for`): an exchange, then odd groups end early (`s_endpgm` on a scalar branch),
+/// even ones exchange once more and store. Neither half may be left waiting at the barrier
+/// (that would hang the dispatch), and partial groups (40, 48 threads) meet like full ones.
+#[test]
+fn gpu_split_wave64_one_wave_groups_end_early() {
+    if !gpu_ready() {
+        return;
+    }
+    use super::{dxc, CsInterface};
+    // s0 = output base, s2 = group id
+    let p = prog(&[
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 255), ("VSRC1", 0)], Some(1000)), // v1 = 1000 + thread
+        ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", 255), ("VSRC1", 0)], Some(40)), // vcc = threads 0..39
+        ("S_BCNT1_I32_B64", "ENC_SOP1", &[("SDST", 20), ("SSRC0", 106)], None),
+        ("S_AND_B32", "ENC_SOP2", &[("SDST", 21), ("SSRC0", 2), ("SSRC1", 129)], None), // scc = odd group
+        ("S_CBRANCH_SCC0", "ENC_SOPP", &[("SIMM16", 1)], None),
+        ("S_ENDPGM", "ENC_SOPP", &[], None),
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 21), ("SRC0", V + 1), ("SRC1", 165)], None), // lane 37 (upper half)
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", 20)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 4), ("SRC0", 21), ("VSRC1", 4)], None),
+        ("S_LSHL_B32", "ENC_SOP2", &[("SDST", 16), ("SSRC0", 2), ("SSRC1", 134)], None), // group · 64
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 7), ("SRC0", 16), ("VSRC1", 0)], None),
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 7), ("SRC0", 130), ("VSRC1", 7)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 7), ("SRC0", 0), ("VSRC1", 7)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 8), ("SRC0", 128)], None),
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 7), ("DATA", 4), ("SADDR", 0x7D)], None),
+    ]);
+    for threads in [64u32, 48, 40] {
+        let cs = CsInterface { threads: [threads, 1, 1], user_sgprs: 2, tgid: [true, false, false], tg_size: false, tid_components: 1 };
+        let opt = on_gpu(Options { mode: Mode::Compute(cs), wave64: true, ..Default::default() });
+        let t = translate(&p, &opt).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        if runner::split_wave64() && std::env::var_os("XCL_WAVE64_SPIN").is_none() {
+            // one console wave per group: a group barrier by default
+            assert!(t.hlsl.contains("#define XCL_X_SPIN 0\n"), "{threads}");
+        }
+        let dxil = direct_or(&p, &opt, dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}")));
+        let base = 0x100usize;
+        let groups = 64usize;
+        let mut io = vec![0u32; 128];
+        io[0] = base as u32;
+        let out = runner::dispatch(&dxil, [groups as u32, 1, 1], &io, &vec![0u32; (base + groups * 64 * 4) / 4]).unwrap();
+        for g in 0..groups {
+            for tid in 0..64usize {
+                let want = if g % 2 == 1 || tid >= threads as usize { 0 } else { 40 + 1037 };
+                assert_eq!(out[(base + (g * 64 + tid) * 4) / 4], want, "{threads} threads, group {g} thread {tid}");
+            }
+        }
+    }
+}
+
+/// LDS written by the upper half and read by lane 0 with nothing between that makes the halves
+/// meet: the console's wave runs both for all 64 lanes in order, so lane 0 sees the writes. The
+/// upper half writes only after a chain of dependent global loads its lanes alone make, so in
+/// the split form (32-lane GPUs) the lower half reaches the read first unless the read waits
+/// for it (`xcl_x_lw`). A plain store and an atomic or; then the other order: every lane reads
+/// (the upper half late) and lane 0 overwrites what they read, which the lower half must not do
+/// before the upper half has read. Groups of one console wave (the group barrier's meet) and
+/// of several (the counters').
+#[test]
+fn gpu_split_wave64_lds_write_then_read_across_halves() {
+    if !gpu_ready() {
+        return;
+    }
+    use super::{dxc, CsInterface};
+    const LOADS: usize = 16;
+    const MARKER: u32 = 0x600D;
+    // s0 = output base, s1 = the load chain's first address, s2 = MARKER - 1, s3 =
+    // log2(threads), s4 = MARKER, s5 = group id; v0 = thread index in the group
+    let mut list: Vec<(&str, &str, Vec<(&str, u64)>, Option<u32>)> = vec![
+        ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 5), ("SRC0", 128)], None),
+        ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 6), ("SRC0", 128)], None),
+        ("V_AND_B32", "ENC_VOP2", vec![("VDST", 2), ("SRC0", 128 + 31), ("VSRC1", 0)], None), // lane & 31
+        ("V_LSHRREV_B32", "ENC_VOP2", vec![("VDST", 1), ("SRC0", 134), ("VSRC1", 0)], None), // console wave
+        ("V_LSHLREV_B32", "ENC_VOP2", vec![("VDST", 1), ("SRC0", 130), ("VSRC1", 1)], None), // its LDS dword
+        // lane 0 clears the wave's two dwords (at v1 and v1 + 256)
+        ("S_MOV_B32", "ENC_SOP1", vec![("SDST", 126), ("SSRC0", 129)], None),
+        ("S_MOV_B32", "ENC_SOP1", vec![("SDST", 127), ("SSRC0", 128)], None),
+        ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 3), ("SRC0", 128)], None),
+        ("DS_WRITE2_B32", "ENC_DS", vec![("ADDR", 1), ("DATA0", 3), ("DATA1", 3), ("OFFSET0", 0), ("OFFSET1", 64)], None),
+        // a mask read whole: the halves meet (after the clear, before the writes below)
+        ("S_MOV_B64", "ENC_SOP1", vec![("SDST", 126), ("SSRC0", 193)], None),
+        ("V_CMP_GT_U32", "ENC_VOPC", vec![("SRC0", 255), ("VSRC1", 0)], Some(40)),
+        ("S_BCNT1_I32_B64", "ENC_SOP1", vec![("SDST", 20), ("SSRC0", 106)], None),
+        // lanes 32..63: the load chain, then lds[v1] = MARKER, lds[v1 + 256] |= 1 << (lane - 32)
+        ("S_MOV_B32", "ENC_SOP1", vec![("SDST", 126), ("SSRC0", 128)], None),
+        ("S_MOV_B32", "ENC_SOP1", vec![("SDST", 127), ("SSRC0", 193)], None),
+        ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 10), ("SRC0", 1)], None),
+        ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 11), ("SRC0", 128)], None),
+    ];
+    for _ in 0..LOADS {
+        list.push(("GLOBAL_LOAD_DWORD", "ENC_FLAT_GLBL", vec![("VDST", 10), ("ADDR", 10), ("SADDR", 0x7D)], None));
+    }
+    list.extend([
+        ("DS_WRITE_B32", "ENC_DS", vec![("ADDR", 1), ("DATA0", 10)], None),
+        ("V_SUBREV_NC_U32", "ENC_VOP2", vec![("VDST", 12), ("SRC0", 2), ("VSRC1", 10)], None), // v10 - s2 = 1
+        ("V_LSHLREV_B32", "ENC_VOP2", vec![("VDST", 12), ("SRC0", V + 2), ("VSRC1", 12)], None),
+        ("DS_OR_B32", "ENC_DS", vec![("ADDR", 1), ("DATA0", 12), ("OFFSET0", 0), ("OFFSET1", 1)], None),
+        // lane 0 reads both, no exchange since the writes
+        ("S_MOV_B32", "ENC_SOP1", vec![("SDST", 126), ("SSRC0", 129)], None),
+        ("S_MOV_B32", "ENC_SOP1", vec![("SDST", 127), ("SSRC0", 128)], None),
+        ("DS_READ2_B32", "ENC_DS", vec![("VDST", 5), ("ADDR", 1), ("OFFSET0", 0), ("OFFSET1", 64)], None),
+        // read, then write: every lane reads lds[v1] (MARKER), the upper half only after a
+        // second load chain (its address depends on it); then lane 0 clears it with nothing
+        // between – the console's lanes all read before the clear
+        ("S_MOV_B64", "ENC_SOP1", vec![("SDST", 126), ("SSRC0", 193)], None),
+        ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 14), ("SRC0", 4)], None), // MARKER
+        ("S_MOV_B32", "ENC_SOP1", vec![("SDST", 126), ("SSRC0", 128)], None),
+        ("S_MOV_B32", "ENC_SOP1", vec![("SDST", 127), ("SSRC0", 193)], None),
+        ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 14), ("SRC0", 1)], None),
+        ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 15), ("SRC0", 128)], None),
+    ]);
+    for _ in 0..LOADS {
+        list.push(("GLOBAL_LOAD_DWORD", "ENC_FLAT_GLBL", vec![("VDST", 14), ("ADDR", 14), ("SADDR", 0x7D)], None));
+    }
+    list.extend([
+        ("S_MOV_B64", "ENC_SOP1", vec![("SDST", 126), ("SSRC0", 193)], None),
+        ("V_SUBREV_NC_U32", "ENC_VOP2", vec![("VDST", 15), ("SRC0", 4), ("VSRC1", 14)], None), // 0
+        ("V_ADD_NC_U32", "ENC_VOP2", vec![("VDST", 15), ("SRC0", V + 1), ("VSRC1", 15)], None), // v1
+        ("DS_READ_B32", "ENC_DS", vec![("VDST", 7), ("ADDR", 15)], None),
+        ("S_MOV_B32", "ENC_SOP1", vec![("SDST", 126), ("SSRC0", 129)], None),
+        ("S_MOV_B32", "ENC_SOP1", vec![("SDST", 127), ("SSRC0", 128)], None),
+        ("DS_WRITE_B32", "ENC_DS", vec![("ADDR", 1), ("DATA0", 3)], None),
+        // out[group · threads + thread] = (v5, v6, v7, 0)
+        ("S_MOV_B64", "ENC_SOP1", vec![("SDST", 126), ("SSRC0", 193)], None),
+        ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 8), ("SRC0", 128)], None),
+        ("S_LSHL_B32", "ENC_SOP2", vec![("SDST", 16), ("SSRC0", 5), ("SSRC1", 3)], None), // s3 = log2(threads)
+        ("V_ADD_NC_U32", "ENC_VOP2", vec![("VDST", 20), ("SRC0", 16), ("VSRC1", 0)], None),
+        ("V_LSHLREV_B32", "ENC_VOP2", vec![("VDST", 20), ("SRC0", 132), ("VSRC1", 20)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", vec![("VDST", 20), ("SRC0", 0), ("VSRC1", 20)], None),
+        ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 21), ("SRC0", 128)], None),
+        ("GLOBAL_STORE_DWORDX4", "ENC_FLAT_GLBL", vec![("ADDR", 20), ("DATA", 5), ("SADDR", 0x7D)], None),
+    ]);
+    let refs: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = list.iter().map(|(n, e, f, l)| (*n, *e, &f[..], *l)).collect();
+    let p = prog(&refs);
+    let chain = 0x40u32;
+    let base = 0x1000usize;
+    let groups = 64usize;
+    for threads in [64u32, 128, 256] {
+        let cs = CsInterface { threads: [threads, 1, 1], user_sgprs: 5, tgid: [true, false, false], tg_size: false, tid_components: 1 };
+        let opt = on_gpu(Options { mode: Mode::Compute(cs), wave64: true, ..Default::default() });
+        let t = translate(&p, &opt).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        if runner::split_wave64() {
+            // every LDS instruction tests the bits (2 writes, the or, 2 reads, the clear)
+            assert_eq!(t.hlsl.matches(") != 0u) xcl_x_meet();").count(), 6, "{threads} threads");
+        }
+        let dxil = direct_or(&p, &opt, dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}")));
+        let mut io = vec![0u32; 128];
+        io[..5].copy_from_slice(&[base as u32, chain, MARKER - 1, threads.trailing_zeros(), MARKER]);
+        let mut mem = vec![0u32; (base + groups * threads as usize * 16) / 4];
+        // mem[chain + 4k] = chain + 4 (k + 1), the last one MARKER
+        for k in 0..LOADS {
+            mem[chain as usize / 4 + k] = if k + 1 == LOADS { MARKER } else { chain + 4 * (k as u32 + 1) };
+        }
+        let out = runner::dispatch(&dxil, [groups as u32, 1, 1], &io, &mem).unwrap();
+        for g in 0..groups {
+            for tid in 0..threads as usize {
+                let at = (base + (g * threads as usize + tid) * 16) / 4;
+                let want = if tid % 64 == 0 { (MARKER, u32::MAX) } else { (0, 0) };
+                assert_eq!((out[at], out[at + 1]), want, "{threads} threads, group {g} thread {tid}: the upper half's store and or");
+                assert_eq!(out[at + 2], MARKER, "{threads} threads, group {g} thread {tid}: read before lane 0's clear");
             }
         }
     }
@@ -7473,9 +8077,9 @@ fn bench_split_wave64() {
                 t.sort_by(f64::total_cmp);
                 ms.push(t[t.len() / 2]);
             }
-            // the form `x64_spin` picks: counters for groups of more than one console wave,
-            // and by default for one as well (`XCL_WAVE64_SPIN=0`: a group barrier)
-            let spin = threads > 64 || std::env::var("XCL_WAVE64_SPIN").map_or(true, |v| v.trim() != "0");
+            // the form `x64_spin` picks: counters for groups of more than one console wave, a
+            // group barrier for one (`XCL_WAVE64_SPIN=1`: counters there too)
+            let spin = super::emit::x64_spin_for(threads, std::env::var("XCL_WAVE64_SPIN").ok().as_deref());
             let form = if runner::split_wave64() { if spin { "split, counter-paired" } else { "split, barrier" } } else { "native" };
             println!(
                 "v_cmp + v_cndmask{}: {exchanges} exchange(s) / iteration, {threads} threads per group, 2^18 threads x {iterations} iterations: wave32 {:.1} ms, wave64 ({form}) {:.1} ms = {:.2}x",
@@ -7515,6 +8119,332 @@ fn gpu_compute_tg_size_counts_a_partial_last_wave() {
         let waves = threads.div_ceil(lanes);
         for (k, &got) in mem.iter().take(threads as usize).enumerate() {
             assert_eq!(got, waves | (k as u32 / lanes) << 6, "{threads} threads, wave{lanes}: thread {k}");
+        }
+    }
+}
+
+/// A loop that only ends when its counter wraps to 0, then global_store_dword [v0 * 4], the
+/// counter: the passes a lane ran before the loop was ended.
+fn endless_loop_program() -> Vec<u8> {
+    prog(&[
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 10), ("SSRC0", 128)], None),
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 10), ("SSRC0", 10), ("SSRC1", 129)], None),
+        ("S_CMP_LG_U32", "ENC_SOPC", &[("SSRC0", 10), ("SSRC1", 128)], None),
+        ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0xFFFD)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", 10)], None),
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 6), ("SRC0", 130), ("VSRC1", 0)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 7), ("SRC0", 128)], None),
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 6), ("DATA", 4), ("SADDR", 0x7D)], None),
+    ])
+}
+
+/// The same loop inside one of three passes: global_store_dword [v0 * 4], the sum of the
+/// inner loop's passes over its three entries.
+fn endless_loop_entered_three_times() -> Vec<u8> {
+    prog(&[
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 11), ("SSRC0", 128)], None),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 12), ("SSRC0", 128)], None),
+        // the outer loop: three passes
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 10), ("SSRC0", 128)], None),
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 10), ("SSRC0", 10), ("SSRC1", 129)], None),
+        ("S_CMP_LG_U32", "ENC_SOPC", &[("SSRC0", 10), ("SSRC1", 128)], None),
+        ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0xFFFD)], None),
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 12), ("SSRC0", 12), ("SSRC1", 10)], None),
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 11), ("SSRC0", 11), ("SSRC1", 129)], None),
+        ("S_CMP_LG_U32", "ENC_SOPC", &[("SSRC0", 11), ("SSRC1", 131)], None),
+        ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0xFFF8)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", 12)], None),
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 6), ("SRC0", 130), ("VSRC1", 0)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 7), ("SRC0", 128)], None),
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 6), ("DATA", 4), ("SADDR", 0x7D)], None),
+    ])
+}
+
+/// `IO_LOOP_BUDGET`: one thread group's share of `DISPATCH_LOOP_PASSES` – all of it for a
+/// dispatch of one group, less the more groups there are, and never 0 ("not known").
+#[test]
+fn dispatch_loop_budget_shrinks_with_the_groups() {
+    use super::{dispatch_loop_budget as budget, DISPATCH_LOOP_PASSES};
+    assert_eq!(budget([1, 1, 1]) as u64, DISPATCH_LOOP_PASSES);
+    assert_eq!(budget([16, 16, 16]) as u64, DISPATCH_LOOP_PASSES / 4096);
+    // 64 threads a group: 1024 passes a lane
+    assert_eq!(budget([16, 16, 16]) / 64, 1024);
+    // a count of 0 dispatches nothing: as 1
+    assert_eq!(budget([0, 8, 0]), budget([1, 8, 1]));
+    assert_eq!(budget([65_535, 65_535, 65_535]), 1);
+}
+
+/// Only the loops of a compute program count their own passes against the dispatch's share:
+/// the HLSL of every other program (and with it the DXIL cache's key) is as it was.
+#[test]
+fn only_compute_programs_with_a_loop_read_the_dispatch_loop_budget() {
+    let cs = super::CsInterface { threads: [8, 4, 2], user_sgprs: 2, tgid: [false; 3], tg_size: false, tid_components: 1 };
+    let compute = Options { mode: Mode::Compute(cs), wave64: false, ..Default::default() };
+    let looping = translate(&endless_loop_program(), &compute).unwrap();
+    assert!(looping.complete(), "{:?}", looping.unsupported_why);
+    let read = format!("uint xcl_gb = io.Load({}u); if (xcl_gb != 0u) xcl_cap = clamp(xcl_gb / 64u, 1024u, 1u << 16);", super::IO_LOOP_BUDGET * 4);
+    assert_eq!(looping.hlsl.matches(&read).count(), 1, "{}", looping.hlsl);
+    assert_eq!(looping.hlsl.matches("static uint xcl_cap = 1u << 16;").count(), 1, "{}", looping.hlsl);
+    assert!(looping.hlsl.contains("uint xcl_n1 = xcl_cap;"), "{}", looping.hlsl);
+    assert!(looping.hlsl.contains("if (xcl_n1 == 0u) break; xcl_n1--; if (xcl_budget == 0u) break; xcl_budget--;"), "{}", looping.hlsl);
+    // each loop has a count of its own
+    let nested = translate(&endless_loop_entered_three_times(), &compute).unwrap();
+    assert!(nested.hlsl.contains("uint xcl_n1 = xcl_cap;") && nested.hlsl.contains("uint xcl_n2 = xcl_cap;"), "{}", nested.hlsl);
+    // the same program as a kernel, and a compute program without a loop
+    let kernel = translate(&endless_loop_program(), &Options { wave64: false, ..Default::default() }).unwrap();
+    assert!(kernel.hlsl.contains("xcl_budget--") && !kernel.hlsl.contains("xcl_cap") && !kernel.hlsl.contains("xcl_gb"), "{}", kernel.hlsl);
+    let straight = prog(&[
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", 2)], None),
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 6), ("SRC0", 130), ("VSRC1", 0)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 7), ("SRC0", 128)], None),
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 6), ("DATA", 4), ("SADDR", 0x7D)], None),
+    ]);
+    let straight = translate(&straight, &compute).unwrap();
+    assert!(!straight.hlsl.contains("xcl_cap") && !straight.hlsl.contains("xcl_gb") && !straight.hlsl.contains("xcl_budget--"), "{}", straight.hlsl);
+}
+
+/// DXC takes a compute program's loop counts (the GPU test above needs a GPU before it compiles).
+#[test]
+fn compute_loop_counts_compile() {
+    if super::dxc::location().is_err() {
+        return runner::skip_test("no DXC");
+    }
+    let cs = super::CsInterface { threads: [8, 4, 2], user_sgprs: 2, tgid: [false; 3], tg_size: false, tid_components: 1 };
+    for wave64 in [false, true] {
+        let compute = Options { mode: Mode::Compute(cs.clone()), wave64, ..Default::default() };
+        for code in [endless_loop_program(), endless_loop_entered_three_times()] {
+            let t = translate(&code, &compute).unwrap();
+            assert!(t.hlsl.contains("xcl_cap;"), "{}", t.hlsl);
+            super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("wave64 {wave64}: {e}\n{}", t.hlsl));
+        }
+    }
+}
+
+/// A compute program's loop that never meets its exit runs the passes its dispatch gives one
+/// entry of a loop: `IO_LOOP_BUDGET` among the group's threads, between 1024 and 65 536 a
+/// lane, the same in every thread (both halves of a split wave64). A dispatch that does not
+/// say (0) leaves it the lane's 65 536. Entered three times the loop runs them three times:
+/// loops inside one another are not cut to one loop's share. The HLSL path: the direct
+/// translator's is `dxil::core_tests::gpu_direct_compute_loop_passes_follow_the_dispatch`.
+#[test]
+fn gpu_compute_loop_passes_follow_the_dispatch() {
+    if !gpu_ready() {
+        return;
+    }
+    let threads = 64u32;
+    let run = |p: &[u8], wave64: bool, slot: u32| -> u32 {
+        let cs = super::CsInterface { threads: [threads, 1, 1], user_sgprs: 2, tgid: [false; 3], tg_size: false, tid_components: 1 };
+        let opt = on_gpu(Options { mode: Mode::Compute(cs), wave64, ..Default::default() });
+        let t = translate(p, &opt).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+        let mut io = [0u32; 128];
+        io[super::IO_LOOP_BUDGET] = slot;
+        let mem = runner::dispatch(&dxil, [1, 1, 1], &io, &vec![0xFFFF_FFFFu32; threads as usize]).unwrap();
+        for (k, &got) in mem.iter().take(threads as usize).enumerate() {
+            assert_eq!(got, mem[0], "wave{}, slot {slot}: thread {k}", if wave64 { 64 } else { 32 });
+        }
+        mem[0]
+    };
+    for wave64 in [false, true] {
+        // (the slot, passes): not known; 5000 a lane; shares below and above the bounds
+        for (slot, passes) in [(0u32, 65_536u32), (threads * 5000, 5000), (1, 1024), (u32::MAX, 65_536)] {
+            assert_eq!(run(&endless_loop_program(), wave64, slot), passes, "wave64 {wave64}, slot {slot}");
+        }
+        // three entries of 1024 passes; without a share the first entry spends the lane's
+        // budget (but for the outer loop's own pass) and ends the program
+        assert_eq!(run(&endless_loop_entered_three_times(), wave64, 1), 3 * 1024, "wave64 {wave64}");
+        assert_eq!(run(&endless_loop_entered_three_times(), wave64, 0), 65_535, "wave64 {wave64}");
+    }
+}
+
+/// A dispatch of more groups in X than D3D12 takes, folded into Y (`IO_GROUP_LIMIT`): each of
+/// the console's groups runs once with its own id in X, none past its count; with no count in io
+/// the groups are the dispatch's own (a retail game's 72 512 × 1 × 1 hung the GPU unfolded).
+/// The HLSL path, then the direct translator (`gpu::dxil`, wave32 / wave64 / split wave64) and
+/// its per-lane form (`lower_dxil`): `bind` and `clamp` fold for every translated pipeline.
+#[test]
+fn gpu_compute_folded_dispatch_runs_each_console_group_once() {
+    if !gpu_ready() {
+        return;
+    }
+    // global_store_dword [s2 * 4], s2 (s2: the group id in X after user SGPRs s0, s1)
+    let p = prog(&[
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", 2)], None),
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 6), ("SRC0", 130), ("VSRC1", 4)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 7), ("SRC0", 128)], None),
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 6), ("DATA", 4), ("SADDR", 0x7D)], None),
+    ]);
+    let fold = super::FOLD_X;
+    // each console group once, none past the count; unfolded, the dispatch's own groups
+    let check = |dxil: &[u8], what: &str| {
+        for n in [72_512u32, fold + 1] {
+            let rows = n.div_ceil(fold);
+            let mut io = vec![0u32; 128];
+            io[super::IO_GROUP_LIMIT] = n;
+            let mem = runner::dispatch(dxil, [fold, rows, 1], &io, &vec![0xFFFF_FFFFu32; (fold * rows) as usize]).unwrap_or_else(|e| panic!("{what}: {e}"));
+            for (k, &got) in mem.iter().enumerate() {
+                let want = if (k as u32) < n { k as u32 } else { 0xFFFF_FFFF };
+                assert_eq!(got, want, "{what}: {n} groups folded into {fold} x {rows}, group {k}");
+            }
+        }
+        let mem = runner::dispatch(dxil, [100, 1, 1], &[0u32; 128], &vec![0xFFFF_FFFFu32; 128]).unwrap();
+        for (k, &got) in mem.iter().enumerate() {
+            assert_eq!(got, if k < 100 { k as u32 } else { 0xFFFF_FFFF }, "{what}: unfolded group {k}");
+        }
+    };
+    let cs = super::CsInterface { threads: [1, 1, 1], user_sgprs: 2, tgid: [true, false, false], tg_size: false, tid_components: 1 };
+    // the native wave64 forms need a GPU that runs wave64 (the split form runs anywhere)
+    let wave64_ok = runner::wave64_supported() == Ok(true);
+    for wave64 in [false, true] {
+        let t = translate(&p, &on_gpu(Options { mode: Mode::Compute(cs.clone()), wave64, ..Default::default() })).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}
+{}", t.hlsl));
+        check(&dxil, &format!("HLSL, wave64 {wave64}"));
+        if !wave64 || wave64_ok {
+            let dxil = super::lower_dxil::compute_code(&p, &cs, wave64).unwrap();
+            check(&dxil, &format!("per-lane, wave64 {wave64}"));
+        }
+    }
+    for (wave64, split) in [(false, false), (true, false), (true, true)].into_iter().filter(|&(w, s)| !w || s || wave64_ok) {
+        let o = crate::gpu::dxil::kernel::KernelOptions { wave64, split, mem_windows: 1, sampler_base: 0 };
+        let k = crate::gpu::dxil::kernel::translate_compute(&p, o, &cs).unwrap();
+        check(&k.dxil, &format!("direct, wave64 {wave64}, split {split}"));
+    }
+}
+
+/// The HLSL compute prologue leaves the lanes past a dispatch's thread limit
+/// (`IO_THREAD_LIMIT`: one 12-byte load) out of the launch EXEC, by the console's thread of the
+/// lane (the console's group, unfolded, times the group size plus `gtid`, which the split form
+/// and a 2-D group number as their waves arrive): wave32, wave64, the split form, a 2-D group;
+/// a wave left with no thread leaves, from the early-exit-safe barrier too, but not where a
+/// plain group barrier would wait for it. DXC compiles each (when it is there).
+#[test]
+fn compute_prologues_leave_the_lanes_past_a_thread_limit_out_of_exec() {
+    // global_store_dword [((s2 << 3) + v0) * 4], (s2 << 3) + v0
+    let store: [(&str, &str, &[(&str, u64)], Option<u32>); 4] = [
+        ("V_LSHL_ADD_U32", "ENC_VOP3", &[("VDST", 4), ("SRC0", 2), ("SRC1", 131), ("SRC2", 256)], None),
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 6), ("SRC0", 130), ("VSRC1", 4)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 7), ("SRC0", 128)], None),
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 6), ("DATA", 4), ("SADDR", 0x7D)], None),
+    ];
+    for (wave64, split, threads, with_barrier) in [
+        (false, false, [64, 1, 1], false),
+        (true, false, [64, 1, 1], false),
+        (true, true, [64, 1, 1], false),
+        (true, true, [128, 1, 1], false),
+        (false, false, [8, 8, 1], false),
+        (true, false, [128, 1, 1], true),
+        (false, false, [64, 1, 1], true),
+    ] {
+        let what = format!("wave64 {wave64}, split {split}, {threads:?}, barrier {with_barrier}");
+        let cs = super::CsInterface { threads, user_sgprs: 2, tgid: [true, true, false], tg_size: false, tid_components: 2 };
+        let mut lines = store.to_vec();
+        if with_barrier {
+            lines.insert(0, ("S_BARRIER", "ENC_SOPP", &[], None));
+        }
+        let t = translate(&prog(&lines), &Options { mode: Mode::Compute(cs), wave64, split_wave64: split, ..Default::default() }).unwrap();
+        assert!(t.complete(), "{what}: {:?}", t.unsupported_why);
+        let [x, y, z] = threads;
+        let ballot = if split { "xcl_x_ballot" } else { "ballot" };
+        for want in [
+            format!("uint3 xcl_tl = io.Load3({}u) - 1u;", super::IO_THREAD_LIMIT[0] * 4),
+            format!("uint2 e0 = {ballot}(all(xcl_gid * uint3({x}u, {y}u, {z}u) + gtid <= xcl_tl));"),
+        ] {
+            assert!(t.hlsl.contains(&want), "{what}: no {want}\n{}", t.hlsl);
+        }
+        let leaves = t.hlsl.lines().find(|l| l.contains("if ((exec_lo | exec_hi) == 0u)")).map(str::trim);
+        let safe = t.hlsl.contains("xcl_s_barrier();");
+        if with_barrier && !safe {
+            // `XCL_SAFE_BARRIER=0`: the plain group barrier, which a wave that left would hang
+            assert_eq!(leaves, None, "{what}\n{}", t.hlsl);
+        } else {
+            let want = if safe { "if ((exec_lo | exec_hi) == 0u) { xcl_s_barrier_exit(); return; }" } else { "if ((exec_lo | exec_hi) == 0u) { return; }" };
+            assert_eq!(leaves, Some(want), "{what}\n{}", t.hlsl);
+        }
+        if super::dxc::location().is_ok() {
+            super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{what}: {e}\n{}", t.hlsl));
+        }
+    }
+}
+
+/// The code of a `lower::tests` program.
+fn code_of(lines: &[super::lower::tests::I]) -> Vec<u8> {
+    lines.iter().flat_map(super::lower::tests::encode_line).collect()
+}
+
+/// The lanes past a dispatch's thread limit (`IO_THREAD_LIMIT`) run as threads the console never
+/// started, in every form a compute program takes: the HLSL path (wave32, wave64, split wave64),
+/// the direct translator (`gpu::dxil`: the same three) and its per-lane form (`lower_dxil`). Each
+/// thread stores its index; only those below the limit are written: in the last console wave of
+/// a group and in the upper half of a wave64, folded into Y, in Y of 8 x 8 groups and in X and Y;
+/// a limit of 0 limits nothing. EXEC (`s_bcnt1`) counts only the threads below the limit.
+#[test]
+fn gpu_compute_thread_limits_leave_the_lanes_past_them_out() {
+    use super::lower::tests::{decode, thread_index_program, I};
+    use super::{CsInterface, FOLD_X, IO_GROUP_LIMIT, IO_THREAD_LIMIT};
+    use crate::gpu::dxil::kernel::{translate_compute, KernelOptions};
+    const NONE: u32 = 0xFFFF_FFFF;
+    if runner::adapter().is_err() || runner::wave32_supported() != Ok(true) || super::dxc::location().is_err() {
+        return runner::skip_test(if super::dxc::location().is_err() { "no DXC" } else { "no GPU" });
+    }
+    let w64 = runner::wave64_supported() == Ok(true);
+    // (name, wave64, the form's DXIL for a program and its group), on this adapter
+    type Form = (&'static str, bool, fn(&[I], &CsInterface) -> Vec<u8>);
+    let mut forms: Vec<Form> = vec![
+        ("HLSL wave32", false, |l, cs| super::dxc::compile(&translate(&code_of(l), &Options { mode: Mode::Compute(cs.clone()), wave64: false, ..Default::default() }).unwrap().hlsl, "main", "cs_6_6", &[]).unwrap()),
+        ("HLSL split wave64", true, |l, cs| super::dxc::compile(&translate(&code_of(l), &Options { mode: Mode::Compute(cs.clone()), wave64: true, split_wave64: true, ..Default::default() }).unwrap().hlsl, "main", "cs_6_6", &[]).unwrap()),
+        ("direct wave32", false, |l, cs| translate_compute(&code_of(l), KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 }, cs).unwrap().dxil),
+        ("direct split wave64", true, |l, cs| translate_compute(&code_of(l), KernelOptions { wave64: true, split: true, mem_windows: 1, sampler_base: 0 }, cs).unwrap().dxil),
+        ("per-lane wave32", false, |l, cs| super::lower_dxil::compute_code(&code_of(l), cs, false).unwrap()),
+        ("per-lane split wave64", true, |l, cs| super::lower_dxil::compute_split(&decode(l), cs).unwrap()),
+    ];
+    if w64 {
+        forms.push(("HLSL wave64", true, |l, cs| super::dxc::compile(&translate(&code_of(l), &Options { mode: Mode::Compute(cs.clone()), wave64: true, ..Default::default() }).unwrap().hlsl, "main", "cs_6_6", &[]).unwrap()));
+        forms.push(("direct wave64", true, |l, cs| translate_compute(&code_of(l), KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 }, cs).unwrap().dxil));
+        forms.push(("per-lane wave64", true, |l, cs| super::lower_dxil::compute_code(&code_of(l), cs, true).unwrap()));
+    }
+    let cs = |threads: [u32; 3], y: bool| CsInterface { threads, user_sgprs: 2, tgid: [true, y, false], tg_size: false, tid_components: if y { 2 } else { 1 } };
+    let io = |x: u32, y: u32, folded: u32| {
+        let mut io = vec![0u32; 128];
+        (io[IO_THREAD_LIMIT[0]], io[IO_THREAD_LIMIT[1]], io[IO_GROUP_LIMIT]) = (x, y, folded);
+        io
+    };
+    for (name, wave64, build) in forms {
+        let lanes = if wave64 { 64 } else { 32 };
+        // 64 threads a group, 4 groups: thread indices, then EXEC's count
+        let index = build(&thread_index_program(6, None, None), &cs([64, 1, 1], false));
+        let count = build(&thread_index_program(6, None, Some(wave64)), &cs([64, 1, 1], false));
+        for l in [3 * 64 + 40, 3 * 64 + 20, 0] {
+            let mem = runner::dispatch(&index, [4, 1, 1], &io(l, 0, 0), &[NONE; 256]).unwrap_or_else(|e| panic!("{name}: {e}"));
+            for (k, &got) in mem.iter().enumerate() {
+                assert_eq!(got, if l == 0 || (k as u32) < l { k as u32 } else { NONE }, "{name}, limit {l}: thread {k}");
+            }
+            let mem = runner::dispatch(&count, [4, 1, 1], &io(l, 0, 0), &[NONE; 256]).unwrap_or_else(|e| panic!("{name}: {e}"));
+            for (k, &got) in mem.iter().enumerate() {
+                let first = k as u32 / lanes * lanes;
+                let n = if l == 0 { lanes } else { l.saturating_sub(first).min(lanes) };
+                assert_eq!(got, if l == 0 || (k as u32) < l { n } else { NONE }, "{name}, limit {l}: thread {k}'s EXEC");
+            }
+        }
+        // 65 537 console groups of 4 threads folded into 65 535 x 2, the last one ending at its
+        // fourth thread
+        let folded = build(&thread_index_program(2, None, None), &cs([4, 1, 1], false));
+        let (n, l) = (FOLD_X + 2, 4 * (FOLD_X + 1) + 3);
+        let mem = runner::dispatch(&folded, [FOLD_X, 2, 1], &io(l, 0, n), &vec![NONE; 4 * 2 * FOLD_X as usize]).unwrap_or_else(|e| panic!("{name}: {e}"));
+        for (k, &got) in mem.iter().enumerate() {
+            assert_eq!(got, if (k as u32) < l { k as u32 } else { NONE }, "{name}, folded: thread {k}");
+        }
+        // 2 x 2 groups of 8 x 8, limits in Y and in X and Y
+        let rows = build(&thread_index_program(3, Some(2), None), &cs([8, 8, 1], true));
+        for (lx, ly) in [(0, 13), (11, 13), (0, 0)] {
+            let mem = runner::dispatch(&rows, [2, 2, 1], &io(lx, ly, 0), &[NONE; 256]).unwrap_or_else(|e| panic!("{name}: {e}"));
+            for (k, &got) in mem.iter().enumerate() {
+                let (x, y) = (k as u32 % 16, k as u32 / 16);
+                let ran = (lx == 0 || x < lx) && (ly == 0 || y < ly);
+                assert_eq!(got, if ran { k as u32 } else { NONE }, "{name}, limit {lx} x {ly}: thread ({x}, {y})");
+            }
         }
     }
 }
@@ -8961,6 +9891,118 @@ fn gpu_safe_s_barrier_multi_warp_and_early_endpgm() {
     }
 }
 
+/// `XCL_SAMPLE_BARRIER=<folder>` (a title's dumped shaders, `<data>\shaders`, or a part of them;
+/// `XCL_DIRECT_DXIL=1` as its runs have it): every compute and mesh program there with
+/// `s_barrier` in a thread group of several 32-lane hardware waves is refused by the direct
+/// translator for that reason, and translates completely on the HLSL path with 16 memory windows
+/// from the descriptor heap in the split form, which DXC compiles. The direct translator leaves
+/// those programs to the HLSL path's bounded barrier (`dxil::lower`'s s_barrier): one the HLSL
+/// path could not translate would lose its draws or dispatches altogether.
+#[test]
+#[ignore]
+fn programs_left_to_the_hlsl_path_for_their_barrier_translate_and_compile() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+    let Some(dir) = std::env::var_os("XCL_SAMPLE_BARRIER") else { return };
+    let mut files: Vec<std::path::PathBuf> = Vec::new();
+    let mut todo = vec![std::path::PathBuf::from(dir)];
+    while let Some(d) = todo.pop() {
+        for e in std::fs::read_dir(&d).unwrap().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                todo.push(p);
+            } else if p.extension().is_some_and(|x| x == "bin") && !p.to_string_lossy().contains(".fssm") {
+                files.push(p);
+            }
+        }
+    }
+    files.sort();
+    const REFUSAL: &str = "s_barrier in a group of several hardware waves";
+    let windows = super::HEAP_WINDOWS | 16;
+    let next = AtomicUsize::new(0);
+    // programs with the barrier in a group of several waves, of them refused by the direct
+    // translator for it, complete on the HLSL path, compiled by DXC
+    let (n, refused, complete, compiled) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
+    let failures: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    std::thread::scope(|s| {
+        for _ in 0..super::dxc::compile_threads() {
+            s.spawn(|| loop {
+                let Some(path) = files.get(next.fetch_add(1, Ordering::Relaxed)) else { break };
+                let blob = std::fs::read(path).unwrap();
+                let name = path.file_name().unwrap().to_string_lossy().into_owned();
+                let Some(sh) = crate::gpu::xbox::parse(&blob) else { continue };
+                for f in &sh.fssm {
+                    let Some(mode) = super::interface(&blob, &sh, f) else { continue };
+                    let threads = match &mode {
+                        Mode::Compute(cs) => cs.threads.iter().product::<u32>(),
+                        Mode::Mesh(ms) => ms.threads,
+                        _ => continue,
+                    };
+                    let Some(p) = f.programs.first() else { continue };
+                    let code = &f.data[p.offset..p.offset + p.len];
+                    let has_barrier = {
+                        let mut off = 0;
+                        let mut found = false;
+                        while off + 4 <= code.len() {
+                            let Ok(d) = crate::gpu::rdna2::decode(&code[off..], off as u64) else { break };
+                            found |= d.inst.name == "S_BARRIER";
+                            off += d.len;
+                        }
+                        found
+                    };
+                    if !has_barrier || threads <= 32 {
+                        continue;
+                    }
+                    n.fetch_add(1, Ordering::Relaxed);
+                    let wave64 = super::fssm_wave64(f, code);
+                    let o = crate::gpu::dxil::kernel::KernelOptions { wave64, split: wave64, mem_windows: windows, sampler_base: 0 };
+                    let direct = match &mode {
+                        Mode::Compute(cs) => crate::gpu::dxil::kernel::translate_compute(code, o, cs).map(|_| ()),
+                        Mode::Mesh(ms) => crate::gpu::dxil::kernel::translate_mesh(code, o, ms).map(|_| ()),
+                        _ => unreachable!(),
+                    };
+                    match direct {
+                        Err(e) if e.contains(REFUSAL) => {
+                            refused.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(e) => failures.lock().unwrap().push(format!("{name}: the direct translator fails otherwise: {}", e.lines().next().unwrap_or(""))),
+                        Ok(()) => failures.lock().unwrap().push(format!("{name}: the direct translator took it ({threads} threads)")),
+                    }
+                    let opt = Options { mode: mode.clone(), wave64, split_wave64: true, mem_windows: windows, ..Default::default() };
+                    let t = match translate(code, &opt) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            failures.lock().unwrap().push(format!("{name}: HLSL path: {e}"));
+                            continue;
+                        }
+                    };
+                    if !t.complete() {
+                        failures.lock().unwrap().push(format!("{name}: HLSL path incomplete: {:?} {:?}", t.unsupported, t.unsupported_why));
+                        continue;
+                    }
+                    complete.fetch_add(1, Ordering::Relaxed);
+                    if !t.hlsl.contains("xcl_s_barrier();") {
+                        failures.lock().unwrap().push(format!("{name}: the HLSL has no bounded barrier"));
+                    }
+                    match super::dxc::compile_cached(&t.hlsl, "main", "cs_6_6") {
+                        Ok(_) => {
+                            compiled.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(e) => failures.lock().unwrap().push(format!("{name}: DXC: {}", e.lines().find(|l| l.contains("error")).unwrap_or(e.lines().next().unwrap_or("")))),
+                    }
+                }
+            });
+        }
+    });
+    let (n, refused, complete, compiled) = (n.into_inner(), refused.into_inner(), complete.into_inner(), compiled.into_inner());
+    let failures = failures.into_inner().unwrap();
+    println!("barrier programs in groups of several waves: {n}; refused by the direct translator for the barrier: {refused}; complete on the HLSL path: {complete}; compiled: {compiled}");
+    for f in failures.iter().take(40) {
+        println!("  {f}");
+    }
+    assert!(failures.is_empty(), "{} of {n} programs", failures.len());
+}
+
 #[test]
 fn qsad_and_mqsad_operand_forms_and_validation() {
     let vop3 = |name: &str, f: &[(&str, u64)]| encode(name, "ENC_VOP3", f, None).unwrap();
@@ -9322,6 +10364,151 @@ fn jumps_to_outer_loop_heads_are_structured() {
     }
     println!("{structured} of 120 programs structured ({entered} jumps into a loop), {ran} run both ways");
     assert!(structured >= 100 && entered > 20, "{structured} structured, {entered} jumps into loops");
+}
+
+/// Compute shaders only declare `globallycoherent` on their flat memory windows (`mem`, `mem1`…
+/// and `XCL_HEAP_WINDOWS` heap views) when the program uses cross-workgroup coherence: memory
+/// atomics, `GLC`/`DLC`/`SLC` memory ops, or cache invalidations. Both the HLSL and direct DXIL
+/// backends follow the same predicate.
+#[test]
+fn compute_globallycoherent_only_when_needed() {
+    let cs = super::CsInterface { threads: [64, 1, 1], user_sgprs: 4, tgid: [true, false, false], tg_size: false, tid_components: 1 };
+    let enc = |n: &str, e: &str, f: &[(&str, u64)]| encode(n, e, f, None).unwrap_or_else(|x| panic!("{n}: {x}"));
+    let prog = |insts: &[(&str, &str, &[(&str, u64)])]| {
+        let mut c = Vec::new();
+        for &(n, e, f) in insts {
+            c.extend(enc(n, e, f));
+        }
+        c.extend(enc("S_ENDPGM", "ENC_SOPP", &[]));
+        c
+    };
+
+    // Plain compute: SMEM + MUBUF load/store + LDS + s_barrier, no GLC/DLC/SLC/atomics/inv.
+    let plain = prog(&[
+        ("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 8), ("SBASE", 0), ("OFFSET", 0), ("SOFFSET", 125)]),
+        ("GLOBAL_LOAD_DWORD", "ENC_FLAT_GLBL", &[("VDST", 1), ("ADDR", 0), ("SADDR", 0)]),
+        ("DS_WRITE_B32", "ENC_DS", &[("ADDR", 0), ("DATA0", 1)]),
+        ("S_BARRIER", "ENC_SOPP", &[]),
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 0), ("DATA", 1), ("SADDR", 0)]),
+    ]);
+
+    let coherent_cases: Vec<(&str, Vec<u8>)> = vec![
+        ("smem glc", prog(&[("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 8), ("SBASE", 0), ("OFFSET", 0), ("SOFFSET", 125), ("GLC", 1)])])),
+        ("smem dlc", prog(&[("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 8), ("SBASE", 0), ("OFFSET", 0), ("SOFFSET", 125), ("DLC", 1)])])),
+        ("mubuf glc", prog(&[("BUFFER_LOAD_DWORD", "ENC_MUBUF", &[("VDATA", 1), ("VADDR", 0), ("SRSRC", 0), ("SOFFSET", 128), ("GLC", 1)])])),
+        ("global dlc", prog(&[("GLOBAL_LOAD_DWORD", "ENC_FLAT_GLBL", &[("VDST", 1), ("ADDR", 0), ("SADDR", 0), ("DLC", 1)])])),
+        ("mubuf slc", prog(&[("BUFFER_STORE_DWORD", "ENC_MUBUF", &[("VDATA", 1), ("VADDR", 0), ("SRSRC", 0), ("SOFFSET", 128), ("SLC", 1)])])),
+        ("buffer_atomic", prog(&[("BUFFER_ATOMIC_ADD", "ENC_MUBUF", &[("VDATA", 1), ("VADDR", 0), ("SRSRC", 0), ("SOFFSET", 128)])])),
+        ("global_atomic", prog(&[("GLOBAL_ATOMIC_ADD", "ENC_FLAT_GLBL", &[("VDST", 1), ("ADDR", 0), ("DATA", 2), ("SADDR", 0)])])),
+        ("flat_atomic", prog(&[("FLAT_ATOMIC_ADD", "ENC_FLAT", &[("VDST", 1), ("ADDR", 2), ("DATA", 4)])])),
+        ("s_dcache_inv", prog(&[("S_DCACHE_INV", "ENC_SMEM", &[])])),
+        ("s_gl1_inv", prog(&[("S_GL1_INV", "ENC_SMEM", &[])])),
+        ("buffer_gl0_inv", prog(&[("BUFFER_GL0_INV", "ENC_MUBUF", &[])])),
+        ("buffer_gl1_inv", prog(&[("BUFFER_GL1_INV", "ENC_MUBUF", &[])])),
+    ];
+
+    for (windows, heap) in [(1u32, false), (2, false), (2, true)] {
+        let opt = Options { mode: Mode::Compute(cs.clone()), wave64: false, mem_windows: windows, heap_windows: heap, ..Default::default() };
+        let t = translate(&plain, &opt).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        assert!(!t.hlsl.contains("globallycoherent"), "plain CS (windows={windows}, heap={heap}) must not emit globallycoherent:\n{}", t.hlsl);
+
+        for (label, code) in &coherent_cases {
+            let t = translate(code, &opt).unwrap();
+            assert!(t.complete(), "{label}: {:?}", t.unsupported_why);
+            assert!(t.hlsl.contains("globallycoherent"), "{label} (windows={windows}, heap={heap}) must emit globallycoherent");
+            if heap {
+                assert!(t.hlsl.contains("#define XCL_MW globallycoherent RWByteAddressBuffer"), "{label}: heap window accessor must be globallycoherent");
+            }
+        }
+    }
+
+    // Kernel mode stays non-coherent even with atomics.
+    let k = translate(&coherent_cases[6].1, &Options { mode: Mode::Kernel, wave64: false, ..Default::default() }).unwrap();
+    assert!(!k.hlsl.contains("globallycoherent"), "kernel mode must not emit globallycoherent");
+
+    // Direct DXIL backend: check the IsGloballyCoherent bit (0x4000) in annotateHandle properties
+    // (RAW_BUFFER=11 | IsUAV=0x1000 = 4107 vs RAW_BUFFER=11 | IsUAV=0x1000 | IsGloballyCoherent=0x4000 = 20491).
+    // (the plain program in a group of one 32-lane wave: its s_barrier in a group of several
+    // hardware waves is left to the HLSL path)
+    let one_wave = super::CsInterface { threads: [32, 1, 1], ..cs.clone() };
+    for mw in [1u32, super::HEAP_WINDOWS | 2] {
+        let o = crate::gpu::dxil::kernel::KernelOptions { wave64: false, split: false, mem_windows: mw, sampler_base: 0 };
+        let plain_k = crate::gpu::dxil::kernel::translate_compute(&plain, o, &one_wave).unwrap();
+        let coh_k = crate::gpu::dxil::kernel::translate_compute(&coherent_cases[6].1, o, &cs).unwrap();
+        if super::dxc::location().is_ok() {
+            let plain_dis = crate::gpu::dxil::validate::disassemble(&plain_k.dxil).unwrap();
+            let coh_dis = crate::gpu::dxil::validate::disassemble(&coh_k.dxil).unwrap();
+            assert!(!plain_dis.contains("i32 20491"), "direct DXIL plain CS (mw={mw:#x}) must not set IsGloballyCoherent:\n{plain_dis}");
+            assert!(coh_dis.contains("i32 20491"), "direct DXIL atomic CS (mw={mw:#x}) must set IsGloballyCoherent:\n{coh_dis}");
+        }
+    }
+}
+
+/// Real GPU check of both non-coherent (cached) and coherent (cross-workgroup atomic + GLC)
+/// compute shaders across HLSL and direct DXIL.
+#[test]
+fn gpu_compute_coherent_and_cached_loads() {
+    if !gpu_ready() {
+        return;
+    }
+    let cs = super::CsInterface { threads: [32, 1, 1], user_sgprs: 2, tgid: [true, false, false], tg_size: false, tid_components: 1 };
+    let enc = |n: &str, e: &str, f: &[(&str, u64)]| encode(n, e, f, None).unwrap_or_else(|x| panic!("{n}: {x}"));
+
+    // 1. Plain cached compute: each thread reads a uniform dword via SMEM (s[0:1] = 0x100) and
+    //    writes (val + group_id * 32 + tid) to mem[0x200 + (group_id * 32 + tid) * 4].
+    let mut plain = Vec::new();
+    plain.extend(enc("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 4), ("SBASE", 0), ("OFFSET", 0), ("SOFFSET", 125)]));
+    plain.extend(enc("S_LSHL_B32", "ENC_SOP2", &[("SDST", 3), ("SSRC0", 2), ("SSRC1", 133)])); // s3 = tgid * 32
+    plain.extend(enc("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 3), ("VSRC1", 0)])); // v1 = tgid * 32 + v0
+    plain.extend(enc("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 4), ("VSRC1", 1)])); // v2 = mem[0x100] + idx
+    plain.extend(enc("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 3), ("SRC0", 130), ("VSRC1", 1)])); // v3 = idx * 4
+    plain.extend(enc("V_MOV_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", 128)]));
+    plain.extend(enc("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 3), ("DATA", 2), ("SADDR", 0x7D), ("OFFSET", 0x200)]));
+    plain.extend(enc("S_ENDPGM", "ENC_SOPP", &[]));
+
+    let t_plain = translate(&plain, &Options { mode: Mode::Compute(cs.clone()), wave64: false, ..Default::default() }).unwrap();
+    assert!(t_plain.complete(), "{:?}", t_plain.unsupported_why);
+    assert!(!t_plain.hlsl.contains("globallycoherent"));
+    let dxil_plain_hlsl = super::dxc::compile(&t_plain.hlsl, "main", "cs_6_6", &[]).unwrap();
+    let dxil_plain_direct = crate::gpu::dxil::kernel::translate_compute(&plain, crate::gpu::dxil::kernel::KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 }, &cs).unwrap().dxil;
+
+    let mut io = vec![0u32; super::KERNEL_SGPRS];
+    io[0] = 0x100;
+    let mut mem = vec![0u32; 0x400 / 4];
+    mem[0x100 / 4] = 0x1234_0000;
+    for (tag, dxil) in [("hlsl", &dxil_plain_hlsl), ("direct", &dxil_plain_direct)] {
+        let out = runner::dispatch(dxil, [4, 1, 1], &io, &mem).unwrap();
+        for idx in 0..128usize {
+            assert_eq!(out[(0x200 + idx * 4) / 4], 0x1234_0000 + idx as u32, "{tag} plain cached idx={idx}");
+        }
+    }
+
+    // 2. Cross-workgroup coherent compute: 16 groups of 32 threads atomically increment a shared
+    //    counter at mem[0x100] and record their returned ticket at mem[0x200 + ticket * 4].
+    let mut coh = Vec::new();
+    coh.extend(enc("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 128)])); // v1 = 0
+    coh.extend(enc("V_MOV_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 129)])); // v2 = 1
+    coh.extend(enc("GLOBAL_ATOMIC_ADD", "ENC_FLAT_GLBL", &[("VDST", 3), ("ADDR", 1), ("DATA", 2), ("SADDR", 0), ("GLC", 1)]));
+    coh.extend(enc("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 4), ("SRC0", 130), ("VSRC1", 3)])); // v4 = ticket * 4
+    coh.extend(enc("V_MOV_B32", "ENC_VOP1", &[("VDST", 5), ("SRC0", 128)]));
+    coh.extend(enc("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 4), ("DATA", 3), ("SADDR", 0x7D), ("OFFSET", 0x200), ("GLC", 1)]));
+    coh.extend(enc("S_ENDPGM", "ENC_SOPP", &[]));
+
+    let t_coh = translate(&coh, &Options { mode: Mode::Compute(cs.clone()), wave64: false, ..Default::default() }).unwrap();
+    assert!(t_coh.complete(), "{:?}", t_coh.unsupported_why);
+    assert!(t_coh.hlsl.contains("globallycoherent"));
+    let dxil_coh_hlsl = super::dxc::compile(&t_coh.hlsl, "main", "cs_6_6", &[]).unwrap();
+    let dxil_coh_direct = crate::gpu::dxil::kernel::translate_compute(&coh, crate::gpu::dxil::kernel::KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 }, &cs).unwrap().dxil;
+
+    let mem2 = vec![0u32; (0x200 + 512 * 4) / 4];
+    for (tag, dxil) in [("hlsl", &dxil_coh_hlsl), ("direct", &dxil_coh_direct)] {
+        let out = runner::dispatch(dxil, [16, 1, 1], &io, &mem2).unwrap();
+        assert_eq!(out[0x100 / 4], 512, "{tag} coherent cross-group counter");
+        for ticket in 0..512usize {
+            assert_eq!(out[(0x200 + ticket * 4) / 4], ticket as u32, "{tag} coherent ticket={ticket}");
+        }
+    }
 }
 
 #[test]
@@ -9817,148 +11004,6 @@ fn gpu_ps_mask_loop_on_a_primitive_edge_ends() {
     let bad: Vec<(usize, usize, [f32; 4])> = (0..size * size).filter(|&i| px[i][0] != 6.0 || px[i][1] != 6.0).map(|i| (i % size, i / size, px[i])).collect();
     println!("{:?}: lane counts {lanes:?}; {} of {} pixels wrong, first {:?}", runner::adapter(), bad.len(), size * size, bad.iter().take(8).collect::<Vec<_>>());
     assert!(bad.is_empty(), "{} pixels wrong (passes, steps, 1, lane count), first {:?}", bad.len(), &bad[..bad.len().min(8)]);
-}
-
-/// Compute shaders only declare `globallycoherent` on their flat memory windows (`mem`, `mem1`…
-/// and `XCL_HEAP_WINDOWS` heap views) when the program uses cross-workgroup coherence: memory
-/// atomics, `GLC`/`DLC`/`SLC` memory ops, or cache invalidations. Both the HLSL and direct DXIL
-/// backends follow the same predicate.
-#[test]
-fn compute_globallycoherent_only_when_needed() {
-    let cs = super::CsInterface { threads: [64, 1, 1], user_sgprs: 4, tgid: [true, false, false], tg_size: false, tid_components: 1 };
-    let enc = |n: &str, e: &str, f: &[(&str, u64)]| encode(n, e, f, None).unwrap_or_else(|x| panic!("{n}: {x}"));
-    let prog = |insts: &[(&str, &str, &[(&str, u64)])]| {
-        let mut c = Vec::new();
-        for &(n, e, f) in insts {
-            c.extend(enc(n, e, f));
-        }
-        c.extend(enc("S_ENDPGM", "ENC_SOPP", &[]));
-        c
-    };
-
-    // Plain compute: SMEM + MUBUF load/store + LDS + s_barrier, no GLC/DLC/SLC/atomics/inv.
-    let plain = prog(&[
-        ("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 8), ("SBASE", 0), ("OFFSET", 0), ("SOFFSET", 125)]),
-        ("GLOBAL_LOAD_DWORD", "ENC_FLAT_GLBL", &[("VDST", 1), ("ADDR", 0), ("SADDR", 0)]),
-        ("DS_WRITE_B32", "ENC_DS", &[("ADDR", 0), ("DATA0", 1)]),
-        ("S_BARRIER", "ENC_SOPP", &[]),
-        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 0), ("DATA", 1), ("SADDR", 0)]),
-    ]);
-
-    let coherent_cases: Vec<(&str, Vec<u8>)> = vec![
-        ("smem glc", prog(&[("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 8), ("SBASE", 0), ("OFFSET", 0), ("SOFFSET", 125), ("GLC", 1)])])),
-        ("smem dlc", prog(&[("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 8), ("SBASE", 0), ("OFFSET", 0), ("SOFFSET", 125), ("DLC", 1)])])),
-        ("mubuf glc", prog(&[("BUFFER_LOAD_DWORD", "ENC_MUBUF", &[("VDATA", 1), ("VADDR", 0), ("SRSRC", 0), ("SOFFSET", 128), ("GLC", 1)])])),
-        ("global dlc", prog(&[("GLOBAL_LOAD_DWORD", "ENC_FLAT_GLBL", &[("VDST", 1), ("ADDR", 0), ("SADDR", 0), ("DLC", 1)])])),
-        ("mubuf slc", prog(&[("BUFFER_STORE_DWORD", "ENC_MUBUF", &[("VDATA", 1), ("VADDR", 0), ("SRSRC", 0), ("SOFFSET", 128), ("SLC", 1)])])),
-        ("buffer_atomic", prog(&[("BUFFER_ATOMIC_ADD", "ENC_MUBUF", &[("VDATA", 1), ("VADDR", 0), ("SRSRC", 0), ("SOFFSET", 128)])])),
-        ("global_atomic", prog(&[("GLOBAL_ATOMIC_ADD", "ENC_FLAT_GLBL", &[("VDST", 1), ("ADDR", 0), ("DATA", 2), ("SADDR", 0)])])),
-        ("flat_atomic", prog(&[("FLAT_ATOMIC_ADD", "ENC_FLAT", &[("VDST", 1), ("ADDR", 2), ("DATA", 4)])])),
-        ("s_dcache_inv", prog(&[("S_DCACHE_INV", "ENC_SMEM", &[])])),
-        ("s_gl1_inv", prog(&[("S_GL1_INV", "ENC_SMEM", &[])])),
-        ("buffer_gl0_inv", prog(&[("BUFFER_GL0_INV", "ENC_MUBUF", &[])])),
-        ("buffer_gl1_inv", prog(&[("BUFFER_GL1_INV", "ENC_MUBUF", &[])])),
-    ];
-
-    for (windows, heap) in [(1u32, false), (2, false), (2, true)] {
-        let opt = Options { mode: Mode::Compute(cs.clone()), wave64: false, mem_windows: windows, heap_windows: heap, ..Default::default() };
-        let t = translate(&plain, &opt).unwrap();
-        assert!(t.complete(), "{:?}", t.unsupported_why);
-        assert!(!t.hlsl.contains("globallycoherent"), "plain CS (windows={windows}, heap={heap}) must not emit globallycoherent:\n{}", t.hlsl);
-
-        for (label, code) in &coherent_cases {
-            let t = translate(code, &opt).unwrap();
-            assert!(t.complete(), "{label}: {:?}", t.unsupported_why);
-            assert!(t.hlsl.contains("globallycoherent"), "{label} (windows={windows}, heap={heap}) must emit globallycoherent");
-            if heap {
-                assert!(t.hlsl.contains("#define XCL_MW globallycoherent RWByteAddressBuffer"), "{label}: heap window accessor must be globallycoherent");
-            }
-        }
-    }
-
-    // Kernel mode stays non-coherent even with atomics.
-    let k = translate(&coherent_cases[6].1, &Options { mode: Mode::Kernel, wave64: false, ..Default::default() }).unwrap();
-    assert!(!k.hlsl.contains("globallycoherent"), "kernel mode must not emit globallycoherent");
-
-    // Direct DXIL backend: check the IsGloballyCoherent bit (0x4000) in annotateHandle properties
-    // (RAW_BUFFER=11 | IsUAV=0x1000 = 4107 vs RAW_BUFFER=11 | IsUAV=0x1000 | IsGloballyCoherent=0x4000 = 20491).
-    for mw in [1u32, super::HEAP_WINDOWS | 2] {
-        let o = crate::gpu::dxil::kernel::KernelOptions { wave64: false, split: false, mem_windows: mw, sampler_base: 0 };
-        let plain_k = crate::gpu::dxil::kernel::translate_compute(&plain, o, &cs).unwrap();
-        let coh_k = crate::gpu::dxil::kernel::translate_compute(&coherent_cases[6].1, o, &cs).unwrap();
-        if super::dxc::location().is_ok() {
-            let plain_dis = crate::gpu::dxil::validate::disassemble(&plain_k.dxil).unwrap();
-            let coh_dis = crate::gpu::dxil::validate::disassemble(&coh_k.dxil).unwrap();
-            assert!(!plain_dis.contains("i32 20491"), "direct DXIL plain CS (mw={mw:#x}) must not set IsGloballyCoherent:\n{plain_dis}");
-            assert!(coh_dis.contains("i32 20491"), "direct DXIL atomic CS (mw={mw:#x}) must set IsGloballyCoherent:\n{coh_dis}");
-        }
-    }
-}
-
-/// Real GPU check of both non-coherent (cached) and coherent (cross-workgroup atomic + GLC)
-/// compute shaders across HLSL and direct DXIL.
-#[test]
-fn gpu_compute_coherent_and_cached_loads() {
-    if !gpu_ready() {
-        return;
-    }
-    let cs = super::CsInterface { threads: [32, 1, 1], user_sgprs: 2, tgid: [true, false, false], tg_size: false, tid_components: 1 };
-    let enc = |n: &str, e: &str, f: &[(&str, u64)]| encode(n, e, f, None).unwrap_or_else(|x| panic!("{n}: {x}"));
-
-    // 1. Plain cached compute: each thread reads a uniform dword via SMEM (s[0:1] = 0x100) and
-    //    writes (val + group_id * 32 + tid) to mem[0x200 + (group_id * 32 + tid) * 4].
-    let mut plain = Vec::new();
-    plain.extend(enc("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 4), ("SBASE", 0), ("OFFSET", 0), ("SOFFSET", 125)]));
-    plain.extend(enc("S_LSHL_B32", "ENC_SOP2", &[("SDST", 3), ("SSRC0", 2), ("SSRC1", 133)])); // s3 = tgid * 32
-    plain.extend(enc("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 3), ("VSRC1", 0)])); // v1 = tgid * 32 + v0
-    plain.extend(enc("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 4), ("VSRC1", 1)])); // v2 = mem[0x100] + idx
-    plain.extend(enc("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 3), ("SRC0", 130), ("VSRC1", 1)])); // v3 = idx * 4
-    plain.extend(enc("V_MOV_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", 128)]));
-    plain.extend(enc("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 3), ("DATA", 2), ("SADDR", 0x7D), ("OFFSET", 0x200)]));
-    plain.extend(enc("S_ENDPGM", "ENC_SOPP", &[]));
-
-    let t_plain = translate(&plain, &Options { mode: Mode::Compute(cs.clone()), wave64: false, ..Default::default() }).unwrap();
-    assert!(t_plain.complete(), "{:?}", t_plain.unsupported_why);
-    assert!(!t_plain.hlsl.contains("globallycoherent"));
-    let dxil_plain_hlsl = super::dxc::compile(&t_plain.hlsl, "main", "cs_6_6", &[]).unwrap();
-    let dxil_plain_direct = crate::gpu::dxil::kernel::translate_compute(&plain, crate::gpu::dxil::kernel::KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 }, &cs).unwrap().dxil;
-
-    let mut io = vec![0u32; super::KERNEL_SGPRS];
-    io[0] = 0x100;
-    let mut mem = vec![0u32; 0x400 / 4];
-    mem[0x100 / 4] = 0x1234_0000;
-    for (tag, dxil) in [("hlsl", &dxil_plain_hlsl), ("direct", &dxil_plain_direct)] {
-        let out = runner::dispatch(dxil, [4, 1, 1], &io, &mem).unwrap();
-        for idx in 0..128usize {
-            assert_eq!(out[(0x200 + idx * 4) / 4], 0x1234_0000 + idx as u32, "{tag} plain cached idx={idx}");
-        }
-    }
-
-    // 2. Cross-workgroup coherent compute: 16 groups of 32 threads atomically increment a shared
-    //    counter at mem[0x100] and record their returned ticket at mem[0x200 + ticket * 4].
-    let mut coh = Vec::new();
-    coh.extend(enc("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 128)])); // v1 = 0
-    coh.extend(enc("V_MOV_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 129)])); // v2 = 1
-    coh.extend(enc("GLOBAL_ATOMIC_ADD", "ENC_FLAT_GLBL", &[("VDST", 3), ("ADDR", 1), ("DATA", 2), ("SADDR", 0), ("GLC", 1)]));
-    coh.extend(enc("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 4), ("SRC0", 130), ("VSRC1", 3)])); // v4 = ticket * 4
-    coh.extend(enc("V_MOV_B32", "ENC_VOP1", &[("VDST", 5), ("SRC0", 128)]));
-    coh.extend(enc("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 4), ("DATA", 3), ("SADDR", 0x7D), ("OFFSET", 0x200), ("GLC", 1)]));
-    coh.extend(enc("S_ENDPGM", "ENC_SOPP", &[]));
-
-    let t_coh = translate(&coh, &Options { mode: Mode::Compute(cs.clone()), wave64: false, ..Default::default() }).unwrap();
-    assert!(t_coh.complete(), "{:?}", t_coh.unsupported_why);
-    assert!(t_coh.hlsl.contains("globallycoherent"));
-    let dxil_coh_hlsl = super::dxc::compile(&t_coh.hlsl, "main", "cs_6_6", &[]).unwrap();
-    let dxil_coh_direct = crate::gpu::dxil::kernel::translate_compute(&coh, crate::gpu::dxil::kernel::KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 }, &cs).unwrap().dxil;
-
-    let mem2 = vec![0u32; (0x200 + 512 * 4) / 4];
-    for (tag, dxil) in [("hlsl", &dxil_coh_hlsl), ("direct", &dxil_coh_direct)] {
-        let out = runner::dispatch(dxil, [16, 1, 1], &io, &mem2).unwrap();
-        assert_eq!(out[0x100 / 4], 512, "{tag} coherent cross-group counter");
-        for ticket in 0..512usize {
-            assert_eq!(out[(0x200 + ticket * 4) / 4], ticket as u32, "{tag} coherent ticket={ticket}");
-        }
-    }
 }
 
 #[test]

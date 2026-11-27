@@ -46,7 +46,7 @@ pub fn label(pso: usize, shaders: &[(&str, Option<&[u8]>)]) {
     LABELS.lock().unwrap().get_or_insert_with(HashMap::new).insert(pso, text);
 }
 
-fn label_of(pso: usize) -> Option<String> {
+pub(super) fn label_of(pso: usize) -> Option<String> {
     LABELS.lock().unwrap().as_ref()?.get(&pso).cloned()
 }
 
@@ -56,8 +56,11 @@ pub unsafe fn mark_pipeline(list: *mut c_void, pso: usize, bound: usize) {
     if !on() || list.is_null() {
         return;
     }
-    // nothing labelled: a stand-in still building, or a pipeline of PC shaders
-    let text = label_of(bound).unwrap_or_else(|| format!("pipeline {pso:#x} (a stand-in, or not translated)"));
+    // nothing labelled: a stand-in still building (named by what it is being built from), or a
+    // pipeline of PC shaders
+    let text = label_of(bound)
+        .or_else(|| super::pso_async::describe(pso))
+        .unwrap_or_else(|| format!("pipeline {pso:#x} (a stand-in, or not translated)"));
     let first = !MARKS.lock().unwrap().as_ref().and_then(|m| m.get(&(list as usize))).and_then(|r| r.last()).is_some_and(|v| v.iter().any(Option::is_some));
     push(list as usize, Some(text));
     if let Some(l) = ID3D12GraphicsCommandList::from_raw_borrowed(&list) {
@@ -147,6 +150,54 @@ pub fn bound_after(list: usize, history: &[i32], done: usize) -> Vec<String> {
     marks.iter().take(total).skip(n).flatten().cloned().collect()
 }
 
+/// Operations `from..to` of a list's DRED history by name; a marker of XCL's shows as the label
+/// of the pipeline bound from there. From the first operation not done to the list's end it is
+/// what the list was about to run: DRED's count can lag, so the one that faulted is among them.
+pub fn ops(list: usize, history: &[i32], from: usize, to: usize) -> String {
+    let g = MARKS.lock().unwrap();
+    let marks = g.as_ref().and_then(|m| m.get(&list)).and_then(|r| recording_of(r, history));
+    let mut n = markers_before(history, from);
+    let mut out = Vec::new();
+    for &op in history.iter().take(to).skip(from) {
+        if op == D3D12_AUTO_BREADCRUMB_OP_SETMARKER.0 {
+            let label = marks.and_then(|m| m.get(n)).cloned().flatten();
+            n += 1;
+            out.push(label.map_or_else(|| "marker".to_string(), |l| format!("[{l}]")));
+        } else {
+            out.push(op_name(op));
+        }
+    }
+    out.join(" ")
+}
+
+/// A breadcrumb operation by name (D3D12_AUTO_BREADCRUMB_OP), the ones a title's lists hold.
+fn op_name(op: i32) -> String {
+    let name = match op {
+        3 => "Draw",
+        4 => "DrawIndexed",
+        5 => "ExecuteIndirect",
+        6 => "Dispatch",
+        7 => "CopyBufferRegion",
+        8 => "CopyTextureRegion",
+        9 => "CopyResource",
+        10 => "CopyTiles",
+        11 => "ResolveSubresource",
+        12 => "ClearRTV",
+        13 => "ClearUAV",
+        14 => "ClearDSV",
+        15 => "Barrier",
+        18 => "ResolveQueryData",
+        23 | 24 => "AtomicCopy",
+        25 => "ResolveSubresourceRegion",
+        26 => "WriteBufferImmediate",
+        42 => "DispatchMesh",
+        45 => "Barrier2",
+        46 => "Begin",
+        n => return format!("op{n}"),
+    };
+    name.to_string()
+}
+
 /// The label of the pipeline `list` had bound at operation `done` of its DRED history.
 pub fn bound_at(list: usize, history: &[i32], done: usize) -> Option<String> {
     let n = markers_before(history, done);
@@ -208,6 +259,10 @@ mod tests {
         assert_eq!(bound_at(0xdead, &h, 6), None);
         assert_eq!(bound_after(list, &h, 2), vec!["ms b ps c".to_string()]);
         assert_eq!(bound_after(list, &h, 6), Vec::<String>::new());
+        // from the first dispatch on: names, XCL's markers as labels, the title's as "marker"
+        assert_eq!(ops(list, &h, 2, 16), "Dispatch marker Dispatch [ms b ps c] Dispatch");
+        assert_eq!(ops(list, &h, 0, 3), "Begin [cs a] Dispatch");
+        assert_eq!(ops(0xdead, &[46, 0, 42, 99], 0, 16), "Begin marker DispatchMesh op99");
         MARKS.lock().unwrap().as_mut().unwrap().remove(&list);
     }
 }

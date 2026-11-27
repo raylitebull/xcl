@@ -8,6 +8,50 @@ use crate::config::Boot;
 
 pub static HOST_MODE: AtomicBool = AtomicBool::new(false);
 
+/// The system's commit charge and its limit in bytes (RAM plus page files): what all programs'
+/// memory, and all video memory, is counted against. (0, 0): not known.
+pub fn system_commit() -> (u64, u64) {
+    use windows_sys::Win32::System::ProcessStatus::{K32GetPerformanceInfo, PERFORMANCE_INFORMATION};
+    unsafe {
+        let mut p: PERFORMANCE_INFORMATION = std::mem::zeroed();
+        p.cb = std::mem::size_of_val(&p) as u32;
+        if K32GetPerformanceInfo(&mut p, p.cb) == 0 {
+            return (0, 0);
+        }
+        (p.CommitTotal as u64 * p.PageSize as u64, p.CommitLimit as u64 * p.PageSize as u64)
+    }
+}
+
+/// Whether commit left over (`limit - commit`) is logged as low: under `LOW_COMMIT` the first
+/// time, then each time it is half of what was logged last.
+fn low_commit_logged(left: u64, last: u64) -> bool {
+    left < LOW_COMMIT && (last == 0 || left <= last / 2)
+}
+
+/// Commit left under which the log warns: a retail title's world took the last 6 GB in seconds.
+const LOW_COMMIT: u64 = 8 << 30;
+
+/// The system is running out of commit: said in the log (once, then at each halving). When it
+/// runs out, allocations fail for every program. (Measured on a retail title's world, whose
+/// process held 45 GB beside 71 GB of other programs under a 147 GB limit: the process's own
+/// memory counts against the commit, its 24 GB of video memory do not.)
+fn warn_low_commit(commit: u64, limit: u64, private: u64, video: u64) {
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let left = limit.saturating_sub(commit);
+    let last = LAST.load(Ordering::Relaxed);
+    if !low_commit_logged(left, last) {
+        return;
+    }
+    LAST.store(left.max(1), Ordering::Relaxed);
+    crate::xlog_warn!(
+        "memory: the system is running out of commit: {} MB left of {} MB (RAM + page file). This process holds {} MB (and {} MB of video memory, which do not count), other programs the rest. When it runs out allocations fail for every program: close other programs or give Windows a larger page file",
+        left >> 20,
+        limit >> 20,
+        private >> 20,
+        video >> 20
+    );
+}
+
 pub fn host_main(boot_path: &Path) -> i32 {
     let boot: Boot = match std::fs::read_to_string(boot_path).map_err(|e| e.to_string()).and_then(|s| serde_json::from_str(&s).map_err(|e| e.to_string())) {
         Ok(b) => b,
@@ -56,6 +100,10 @@ pub fn host_main(boot_path: &Path) -> i32 {
                 [p, e, d, x, f[0], f[1], f[2], f[3], r, b >> 20, fail]
             };
             let mut last = snap();
+            let mut cost = crate::hle::api_cost::totals();
+            let mut own_cost = crate::hle::api_cost::submitter_totals();
+            let mut views = crate::hle::d3d12x::view_want::totals();
+            let mut tile_calls = crate::hle::d3d12x::sparse::tile_calls();
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(2));
                 let now = snap();
@@ -64,6 +112,41 @@ pub fn host_main(boot_path: &Path) -> i32 {
                     "activity (2 s): {} presents, {} submits, {} draws, {} dispatches, {} frame-event waits ({} timed out), {} frame statistics ({} not flipped); DirectStorage {} requests, {} MB, {} failed",
                     d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8], d[9], d[10]
                 );
+                // the time the title's threads spent in some of XCL's calls
+                let line = |spent: &[(u64, u64)], before: &[(u64, u64)]| -> Vec<String> {
+                    crate::hle::api_cost::CALLS
+                        .iter()
+                        .zip(spent.iter().zip(before))
+                        .filter(|(_, (n, o))| n.0 > o.0)
+                        .map(|(c, (n, o))| format!("{} {} in {} ms", n.0 - o.0, c.1, (n.1 - o.1) / 1000))
+                        .collect()
+                };
+                let spent = crate::hle::api_cost::totals();
+                let calls = line(&spent, &cost);
+                cost = spent;
+                if !calls.is_empty() {
+                    crate::xlog_info!("calls (2 s, all threads): {}", calls.join(", "));
+                }
+                // `XCL_LOOK_STATS=2`: those of the thread that submits, its submits and presents
+                // with them: the time of its frames, added up
+                let spent = crate::hle::api_cost::submitter_totals();
+                let calls = line(&spent, &own_cost);
+                own_cost = spent;
+                if !calls.is_empty() {
+                    crate::xlog_info!("calls of the submitting thread (2 s): {}", calls.join(", "));
+                }
+                // the addresses in its GPU view the title gave the GPU, by the path they took
+                let asked = crate::hle::d3d12x::view_want::totals();
+                if let Some(line) = crate::hle::d3d12x::view_want::line(&asked, &views) {
+                    crate::xlog_info!("GPU view (2 s): {line}");
+                }
+                views = asked;
+                // the sparse queue's UpdateTileMappings calls and tiles, by kind of window
+                let mappings = crate::hle::d3d12x::sparse::tile_calls();
+                if let Some(line) = crate::hle::d3d12x::sparse::tile_calls_line(&mappings, &tile_calls) {
+                    crate::xlog_info!("tile mappings (2 s): {line}");
+                }
+                tile_calls = mappings;
                 // where the memory is: the process's commit, video memory, and XCL's parts of it
                 let private = unsafe {
                     use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX};
@@ -72,13 +155,22 @@ pub fn host_main(boot_path: &Path) -> i32 {
                     K32GetProcessMemoryInfo(windows_sys::Win32::System::Threading::GetCurrentProcess(), &mut c as *mut _ as *mut _, c.cb);
                     c.PrivateUsage
                 };
-                let (local, non_local) = crate::hle::d3d12x::real::video_memory().unwrap_or((0, 0));
+                let (local, non_local, budget) = crate::hle::d3d12x::real::video_memory().unwrap_or((0, 0, 0));
                 let (arenas, arenas_made) = crate::hle::d3d12x::vram::arena_bytes();
                 let (pools, pools_mapped) = crate::hle::d3d12x::sparse::pool_bytes();
                 let (pages, page_pools) = crate::hle::d3d12x::vram::page_bytes();
                 let mb = |b: u64| b >> 20;
+                // (at the end: tools read the line's beginning; the guard script reads the budget)
+                let mut budget_text = if budget != 0 { format!("; video memory budget {} MB", mb(budget)) } else { String::new() };
+                // the system's commit: this process's memory counts against it with every other
+                // program's (video memory does not), and where it ends allocations fail
+                let (commit, commit_limit) = system_commit();
+                if commit_limit != 0 {
+                    budget_text += &format!("; system commit {} of {} MB", mb(commit), mb(commit_limit));
+                    warn_low_commit(commit, commit_limit, private as u64, local);
+                }
                 crate::xlog_info!(
-                    "memory: {} MB committed by the process; video memory {} MB local, {} MB non-local; target pages {} MB (pools {} MB); arenas {} MB in use, {} MB made; sparse pools {} MB ({} MB mapped)",
+                    "memory: {} MB committed by the process; video memory {} MB local, {} MB non-local; target pages {} MB (pools {} MB); arenas {} MB in use, {} MB made; sparse pools {} MB ({} MB mapped){budget_text}",
                     mb(private as u64),
                     mb(local),
                     mb(non_local),
@@ -89,6 +181,15 @@ pub fn host_main(boot_path: &Path) -> i32 {
                     mb(pools as u64),
                     mb(pools_mapped as u64)
                 );
+                if pages != 0 {
+                    crate::xlog_info!("{}", crate::hle::d3d12x::vram::page_owners());
+                }
+                // past the budget Windows moves the process's video memory off the card and
+                // every frame pays for bringing it back; a run at the card's limit is also
+                // where the driver gave up (the guard script ends a run that stays there)
+                if let Some(over) = crate::hle::d3d12x::real::over_video_budget(local, budget) {
+                    crate::xlog_warn!("video memory: {} MB in use, {} MB over the budget of {} MB Windows gives this process", mb(local), mb(over), mb(budget));
+                }
                 last = now;
             }
         });
@@ -163,4 +264,25 @@ pub fn host_main(boot_path: &Path) -> i32 {
     crate::report::write_final(None);
     crate::log::flush();
     code as i32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn low_commit_is_logged_under_the_mark_and_at_each_halving() {
+        assert!(!low_commit_logged(LOW_COMMIT, 0), "at the mark: not yet");
+        assert!(low_commit_logged(LOW_COMMIT - 1, 0));
+        assert!(!low_commit_logged(5 << 30, 7 << 30), "less, but not half of what was logged last");
+        assert!(low_commit_logged(3 << 30, 7 << 30));
+        assert!(low_commit_logged(0, 1), "none left");
+        assert!(!low_commit_logged(9 << 30, 1 << 30), "back above the mark");
+    }
+
+    #[test]
+    fn the_system_commit_is_known_and_under_its_limit() {
+        let (commit, limit) = system_commit();
+        assert!(commit > 0 && commit <= limit, "{commit} of {limit}");
+    }
 }

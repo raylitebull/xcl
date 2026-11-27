@@ -93,6 +93,38 @@ fn translation_is_byte_identical_across_runs_and_threads() {
     }
 }
 
+/// A group barrier in a compute group of several hardware waves is not translated here: the
+/// plain barrier waits for waves that have left (the GPU hangs on NVIDIA), and only the HLSL
+/// path has the barrier that counts the waves still there.
+#[test]
+fn a_group_barrier_of_several_hardware_waves_is_left_to_the_hlsl_path() {
+    // (`XCL_SAFE_BARRIER=0`: the plain group barrier in both translators)
+    if !crate::gpu::recomp::emit::safe_barrier_wanted() {
+        return;
+    }
+    let code = prog(&[("S_BARRIER", "ENC_SOPP", &[], None)]);
+    let o = |wave64, split| KernelOptions { wave64, split, mem_windows: 1, sampler_base: 0 };
+    let cs = |threads| CsInterface { threads, user_sgprs: 4, tgid: [true, false, false], tg_size: false, tid_components: 1 };
+    // 16 x 16 threads: 8 hardware waves in the split form, 4 native 64-lane ones, 8 of a
+    // 32-lane program; and the two 32-lane halves of one console wave
+    for (wave64, split, threads) in [(true, true, [16, 16, 1]), (true, false, [16, 16, 1]), (false, false, [16, 16, 1]), (true, true, [64, 1, 1])] {
+        let e = kernel::translate_compute(&code, o(wave64, split), &cs(threads)).err().unwrap_or_else(|| panic!("translated: wave64 {wave64}, split {split}, {threads:?}"));
+        assert!(e.contains("s_barrier in a group of several hardware waves"), "{e}");
+    }
+    // one hardware wave has nobody to wait for: translated as before
+    kernel::translate_compute(&code, o(true, false), &cs([64, 1, 1])).expect("one 64-lane wave");
+    kernel::translate_compute(&code, o(false, false), &cs([32, 1, 1])).expect("one 32-lane wave");
+    // (the kernel form of the tests is no thread group of a title's: its barrier stays)
+    kernel::translate(&code, o(true, true)).expect("kernel");
+    // a mesh program's compute pass: two console waves a group, as a retail title's
+    let ms = |threads| crate::gpu::recomp::MsInterface { outputs: vec![el("SV_Position", 0, 1, 3, 0, 0xF)], threads, max_vertices: 64, max_primitives: 64 };
+    for split in [true, false] {
+        let e = kernel::translate_mesh(&code, o(true, split), &ms(128)).err().unwrap_or_else(|| panic!("a mesh pass translated (split {split})"));
+        assert!(e.contains("s_barrier in a group of several hardware waves"), "{e}");
+    }
+    kernel::translate_mesh(&code, o(true, false), &ms(64)).expect("a mesh pass of one 64-lane wave");
+}
+
 // ---- builder misuse: recorded as the first error, finish fails instead of panicking
 
 use super::container::Stage;

@@ -38,6 +38,9 @@ const IID_GRAPHICS_COMMAND_LIST: GUID = GUID::from_u128(0x5b160d0f_ac1b_4185_8ba
 const IID_PIPELINE_STATE: GUID = GUID::from_u128(0x765a30f3_f624_4c6f_a828_ace948622445);
 /// D3D12_INDIRECT_ARGUMENT_TYPE of the console's DispatchX
 const XBOX_ARG_DISPATCH_X: u32 = 105;
+/// D3D12_INDIRECT_ARGUMENT_TYPE of the console's DispatchMesh (a UE5 title's mesh dispatch
+/// signature: this one argument, stride 16)
+const XBOX_ARG_DISPATCH_MESH_X: u32 = 107;
 
 fn guid_bytes(g: &GUID) -> (u32, u16, u16, [u8; 8]) {
     (g.data1, g.data2, g.data3, g.data4)
@@ -117,6 +120,7 @@ unsafe fn create_list(this: *mut c_void, node: u32, ty: u32, alloc: usize, pso: 
     if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() && !super::console_list::enabled() {
         super::bind::reset(*ppv, alloc, pso);
         *ppv = super::title_list::wrap(*ppv);
+        super::capture::list_begin(*ppv as usize, pso);
     }
     hr
 }
@@ -1090,12 +1094,16 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
     if desc.is_null() || ppv.is_null() || !crate::gpu::shader::readable(desc as usize, 0x38) {
         return E_INVALIDARG;
     }
+    let mut cost = crate::hle::api_cost::time(crate::hle::api_cost::Call::PlacedTexture);
     // the PC's reserved resource and tile mappings for it can take long where the console's
     // placement takes no time (`pso_async::title_held`)
     let _in_pc = super::pso_async::pc_call();
     let x: [u8; 0x38] = (desc as *const [u8; 0x38]).read_unaligned();
     let d = pc_resource_desc_for_device(this, &x);
     let buffer = u32::from_le_bytes(d[0..4].try_into().unwrap()) == D3D12_RESOURCE_DIMENSION_BUFFER.0 as u32;
+    if buffer {
+        cost.call = crate::hle::api_cost::Call::PlacedBuffer;
+    }
     note_alias(va as usize, &x);
     // console-only state bits (Unicorn Overlord's 4K display target: 0x100000) are not the
     // PC's: the PC refused the resource (E_INVALIDARG) and the title threw
@@ -1131,6 +1139,8 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
                         super::title_textures::retire_overlapping(va as usize, bytes as usize);
                     }
                     real::note_title_address(*ppv as usize, va as usize);
+                    super::depth_uav::note_created(*ppv, &x, Some(va as usize), state);
+                    super::lut3d::created("CreatePlacedResourceX (GPU-owned: on the title's pages / an arena)", *ppv, Some(&x), Some(va as usize), false, state);
                 }
                 return hr;
             }
@@ -1150,6 +1160,8 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
         match super::title_textures::register(this, *ppv, va as usize, &x, D3D12_RESOURCE_STATES(state as i32)) {
             Ok(()) => {
                 real::note_title_address(*ppv as usize, va as usize);
+                super::depth_uav::note_created(*ppv, &x, Some(va as usize), state);
+                super::lut3d::created(if placed_hr.is_some() { "CreatePlacedResourceX (sampled: on shared pages)" } else { "CreatePlacedResourceX (sampled: committed)" }, *ppv, Some(&x), Some(va as usize), true, state);
                 return hr;
             }
             Err(e) if once(&M, 4) => {
@@ -1165,6 +1177,10 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
     }
     if hr >= 0 && !(*ppv).is_null() {
         real::note_title_address(*ppv as usize, va as usize);
+        if !buffer {
+            super::depth_uav::note_created(*ppv, &x, Some(va as usize), state);
+            super::lut3d::created("CreatePlacedResourceX (a resource of its own: not kept in step)", *ppv, Some(&x), Some(va as usize), false, state);
+        }
     }
     if hr < 0 || once(&N, 4) {
         let w = |o: usize| u32::from_le_bytes(x[o..o + 4].try_into().unwrap());
@@ -1234,8 +1250,32 @@ pub(super) unsafe extern "system" fn get_copyable_footprints_x(
     }
 }
 
-/// device #41 CreateCommandSignature(desc, root signature, riid, signature): the console's
-/// DispatchX argument (105) is a PC Dispatch; the root signature only goes with arguments
+/// The PC argument type of a console one: DispatchX (105) is a PC Dispatch, DispatchMeshX (107)
+/// a PC DispatchMesh (the PC refuses both console types: debug layer 743, "Unexpected
+/// parameter type"); the others are the PC's own.
+fn pc_argument_type(t: u32) -> u32 {
+    match t {
+        XBOX_ARG_DISPATCH_X => D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH.0 as u32,
+        XBOX_ARG_DISPATCH_MESH_X => D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH.0 as u32,
+        t => t,
+    }
+}
+
+fn indirect_arg_bytes(arg: &[u32; 4]) -> u32 {
+    match arg[0] {
+        0 => 16,
+        1 => 20,
+        2 | 10 => 12,
+        3 | 4 => 16,
+        5 => arg[3].saturating_mul(4),
+        6..=8 => 8,
+        9 => 108,
+        _ => 0,
+    }
+}
+
+/// device #41 CreateCommandSignature(desc, root signature, riid, signature): console argument
+/// types become the PC's (`pc_argument_type`); the root signature only goes with arguments
 /// that need one (constants, CBV / SRV / UAV)
 pub(super) unsafe extern "system" fn create_command_signature_x(this: *mut c_void, desc: *const u8, root: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     if desc.is_null() || ppv.is_null() {
@@ -1247,18 +1287,45 @@ pub(super) unsafe extern "system" fn create_command_signature_x(this: *mut c_voi
     let args = u64::from_le_bytes(pc[8..16].try_into().unwrap()) as *const [u32; 4];
     let mut list: Vec<[u32; 4]> = if args.is_null() || n > 64 { Vec::new() } else { (0..n).map(|i| args.add(i).read_unaligned()).collect() };
     for a in list.iter_mut() {
-        if a[0] == XBOX_ARG_DISPATCH_X {
-            a[0] = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH.0 as u32;
-        }
+        a[0] = pc_argument_type(a[0]);
     }
     let needs_root = list.iter().any(|a| (5..=8).contains(&a[0]));
     pc[8..16].copy_from_slice(&(if list.is_empty() { 0 } else { list.as_ptr() as u64 }).to_le_bytes());
     let hr = real::dev_create_command_signature(this, pc.as_ptr() as usize, if needs_root { root } else { 0 }, riid, ppv);
-    if hr >= 0 && !ppv.is_null() && needs_root {
-        super::bind::note_root_changing_signature(*ppv as usize);
+    if hr < 0 {
+        crate::xlog_warn!(
+            "D3D12.X: CreateCommandSignature stride {} node mask {:#x} root {root:#x} arguments {:?} → {hr:#x}",
+            u32::from_le_bytes(pc[0..4].try_into().unwrap()),
+            u32::from_le_bytes(pc[16..20].try_into().unwrap()),
+            list
+        );
+    }
+    if hr >= 0 && !ppv.is_null() {
+        // noted at every creation, so a signature made at a freed one's address does not keep
+        // its companion
+        super::bind::forget_dispatch_mesh_signature(*ppv as usize);
+        if needs_root {
+            super::bind::note_root_changing_signature(*ppv as usize);
+        } else if let Some(idx) = list.iter().position(|a| a[0] == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH.0 as u32) {
+            let offset: u32 = list[..idx].iter().map(indirect_arg_bytes).sum();
+            let byte_stride = u32::from_le_bytes(pc[0..4].try_into().unwrap());
+            let mut dispatch_list = list.clone();
+            dispatch_list[idx][0] = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH.0 as u32;
+            let mut dpc = pc;
+            dpc[8..16].copy_from_slice(&(dispatch_list.as_ptr() as u64).to_le_bytes());
+            let mut companion: *mut c_void = std::ptr::null_mut();
+            let hr2 = real::dev_create_command_signature(this, dpc.as_ptr() as usize, 0, riid, &mut companion);
+            if hr2 >= 0 && !companion.is_null() {
+                super::bind::note_dispatch_mesh_signature(*ppv as usize, companion as usize, byte_stride, offset);
+            }
+        }
     }
     if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
         super::bind::note_signature_dispatches(*ppv as usize, list.iter().any(|a| a[0] == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH.0 as u32));
+        super::indirect_guard::note_signature(*ppv as usize, &list.iter().map(|a| a[0] as i32).collect::<Vec<_>>());
+        if super::capture::enabled() {
+            super::capture::note_signature(*ppv as usize, u32::from_le_bytes(pc[0..4].try_into().unwrap()), &list.iter().map(|a| a[0] as i32).collect::<Vec<_>>());
+        }
     }
     hr
 }
@@ -1266,6 +1333,15 @@ pub(super) unsafe extern "system" fn create_command_signature_x(this: *mut c_voi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn console_indirect_argument_types_become_pc_ones() {
+        assert_eq!(pc_argument_type(105), D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH.0 as u32);
+        assert_eq!(pc_argument_type(107), D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH.0 as u32);
+        for t in 0..=10 {
+            assert_eq!(pc_argument_type(t), t, "PC type {t} stays");
+        }
+    }
 
     #[test]
     fn console_types_and_descs_become_pc_ones() {

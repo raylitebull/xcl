@@ -224,6 +224,39 @@ fn make_reducible(blocks: &mut Vec<CfgBlock>) -> Result<(Vec<usize>, BTreeSet<us
     }
 }
 
+/// The loop directly around each loop header of a reducible `cfg` (None: an outermost loop).
+/// A header's loop is its header and every block that reaches one of its back edges (an edge
+/// into it from a block at or after it in `rpo`) without passing the header; the loop around
+/// it is the smallest other loop that holds its header.
+pub fn loop_parents(cfg: &Cfg) -> BTreeMap<usize, Option<usize>> {
+    let n = cfg.blocks.len();
+    let mut pos = vec![usize::MAX; n];
+    for (i, &b) in cfg.rpo.iter().enumerate() {
+        pos[b] = i;
+    }
+    let body = |h: usize| {
+        let mut inside = vec![false; n];
+        inside[h] = true;
+        let mut stack: Vec<usize> = cfg.blocks[h].preds.iter().copied().filter(|&p| pos[p] != usize::MAX && pos[p] >= pos[h]).collect();
+        while let Some(x) = stack.pop() {
+            if !inside[x] {
+                inside[x] = true;
+                stack.extend(cfg.blocks[x].preds.iter().copied());
+            }
+        }
+        inside
+    };
+    let loops: Vec<(usize, Vec<bool>)> = cfg.headers.iter().map(|&h| (h, body(h))).collect();
+    let size = |b: &[bool]| b.iter().filter(|&&x| x).count();
+    loops
+        .iter()
+        .map(|&(h, _)| {
+            let around = loops.iter().filter(|(g, b)| *g != h && b[h]).min_by_key(|(g, b)| (size(b), pos[*g])).map(|&(g, _)| g);
+            (h, around)
+        })
+        .collect()
+}
+
 fn succ_of(b: &CfgBlock) -> Vec<usize> {
     match b.term {
         Term::Jump(t) => vec![t],
@@ -345,5 +378,71 @@ mod tests {
         assert_eq!(b.len(), 6);
         assert_eq!(headers.len(), 1);
         assert_eq!(headers2.len(), 1);
+    }
+
+    /// A reducible `Cfg` of `blocks` (no instructions), as `Cfg::build` finishes one.
+    fn cfg_of(mut blocks: Vec<CfgBlock>) -> Cfg {
+        let (rpo, headers) = make_reducible(&mut blocks).unwrap();
+        for &b in &rpo {
+            for t in succ_of(&blocks[b]) {
+                if !blocks[t].preds.contains(&b) {
+                    blocks[t].preds.push(b);
+                }
+            }
+        }
+        Cfg { insts: Vec::new(), blocks, rpo, headers }
+    }
+
+    fn parents(blocks: Vec<CfgBlock>) -> Vec<(usize, Option<usize>)> {
+        loop_parents(&cfg_of(blocks)).into_iter().collect()
+    }
+
+    use Term::{Cond, End, Jump};
+
+    #[test]
+    fn loop_parents_of_one_loop_and_of_loops_one_after_the_other() {
+        // 0 → 1 → 2 → {1 | 3}
+        assert_eq!(parents(vec![blk(Jump(1)), blk(Jump(2)), blk(Cond(0, 1, 3)), blk(End)]), [(1, None)]);
+        // 0 → 1 ⟲, 1 → 2 → 3 ⟲, 3 → 4
+        assert_eq!(parents(vec![blk(Jump(1)), blk(Cond(0, 1, 2)), blk(Jump(3)), blk(Cond(0, 3, 4)), blk(End)]), [(1, None), (3, None)]);
+    }
+
+    #[test]
+    fn loop_parents_of_loops_inside_one_another() {
+        // 1 → 2 ⟲, 2 → 3 → {1 | 4}
+        assert_eq!(parents(vec![blk(Jump(1)), blk(Jump(2)), blk(Cond(0, 2, 3)), blk(Cond(0, 1, 4)), blk(End)]), [(1, None), (2, Some(1))]);
+        // three deep: 3 ⟲ inside 2 … 4 inside 1 … 5
+        let deep = vec![blk(Jump(1)), blk(Jump(2)), blk(Jump(3)), blk(Cond(0, 3, 4)), blk(Cond(0, 2, 5)), blk(Cond(0, 1, 6)), blk(End)];
+        assert_eq!(parents(deep), [(1, None), (2, Some(1)), (3, Some(2))]);
+    }
+
+    /// Both back edges make the loop: each of 3 → 1 and 5 → 1 has an inner loop (2 ⟲, 4 ⟲) only
+    /// on its own path, so a body of either back edge alone leaves one of them outermost.
+    #[test]
+    fn loop_parents_of_a_loop_with_two_back_edges() {
+        let b = vec![blk(Jump(1)), blk(Cond(0, 2, 4)), blk(Cond(0, 2, 3)), blk(Jump(1)), blk(Cond(0, 4, 5)), blk(Cond(0, 1, 6)), blk(End)];
+        assert_eq!(parents(b), [(1, None), (2, Some(1)), (4, Some(1))]);
+    }
+
+    /// A loop entered in the middle, after `make_reducible` split it (0 → {3 | 1}, 1 → 2's copy,
+    /// cycle 2 → 3 → {2 | 4}): one loop, at 3.
+    #[test]
+    fn loop_parents_of_a_split_loop() {
+        let b = vec![blk(Cond(0, 3, 1)), blk(Jump(2)), blk(Jump(3)), blk(Cond(0, 2, 4)), blk(End)];
+        assert_eq!(parents(b), [(3, None)]);
+    }
+
+    /// The outer body enters the inner loop 4 from two blocks (2 and 3).
+    #[test]
+    fn loop_parents_of_a_loop_entered_from_two_blocks() {
+        let b = vec![blk(Jump(1)), blk(Cond(0, 2, 3)), blk(Jump(4)), blk(Jump(4)), blk(Cond(0, 4, 5)), blk(Cond(0, 1, 6)), blk(End)];
+        assert_eq!(parents(b), [(1, None), (4, Some(1))]);
+    }
+
+    /// The program's first block is the outer loop's header.
+    #[test]
+    fn loop_parents_of_a_loop_at_the_entry() {
+        let b = vec![blk(Jump(1)), blk(Cond(0, 1, 2)), blk(Cond(0, 0, 3)), blk(End)];
+        assert_eq!(parents(b), [(0, None), (1, Some(0))]);
     }
 }

@@ -109,6 +109,23 @@ unsafe extern "system" fn unhandled_filter(info: *const EXCEPTION_POINTERS) -> i
             modules::describe_address(addr)
         );
         crate::xlog_error!("{msg}");
+        // what happened lately at the title pages the registers point into
+        if !ctx.is_null() {
+            let c = &*ctx;
+            let mut seen: Vec<usize> = Vec::new();
+            for (n, v) in [("rax", c.Rax), ("rbx", c.Rbx), ("rcx", c.Rcx), ("rdx", c.Rdx), ("rsi", c.Rsi), ("rdi", c.Rdi), ("rbp", c.Rbp), ("r8", c.R8), ("r9", c.R9), ("r10", c.R10), ("r11", c.R11), ("r12", c.R12), ("r13", c.R13), ("r14", c.R14), ("r15", c.R15)] {
+                let p = v as usize;
+                if p < 0x1_0000 || seen.contains(&(p & !0xFFFF)) {
+                    continue;
+                }
+                seen.push(p & !0xFFFF);
+                let d = crate::hle::kernelx::pagelog::describe(p);
+                if !d.is_empty() {
+                    crate::xlog_error!("page of {n}={p:#x}: {d}");
+                }
+            }
+            crate::xlog_error!("page events so far: {}", crate::hle::kernelx::pagelog::counts());
+        }
         crate::report::write_final(Some(msg));
         crate::log::flush();
     }
@@ -176,6 +193,116 @@ pub fn find_gs_check(code: &[u8]) -> Option<usize> {
         }
     }
     None
+}
+
+/// The CPU has CLZERO (CPUID 8000_0008h, EBX bit 0): AMD's since Zen, no Intel CPU.
+pub fn cpu_has_clzero() -> bool {
+    static HAS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *HAS.get_or_init(|| unsafe {
+        std::arch::x86_64::__cpuid(0x8000_0000).eax >= 0x8000_0008 && std::arch::x86_64::__cpuid(0x8000_0008).ebx & 1 != 0
+    })
+}
+
+/// The code of a CLZERO loop's stand-in for a CPU without CLZERO, entered by a `call` in the
+/// loop's place: `[rax & !63 .. )` zeroed in whole lines up to `end_reg`, at least one line, rax
+/// and the flags left as the loop's last `add rax, 0x40; cmp rax, <end_reg>` leaves them. No
+/// other register changes.
+fn clzero_loop_thunk(end_reg: u8) -> Vec<u8> {
+    let r = end_reg & 15;
+    let mut c: Vec<u8> = vec![0x57, 0x51, 0x50]; // push rdi; push rcx; push rax
+    c.extend_from_slice(&[0x48 | (r >> 3), 0x8B, 0xC8 | (r & 7)]); // mov rcx, <end_reg>
+    c.extend_from_slice(&[0x48, 0x89, 0xC7]); // mov rdi, rax
+    c.extend_from_slice(&[0x48, 0x83, 0xE7, 0xC0]); // and rdi, -64
+    c.extend_from_slice(&[0x48, 0x29, 0xC1]); // sub rcx, rax
+    c.extend_from_slice(&[0x76, 0x0A]); // jbe one
+    c.extend_from_slice(&[0x48, 0x83, 0xC1, 0x3F]); // add rcx, 63
+    c.extend_from_slice(&[0x48, 0xC1, 0xE9, 0x06]); // shr rcx, 6
+    c.extend_from_slice(&[0xEB, 0x05]); // jmp go
+    c.extend_from_slice(&[0xB9, 0x01, 0x00, 0x00, 0x00]); // one: mov ecx, 1
+    c.extend_from_slice(&[0x48, 0xC1, 0xE1, 0x06]); // go: shl rcx, 6
+    c.extend_from_slice(&[0x48, 0x01, 0x0C, 0x24]); // add [rsp], rcx (the rax to leave)
+    c.extend_from_slice(&[0x31, 0xC0]); // xor eax, eax
+    c.extend_from_slice(&[0xF3, 0xAA]); // rep stosb
+    c.extend_from_slice(&[0x58, 0x59, 0x5F]); // pop rax; pop rcx; pop rdi
+    c.extend_from_slice(&[0x48 | ((r >> 3) << 2), 0x39, 0xC0 | ((r & 7) << 3)]); // cmp rax, <end_reg>
+    c.push(0xC3); // ret
+    c
+}
+
+/// Executable memory a `call rel32` at `site` reaches (64 KiB, committed), made in the first free
+/// place above it. None: none within 1 GiB.
+unsafe fn code_near(site: usize) -> Option<usize> {
+    use windows_sys::Win32::System::Memory::{VirtualAlloc, MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READWRITE};
+    let mut at = (site + 0x1_0000) & !0xFFFF;
+    while at - site < 0x4000_0000 {
+        let p = VirtualAlloc(at as *const std::ffi::c_void, 0x1_0000, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE) as usize;
+        if p != 0 {
+            return Some(p);
+        }
+        at += 0x1_0000;
+    }
+    None
+}
+
+/// Executable memory `[at, at + len)` of a title image on a CPU without CLZERO: each
+/// `clzero; add rax, 0x40; cmp rax, <reg>; jb` loop (`insn::ConsoleOnly::ClzeroLoop`, 12 bytes)
+/// becomes a call of a stand-in that zeroes the same lines (`clzero_loop_thunk`).
+/// `XCL_CLZERO_PATCH=0` leaves the loops as they are. The patched loops.
+///
+/// Left alone, every run of such a loop is an illegal-instruction exception that
+/// `emulate_console_only` answers: a retail title's memset is such a loop, and while its world
+/// loaded one of its threads was in that exception at every look (thread dumps at 300, 360 and
+/// 400 s of several runs on an Intel CPU), with the GPU measured at 0.2 to 0.5 s of work in world
+/// frames of 17 to 43 s.
+pub unsafe fn patch_clzero_loops(at: usize, len: usize, image: &str) -> usize {
+    use windows_sys::Win32::System::Memory::{VirtualProtect, PAGE_EXECUTE_READWRITE};
+    if len < 12 || std::env::var("XCL_CLZERO_PATCH").is_ok_and(|v| v.trim() == "0") {
+        return 0;
+    }
+    let code = std::slice::from_raw_parts(at as *const u8, len);
+    let sites: Vec<(usize, u8)> = (0..len - 11)
+        .filter(|&i| code[i] == 0x0F && code[i + 1] == 0x01 && code[i + 2] == 0xFC && (i == 0 || code[i - 1] != 0x67))
+        .filter_map(|i| match crate::insn::decode(&code[i..i + 12]) {
+            // (rsp is no end of a loop: the stand-in's pushes move it)
+            Some((crate::insn::ConsoleOnly::ClzeroLoop { end_reg }, 12)) if end_reg != 4 => Some((i, end_reg)),
+            _ => None,
+        })
+        .collect();
+    if sites.is_empty() {
+        return 0;
+    }
+    let Some(arena) = code_near(at + len) else {
+        crate::xlog_warn!("{image}: {} CLZERO loops stay emulated (no executable memory near the image)", sites.len());
+        return 0;
+    };
+    // one stand-in for each end register
+    let mut thunks = [0usize; 16];
+    let mut next = arena;
+    let mut done = 0;
+    for &(i, reg) in &sites {
+        if thunks[reg as usize] == 0 {
+            let t = clzero_loop_thunk(reg);
+            std::ptr::copy_nonoverlapping(t.as_ptr(), next as *mut u8, t.len());
+            thunks[reg as usize] = next;
+            next += (t.len() + 15) & !15;
+        }
+        let site = at + i;
+        let Ok(rel) = i32::try_from(thunks[reg as usize] as i64 - (site as i64 + 5)) else { continue };
+        let mut patch = [0xE8u8, 0, 0, 0, 0, 0x0F, 0x1F, 0x80, 0, 0, 0, 0]; // call thunk; nop (7 bytes)
+        patch[1..5].copy_from_slice(&rel.to_le_bytes());
+        let mut old = 0u32;
+        if VirtualProtect(site as *const std::ffi::c_void, 12, PAGE_EXECUTE_READWRITE, &mut old) == 0 {
+            continue;
+        }
+        std::ptr::copy_nonoverlapping(patch.as_ptr(), site as *mut u8, 12);
+        VirtualProtect(site as *const std::ffi::c_void, 12, old, &mut old);
+        done += 1;
+    }
+    if done != 0 {
+        windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache(windows_sys::Win32::System::Threading::GetCurrentProcess(), at as *const std::ffi::c_void, len);
+        crate::xlog_info!("{image}: {done} CLZERO loops run as native code on this CPU, which has no CLZERO (XCL_CLZERO_PATCH=0: emulated, one exception a loop)");
+    }
+    done
 }
 
 /// Executable memory `[at, at + len)` of a title image: its `__report_gsfailure` (the target of
@@ -1044,6 +1171,41 @@ mod tests {
         assert_eq!(cmp_eflags(0x202, 0, 1), 0x202 | 0x001 | 0x004 | 0x010 | 0x080);
         // signed overflow: i64::MIN - 1 = i64::MAX (0xFF -> PF=1, AF=1, OF=1, CF=0, SF=0)
         assert_eq!(cmp_eflags(0x202, 0x8000_0000_0000_0000, 1), 0x202 | 0x004 | 0x010 | 0x800);
+    }
+
+    /// A CLZERO loop patched for a CPU without CLZERO (`patch_clzero_loops`) zeroes the same
+    /// lines and leaves rax, the flags and every other register as the loop does.
+    #[test]
+    fn a_patched_clzero_loop_zeroes_whole_lines_and_keeps_registers() {
+        unsafe {
+            // clzero; add rax, 0x40; cmp rax, r10; jb -12; setb cl (the flags, seen); ret
+            let code = crate::stubs::alloc_code(64);
+            let bytes = [0x0Fu8, 0x01, 0xFC, 0x48, 0x83, 0xC0, 0x40, 0x4C, 0x39, 0xD0, 0x72, 0xF4, 0x0F, 0x92, 0xC1, 0xC3];
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), code, bytes.len());
+            assert_eq!(patch_clzero_loops(code as usize, bytes.len(), "test"), 1);
+            assert_eq!(*code, 0xE8, "a call in the loop's place");
+            let run = |start: usize, end: usize| -> (usize, usize, usize, usize) {
+                let (rax, rcx, rdi, rdx): (usize, usize, usize, usize);
+                std::arch::asm!("call {f}", f = in(reg) code, inout("rax") start => rax, in("r10") end, inout("rcx") 0xAA00usize => rcx, inout("rdi") 0x1111usize => rdi, inout("rdx") 0x2222usize => rdx);
+                (rax, rcx, rdi, rdx)
+            };
+            #[repr(align(64))]
+            struct Lines([u8; 64 * 6]);
+            let mut m = Lines([0xEE; 64 * 6]);
+            let base = m.0.as_mut_ptr() as usize;
+            // from the middle of line 1 to the middle of line 3: two passes (rax reaches the end
+            // after the second), the lines 1 and 2 whole
+            let (rax, rcx, rdi, rdx) = run(base + 64 + 8, base + 64 * 3 + 8);
+            assert_eq!(rax, base + 64 * 3 + 8);
+            assert_eq!(rcx, 0xAA00, "rcx is the caller's but for cl: rax is not below the end");
+            assert_eq!((rdi, rdx), (0x1111, 0x2222), "no other register changes");
+            assert!(m.0[..64].iter().all(|&b| b == 0xEE) && m.0[64..64 * 3].iter().all(|&b| b == 0) && m.0[64 * 3..].iter().all(|&b| b == 0xEE));
+            // end at or before the start: one line, as the loop's first pass
+            m.0.fill(0xEE);
+            let (rax, _, _, _) = run(base + 64 * 2, base + 64);
+            assert_eq!(rax, base + 64 * 3);
+            assert!(m.0[..64 * 2].iter().all(|&b| b == 0xEE) && m.0[64 * 2..64 * 3].iter().all(|&b| b == 0) && m.0[64 * 3..].iter().all(|&b| b == 0xEE));
+        }
     }
 
     #[test]

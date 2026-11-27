@@ -51,11 +51,12 @@ SGPRs of both halves and the tests fail if they ever differ.
 
 ### Synchronisation
 
-* **One console wave per group** (≤ 64 threads: kernel mode, most compute, ES+GS):
-  `GroupMemoryBarrierWithGroupSync` between writing and reading the slot. All hardware
-  waves of the group are the two halves of the same console wave, which execute the same
-  sequence of exchanges, so every barrier is reached by both. Portable (no forward-progress
-  assumption) and cheap.
+* **One console wave per group** (≤ 64 threads), now only in kernel mode (the tests), with
+  `XCL_WAVE64_SPIN=0` in the HLSL path and in the direct translator's ES phase with
+  `XCL_SAFE_BARRIER=0`: `GroupMemoryBarrierWithGroupSync` between writing and reading the
+  slot. All hardware waves of the group are the two halves of the same console wave, which
+  execute the same sequence of exchanges, so every barrier is reached by both. Portable (no
+  forward-progress assumption) and cheap, but such barriers hung NVIDIA GPUs (#1727).
 * **Several console waves per group** (mesh: 128 threads, compute > 64 threads): a group
   barrier would also wait for the *other* console waves, whose control flow may differ (wave
   index, per-wave data). Each pair instead meets through groupshared arrival counters:
@@ -69,8 +70,10 @@ SGPRs of both halves and the tests fail if they ever differ.
   pair – should not happen, see hazards), the wave stops exchanging (`xcl_x_dead`) and
   finishes with half-local values instead of hanging the GPU until a TDR. This relies on
   co-resident waves of one group making progress, which holds on GPUs (all waves of a group
-  are resident on one SM / CU) but not necessarily on WARP. `XCL_WAVE64_SPIN=1` forces this
-  variant everywhere (the test suite passes with it too).
+  are resident on one SM / CU) but not necessarily on WARP. Both translators use this variant
+  by default for one console wave per group too; `XCL_WAVE64_SPIN=0` forces the group barrier
+  for groups of one console wave in the HLSL path only (the direct translator always spins for
+  compute and mesh).
 
 A console wave whose upper half does not exist (group of 32 or 96 threads) exchanges with
 nobody: the missing lanes count as inactive (ballot bits 0), exactly as on the console. The

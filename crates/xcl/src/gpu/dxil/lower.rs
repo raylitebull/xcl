@@ -25,15 +25,22 @@ pub const VAR_BUDGET: u32 = 128 + 256;
 pub const VAR_FP16_RM: u32 = VAR_BUDGET + 1;
 /// the memory window the next access uses (`xcl_w`)
 pub const VAR_WIN: u32 = VAR_BUDGET + 2;
-/// split form, several console waves per group: exchanges so far, and the "partner never
-/// arrived" flag (`xcl_xk`, `xcl_x_dead`)
+/// split form, the spin exchange (compute and mesh groups): exchanges so far, and the "partner
+/// never arrived" flag (`xcl_xk`, `xcl_x_dead`)
 pub const VAR_XK: u32 = VAR_BUDGET + 3;
 pub const VAR_XDEAD: u32 = VAR_BUDGET + 4;
+/// split form: LDS written since the halves last met (the recompiler's `xcl_x_lw`, `Lw::lds_in_order`)
+pub const VAR_XLW: u32 = VAR_BUDGET + 6;
 /// `tw0 + 1` of the last image store / atomic through the k-th T# of `Lw::img_writes` (16
 /// slots; the recompiler's `xcl_iw{srsrc}`)
 pub const VAR_IMG_WRITE: u32 = VAR_BUDGET + 8;
-/// loop iterations a lane may run (the recompiler's `xcl_budget`)
+/// loop iterations a lane may run (the recompiler's `xcl_budget`). The plain form of a compute
+/// program also counts each entry of a loop (`VAR_LOOP_PASSES`, `kernel::loop_passes`); the
+/// compact form (`compact`) and the per-lane form (`recomp::lower_dxil`) keep this budget alone.
 pub const LOOP_BUDGET: u32 = 1 << 16;
+/// the passes left to the current entry of the loop whose header is CFG block `b`:
+/// `VAR_LOOP_PASSES + b` (above the temporaries and `reload::VAR_RELOAD`'s variables)
+pub const VAR_LOOP_PASSES: u32 = 1 << 30;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dst {
@@ -64,6 +71,10 @@ pub struct MeshCtx {
     pub rec: Value,
     pub vtx: Value,
     pub prm: Value,
+    /// this thread has a vertex slot / a primitive slot in the record (its index is below the
+    /// record's `max_vertices` / `max_primitives`): a thread past either exports nothing
+    pub vok: Value,
+    pub pok: Value,
     pub outputs: Vec<crate::gpu::dxbc::SigElement>,
 }
 
@@ -118,7 +129,7 @@ impl Init {
         if var == super::lower_round::VAR_F32_MODE {
             return s.m.i32c(super::lower_round::MODE_INIT);
         }
-        if var == VAR_FP16_RM || var == VAR_WIN || var == VAR_XK || var == VAR_XDEAD || (VAR_IMG_WRITE..VAR_IMG_WRITE + 16).contains(&var) {
+        if var == VAR_FP16_RM || var == VAR_WIN || var == VAR_XK || var == VAR_XDEAD || var == VAR_XLW || (VAR_IMG_WRITE..VAR_IMG_WRITE + 16).contains(&var) {
             return s.m.i32c(0);
         }
         if var >= super::lower_mem::VAR_TMP {
@@ -153,7 +164,8 @@ impl Init {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Partner {
     Present,
-    /// several console waves per group: the halves pair up through arrival counters
+    /// a compute or mesh group (one console wave or several): the halves pair up through
+    /// arrival counters
     Spin,
     Missing,
     Unsupported(&'static str),
@@ -190,6 +202,11 @@ pub struct Lw {
     pub res: Option<RawUav>,
     /// the buffer format table (`FMT_INFO`), created on first use
     pub fmt_table: Option<Value>,
+    /// constant data after the program in the code region (`recomp::Options::rodata`:
+    /// (address from the program's start, dwords)) and its table, created on first use
+    /// (`rodata_loads`)
+    pub rodata: Vec<(u32, Vec<u32>)>,
+    pub rodata_table: Option<Value>,
     /// cached decoded format descriptors hoisted to `d3`'s defining block
     pub fmt_desc_cache: HashMap<(Value, Option<u32>), super::lower_mem::FmtDesc>,
     /// cached single-component format decode parameters hoisted to `d3`'s defining block
@@ -226,10 +243,16 @@ pub struct Lw {
     pub xw: Option<(super::ops::GroupShared, u32)>,
     /// arrival counters of the spin exchange (two per console wave)
     pub xc: Option<(super::ops::GroupShared, u32)>,
+    /// hardware waves of a compute or mesh thread group (None: another kind of entry), as the
+    /// HLSL emitter's `compute_or_mesh_hw_waves`
+    pub barrier_waves: Option<u32>,
     /// console waves per group, this thread's console wave and its partner half's lanes
     pub waves: u32,
     pub cw: Value,
     pub xn: Value,
+    /// a compute program whose lanes outside the launch EXEC have left (`kernel::compute_gate`):
+    /// that EXEC (lo, hi), every running lane's bit of which is set
+    pub live_exec: Option<(Value, Value)>,
     /// words per half in an exchange
     pub xslot: u32,
     /// the program's LDS (`xcl_lds`, 8192 dwords) and its last usable dword
@@ -264,6 +287,9 @@ pub struct Lw {
     /// when it is never read whole. Set by a caller that reads back only each lane's own bit
     /// (the per-lane form's bridge), so no exchange meets the other half.
     pub local_masks: bool,
+    /// split form: the program writes LDS (`recomp::emit::writes_lds`), so its LDS reads and
+    /// atomics keep the console wave's order (`VAR_XLW`)
+    pub writes_lds: bool,
 }
 
 impl Lw {
@@ -1016,7 +1042,21 @@ impl Lw {
     fn sopp(&mut self, d: &Decoded, name: &str) -> LResult<()> {
         match name {
             "s_barrier" => {
+                // A compute or mesh group of several hardware waves: this barrier waits for
+                // every one of them at a barrier, and a console wave that has left – s_endpgm
+                // behind a branch around the barrier, the loop budget – or that ran one barrier
+                // fewer never arrives. On the console the waves left go on; on NVIDIA they wait
+                // for ever and the GPU hangs (`recomp::emit::PRELUDE_SAFE_BARRIER`). A retail
+                // title's mesh programs all have it: the first wave of a group whose vertex or
+                // primitive count is 0 runs a barrier the other waves branch around, then the
+                // one they all run. The HLSL path counts the waves still there
+                // (`xcl_s_barrier`): such a program is left to it.
+                if self.barrier_waves.is_some_and(|w| w > 1) && crate::gpu::recomp::emit::safe_barrier_wanted() {
+                    return err(d, "s_barrier in a group of several hardware waves");
+                }
                 self.s.barrier(super::ops::barrier::GROUP_SYNC);
+                // (split form: both halves made their LDS writes before it)
+                self.lds_met();
                 Ok(())
             }
             "s_round_mode" => {
@@ -1305,8 +1345,11 @@ impl Lw {
             return err(d, "indirect branch");
         }
         if name == "s_getpc_b64" {
+            // the code region is addressed from 0 – with constant data after the program and
+            // several memory windows, above them all (`rodata_loads`), as the HLSL kernel
             let pc = d.pc + d.len as u64;
-            let (lo, hi) = (self.c(pc as u32), self.c(0));
+            let code_hi = if self.rodata.is_empty() || !self.windowed() { 0 } else { crate::gpu::recomp::CODE_ADDRESS_HI };
+            let (lo, hi) = (self.c(pc as u32), self.c(code_hi));
             self.write64(&dst, lo, hi);
             return Ok(());
         }

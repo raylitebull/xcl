@@ -22,8 +22,9 @@
 //!   3×4 as in D3D12_RAYTRACING_INSTANCE_DESC; @112..127 zero.
 //!
 //! The console builder reports sizes for exactly these node sizes plus 4 bytes of parent
-//! pointers per 64 bytes of nodes (`tests/console_dlls_e2e.rs`); where those pointers live is
-//! unknown and no shader seen reads them, so they are not written.
+//! pointers per 64 bytes of nodes (`tests/console_dlls_e2e.rs`). A title's traversal loop reads
+//! the parent of node `n` (when its short stack runs out) at the dword
+//! `base + 4·((n >> 3) − (header@52 >> 6 − header@56 >> 2))`; the builder here does not write them.
 //!
 //! Top-down build: median split of the leaf box centroids on the longest axis, twice per box
 //! node (4 children), one triangle / instance per leaf.
@@ -118,6 +119,15 @@ pub fn build_top(instances: &[Instance]) -> Bvh {
         INSTANCE
     };
     Builder { data: Vec::new(), bounds, leaf_bytes: INSTANCE_BYTES, leaf: &leaf }.finish()
+}
+
+/// A structure no ray hits: its root a box32 node with no child (a top or bottom level alike).
+pub fn empty() -> Bvh {
+    let mut data = vec![0; HEADER_BYTES + BOX_BYTES];
+    let root = (HEADER_BYTES / 8) as u32 | BOX32;
+    put(&mut data, ROOT_AT, &[root]);
+    put(&mut data, HEADER_BYTES, &[INVALID; 4]);
+    Bvh { data, root }
 }
 
 fn put(out: &mut [u8], at: usize, words: &[u32]) {
@@ -419,6 +429,250 @@ impl Bvh {
     }
 }
 
+/// The tiles a walk reports what it reached in (`Reach::tiles`): a GPU view's (64 KiB)
+pub const WALK_TILE: u64 = 0x1_0000;
+/// node offsets and parent pointers further than this from a structure's base are not followed
+const WALK_SPAN: u64 = 2 << 30;
+/// tiles a walk keeps read (64 MiB): more and they are read again
+const WALK_CACHE: usize = 1024;
+/// root ids followed into one bottom level (besides its header's)
+const WALK_ROOTS: usize = 8;
+
+/// How far a walk of the title's structures goes: it reads memory the title may be writing.
+#[derive(Clone, Copy, Debug)]
+pub struct Limits {
+    /// nodes of one structure
+    pub nodes: u64,
+    /// nodes of a top level and its bottom levels
+    pub scene_nodes: u64,
+    /// bytes read in a walk (whole tiles)
+    pub bytes: u64,
+    /// distinct bottom levels of a top level
+    pub bottoms: usize,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Limits { nodes: 4 << 20, scene_nodes: 32 << 20, bytes: 2 << 30, bottoms: 1 << 16 }
+    }
+}
+
+/// What a traversal can read of one structure, found by walking it from its root(s).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Reach {
+    pub base: u64,
+    /// nodes reached (box, triangle, instance)
+    pub nodes: u64,
+    /// [first, end) byte of the header and the nodes reached (whole nodes)
+    pub span: (u64, u64),
+    /// [first, end) byte of the parent pointers of the nodes reached; None: header @52 and @56
+    /// are 0, no parent array
+    pub parents: Option<(u64, u64)>,
+    /// the `WALK_TILE` tiles of all of it, as (address, bytes) runs
+    pub tiles: Vec<(u64, u64)>,
+    /// why the walk left something out
+    pub cut: Option<&'static str>,
+}
+
+/// A top level and the bottom levels its instance nodes reach (`walk_scene`).
+#[derive(Debug, Default)]
+pub struct Scene {
+    pub top: Reach,
+    /// the bottom levels walked (those `walk_scene`'s `walk` asked for), by address
+    pub bottoms: Vec<Reach>,
+    /// every distinct bottom-level address of an instance node reached, ascending
+    pub referenced: Vec<u64>,
+    /// the first thing any walk left out
+    pub cut: Option<&'static str>,
+}
+
+/// The title's memory as a walk reads it: whole tiles, a few kept; a tile that cannot be read
+/// whole is read for the bytes asked only.
+struct Mem<'r> {
+    read: &'r mut dyn FnMut(u64, &mut [u8]) -> bool,
+    tiles: std::collections::HashMap<u64, Option<Box<[u8]>>>,
+    bytes: u64,
+    nodes: u64,
+    lim: Limits,
+}
+
+/// a read refused: `Err(true)` the byte cap, `Err(false)` memory that cannot be read
+type Got = Result<(), bool>;
+
+impl Mem<'_> {
+    fn get(&mut self, at: u64, out: &mut [u8]) -> Got {
+        let end = at.checked_add(out.len() as u64).ok_or(false)?;
+        let mut p = at;
+        while p < end {
+            let t = p & !(WALK_TILE - 1);
+            let n = (end.min(t.saturating_add(WALK_TILE)) - p) as usize;
+            let dst = &mut out[(p - at) as usize..][..n];
+            if !self.tiles.contains_key(&t) {
+                if self.bytes >= self.lim.bytes {
+                    return Err(true);
+                }
+                if self.tiles.len() >= WALK_CACHE {
+                    self.tiles.clear();
+                }
+                self.bytes += WALK_TILE;
+                let mut b = vec![0u8; WALK_TILE as usize].into_boxed_slice();
+                let whole = t.checked_add(WALK_TILE).is_some() && (self.read)(t, &mut b);
+                self.tiles.insert(t, whole.then_some(b));
+            }
+            match &self.tiles[&t] {
+                Some(b) => dst.copy_from_slice(&b[(p - t) as usize..][..n]),
+                None => {
+                    self.bytes += n as u64;
+                    if !(self.read)(p, dst) {
+                        return Err(false);
+                    }
+                }
+            }
+            p += n as u64;
+        }
+        Ok(())
+    }
+}
+
+/// `[at, at + len)`'s tiles onto `tiles` (indices)
+fn touch(tiles: &mut Vec<u64>, at: u64, len: u64) {
+    for t in at / WALK_TILE..=(at + len - 1) / WALK_TILE {
+        if tiles.last() != Some(&t) {
+            tiles.push(t);
+        }
+    }
+}
+
+/// Every node the traversal can reach from the header's root and `roots`, once each (a visited
+/// set: no loop, whatever the bytes say). `top`: box and instance nodes (whose (bottom-level
+/// address, root) go to `found`); else box and triangle nodes.
+fn walk(mem: &mut Mem, base: u64, roots: &[u32], top: bool, found: &mut Vec<(u64, u32)>) -> Reach {
+    let mut r = Reach { base, span: (base, base), ..Default::default() };
+    let mut hdr = [0u8; HEADER_BYTES];
+    if base.checked_add(WALK_SPAN).is_none() || mem.get(base, &mut hdr).is_err() {
+        r.cut = Some("header unreadable");
+        return r;
+    }
+    let mut tiles = Vec::new();
+    touch(&mut tiles, base, HEADER_BYTES as u64);
+    r.span.1 = base + HEADER_BYTES as u64;
+    // the parent of node n at base + 4·(n / 64 − shift)
+    let (h52, h56) = (word(&hdr, 52), word(&hdr, 56));
+    let shift = (h52 != 0 || h56 != 0).then(|| (h52 >> 6) as i64 - (h56 >> 2) as i64);
+    let mut parents: Option<(u64, u64)> = None;
+    let mut seen: Vec<u64> = Vec::new();
+    let mut stack = vec![word(&hdr, ROOT_AT)];
+    stack.extend(roots.iter().rev());
+    let mut node = [0u8; 128];
+    while let Some(n) = stack.pop() {
+        if n == INVALID {
+            continue;
+        }
+        let ty = n & 7;
+        let (size, kind) = match ty {
+            BOX32 => (128, true),
+            4 => (64, true),
+            INSTANCE => (128, top),
+            0..=3 => (64, !top),
+            _ => (0, false),
+        };
+        let off = node_at(n) as u64;
+        if !kind || off < HEADER_BYTES as u64 || off + size > WALK_SPAN {
+            r.cut = r.cut.or(Some("bad node id"));
+            continue;
+        }
+        let k = (off / 64) as usize;
+        if seen.len() <= k / 64 {
+            seen.resize(k / 64 + 1, 0);
+        }
+        if seen[k / 64] & 1 << (k % 64) != 0 {
+            continue;
+        }
+        if r.nodes >= mem.lim.nodes || mem.nodes >= mem.lim.scene_nodes {
+            r.cut = Some("node cap");
+            break;
+        }
+        seen[k / 64] |= 1 << (k % 64);
+        let at = base + off;
+        let b = &mut node[..size as usize];
+        match mem.get(at, b) {
+            Ok(()) => {}
+            Err(true) => {
+                r.cut = Some("byte cap");
+                break;
+            }
+            Err(false) => {
+                r.cut = r.cut.or(Some("node unreadable"));
+                continue;
+            }
+        }
+        let b: &[u8] = b;
+        r.nodes += 1;
+        mem.nodes += 1;
+        r.span = (r.span.0.min(at), r.span.1.max(at + size));
+        touch(&mut tiles, at, size);
+        if let Some(s) = shift {
+            let d = 4 * ((off / 64) as i64 - s);
+            match base.checked_add_signed(d).filter(|_| d.unsigned_abs() <= WALK_SPAN) {
+                Some(p) => {
+                    parents = Some(parents.map_or((p, p + 4), |(lo, hi)| (lo.min(p), hi.max(p + 4))));
+                    touch(&mut tiles, p, 4);
+                }
+                None => r.cut = r.cut.or(Some("parent pointer out of range")),
+            }
+        }
+        match ty {
+            BOX32 | 4 => stack.extend((0..4).rev().map(|c| word(b, 4 * c)).filter(|&c| c != INVALID)),
+            INSTANCE => {
+                let (root, addr) = (word(b, 56) & 0x3FFF_FFFF, (word(b, 60) as u64) << 8);
+                if addr != 0 && root != 0x3FFF_FFFF {
+                    found.push((addr, root));
+                }
+            }
+            _ => {}
+        }
+    }
+    r.parents = parents;
+    tiles.sort_unstable();
+    tiles.dedup();
+    for t in tiles {
+        match r.tiles.last_mut() {
+            Some((a, n)) if *a + *n == t * WALK_TILE => *n += WALK_TILE,
+            _ => r.tiles.push((t * WALK_TILE, WALK_TILE)),
+        }
+    }
+    r
+}
+
+/// What a ray traversal can read of the top level at `base` and of the bottom levels its
+/// instance nodes reach, through `read` (copies `out.len()` bytes at an address; false when any
+/// of them cannot be read). A bottom level is walked when `walk(address)` says so (one known
+/// already need not be). Never more than `lim`; what was left out is in the `cut`s.
+pub fn walk_scene(read: &mut dyn FnMut(u64, &mut [u8]) -> bool, base: u64, lim: &Limits, walk_bottom: &mut dyn FnMut(u64) -> bool) -> Scene {
+    let mut mem = Mem { read, tiles: Default::default(), bytes: 0, nodes: 0, lim: *lim };
+    let mut found = Vec::new();
+    let top = walk(&mut mem, base, &[], true, &mut found);
+    let mut s = Scene { cut: top.cut, top, ..Default::default() };
+    found.sort_unstable();
+    found.dedup();
+    for g in found.chunk_by(|a, b| a.0 == b.0) {
+        if s.referenced.len() >= lim.bottoms {
+            s.cut = s.cut.or(Some("bottom-level cap"));
+            break;
+        }
+        let addr = g[0].0;
+        s.referenced.push(addr);
+        if !walk_bottom(addr) {
+            continue;
+        }
+        let roots: Vec<u32> = g.iter().take(WALK_ROOTS).map(|x| x.1).collect();
+        let b = walk(&mut mem, addr, &roots, false, &mut Vec::new());
+        s.cut = s.cut.or(b.cut);
+        s.bottoms.push(b);
+    }
+    s
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -592,6 +846,194 @@ pub(crate) mod tests {
         assert!(is_compressed_header(&compressed));
         assert!(!is_compressed_header(&rehydrated));
         assert!(!is_compressed_header(&[]));
+    }
+
+    /// The empty structure: a ray right through its (zero) bounds reaches no child, as a top or
+    /// a bottom level.
+    #[test]
+    fn the_empty_structure_has_nothing_to_hit() {
+        let e = empty();
+        assert_eq!(word(&e.data, ROOT_AT), e.root);
+        let (o, d) = ([-1.0, 0.0, 0.0], [1.0, 0.0, 0.0]);
+        assert_eq!(intersect_node(&e.data, e.root, 100.0, o, d, d.map(|x| 1.0 / x), true), [INVALID; 4]);
+        assert_eq!(e.trace(o, d, 100.0), None);
+        assert_eq!(e.trace_scene(&|_| None, o, d, 100.0), None);
+        let s = walk_scene(&mut space(&[(TOP_AT, e.data.clone())]), TOP_AT, &Limits::default(), &mut |_| true);
+        assert_eq!((s.top.nodes, s.referenced.len(), s.cut), (1, 0, None));
+    }
+
+    /// An address space of `regions` (address, bytes): a read inside one of them only.
+    fn space(regions: &[(u64, Vec<u8>)]) -> impl FnMut(u64, &mut [u8]) -> bool + '_ {
+        move |a, out| {
+            let r = regions.iter().find(|(at, d)| a >= *at && a + out.len() as u64 <= at + d.len() as u64);
+            r.map(|(at, d)| out.copy_from_slice(&d[(a - at) as usize..][..out.len()])).is_some()
+        }
+    }
+
+    /// whole tiles over `[at, at + len)`
+    fn tiles_of(at: u64, len: u64) -> Vec<(u64, u64)> {
+        let lo = at & !(WALK_TILE - 1);
+        vec![(lo, (at + len).next_multiple_of(WALK_TILE) - lo)]
+    }
+
+    /// `n` instances spread over bottom levels at `blas`
+    fn top_over(blas: &[(u64, Bvh)], n: usize) -> Bvh {
+        let mut r = rng(5);
+        let instances: Vec<Instance> = (0..n)
+            .map(|i| {
+                let (addr, b) = &blas[i % blas.len()];
+                let t = [r(-50.0, 50.0), r(-50.0, 50.0), r(-50.0, 50.0)];
+                let m = [0, 1, 2].map(|row| [(row == 0) as u32 as f32, (row == 1) as u32 as f32, (row == 2) as u32 as f32, t[row]]);
+                Instance { transform: m, id: i as u32, mask: 0xFF, contribution: 0, flags: 0, blas_address: *addr, blas_root: b.root, blas_bounds: b.bounds() }
+            })
+            .collect();
+        build_top(&instances)
+    }
+
+    const TOP_AT: u64 = 0x20_0000_0000;
+
+    fn walk_all(regions: &[(u64, Vec<u8>)], lim: &Limits) -> Scene {
+        walk_scene(&mut space(regions), TOP_AT, lim, &mut |_| true)
+    }
+
+    /// box + leaf nodes of a structure from the builder here (every node reachable)
+    fn node_count(b: &Bvh, leaf: usize, leaves: usize) -> u64 {
+        (leaves + (b.data.len() - HEADER_BYTES - leaf * leaves) / BOX_BYTES) as u64
+    }
+
+    /// A top level of 600 instances (over 64 KiB) over 3 bottom levels, one of them neither at
+    /// nor a whole number of tiles: the walk reaches exactly each structure's bytes and tiles.
+    #[test]
+    fn walk_reaches_exactly_the_top_level_and_each_bottom_level() {
+        let sizes = [30, 200, 1500];
+        let addrs = [0x10_0000_0000u64, 0x10_0040_0000, 0x10_0081_2300];
+        let blas: Vec<(u64, Bvh)> = (0..3).map(|k| (addrs[k], build(&random_tris(sizes[k], 40 + k as u64), 0))).collect();
+        let top = top_over(&blas, 600);
+        assert!(top.data.len() > 0x1_0000, "{} bytes", top.data.len());
+        let mut regions: Vec<(u64, Vec<u8>)> = blas.iter().map(|(a, b)| (*a, b.data.clone())).collect();
+        regions[0].1.resize(0x1_0000, 0); // a whole tile: read whole
+        regions.push((TOP_AT, top.data.clone()));
+        let s = walk_all(&regions, &Limits::default());
+        assert_eq!(s.cut, None);
+        let len = top.data.len() as u64;
+        assert_eq!(s.top.span, (TOP_AT, TOP_AT + len));
+        assert_eq!(s.top.nodes, node_count(&top, INSTANCE_BYTES, 600));
+        assert_eq!(s.top.tiles, tiles_of(TOP_AT, len));
+        assert_eq!(s.top.parents, None, "header @52 / @56 0: no parent array");
+        assert_eq!(s.referenced, addrs);
+        for (k, b) in s.bottoms.iter().enumerate() {
+            let (a, built) = &blas[k];
+            let len = built.data.len() as u64;
+            assert_eq!((b.base, b.span, b.cut), (*a, (*a, *a + len), None), "bottom level {k}");
+            assert_eq!(b.nodes, node_count(built, TRI_BYTES, sizes[k]), "bottom level {k}");
+            assert_eq!(b.tiles, tiles_of(*a, len), "bottom level {k}");
+        }
+        // a bottom level known already is not walked again, still referenced
+        let s2 = walk_scene(&mut space(&regions), TOP_AT, &Limits::default(), &mut |a| a != addrs[1]);
+        assert_eq!((s2.referenced.len(), s2.bottoms.len()), (3, 2));
+    }
+
+    /// An instance's bottom level that cannot be read is left out and said so; the others are not.
+    #[test]
+    fn walk_leaves_out_an_unreadable_bottom_level() {
+        let good = build(&random_tris(50, 3), 0);
+        let blas = [(0x10_0000_0000u64, good), (0x30_0000_0000, build(&random_tris(5, 4), 0))];
+        let top = top_over(&blas, 8);
+        let regions = vec![(blas[0].0, blas[0].1.data.clone()), (TOP_AT, top.data.clone())];
+        let s = walk_all(&regions, &Limits::default());
+        assert_eq!(s.referenced, [0x10_0000_0000, 0x30_0000_0000]);
+        assert_eq!(s.cut, Some("header unreadable"));
+        assert_eq!((s.bottoms[0].nodes, s.bottoms[0].cut), (node_count(&blas[0].1, TRI_BYTES, 50), None));
+        assert_eq!((s.bottoms[1].nodes, s.bottoms[1].tiles.len(), s.bottoms[1].cut), (0, 0, Some("header unreadable")));
+        assert_eq!(s.top.nodes, node_count(&top, INSTANCE_BYTES, 8));
+    }
+
+    /// A box pointing back at the root (or twice at one child) is walked once.
+    #[test]
+    fn walk_visits_a_node_once_in_a_cycle() {
+        let blas = [(0x10_0000_0000u64, build(&random_tris(5, 4), 0))];
+        let mut top = top_over(&blas, 3);
+        assert_eq!(word(&top.data, HEADER_BYTES + 12), INVALID);
+        put(&mut top.data, HEADER_BYTES + 12, &[top.root]);
+        let regions = vec![(blas[0].0, blas[0].1.data.clone()), (TOP_AT, top.data.clone())];
+        let s = walk_all(&regions, &Limits::default());
+        assert_eq!((s.top.nodes, s.top.cut), (4, None));
+        let first = word(&top.data, HEADER_BYTES);
+        put(&mut top.data, HEADER_BYTES + 12, &[first]);
+        let regions = vec![(blas[0].0, blas[0].1.data.clone()), (TOP_AT, top.data.clone())];
+        assert_eq!(walk_all(&regions, &Limits::default()).top.nodes, 4);
+    }
+
+    /// A root that is no node of a top level (a triangle, an unknown type, inside the header,
+    /// too far, not there) gives no node, and says why.
+    #[test]
+    fn walk_refuses_a_garbage_root() {
+        let blas = [(0x10_0000_0000u64, build(&random_tris(5, 4), 0))];
+        let top = top_over(&blas, 3);
+        let cases = [(0x7u32 | (HEADER_BYTES as u32 / 8), "bad node id"), (HEADER_BYTES as u32 / 8, "bad node id"), (0x10 | BOX32, "bad node id"), (0x4000_0000 | BOX32, "bad node id"), (0x10_0000 | BOX32, "node unreadable")];
+        for (root, why) in cases {
+            let mut data = top.data.clone();
+            put(&mut data, ROOT_AT, &[root]);
+            let regions = vec![(blas[0].0, blas[0].1.data.clone()), (TOP_AT, data)];
+            let s = walk_all(&regions, &Limits::default());
+            assert_eq!((s.top.nodes, s.top.cut, s.referenced.len()), (0, Some(why), 0), "root {root:#x}");
+            assert_eq!(s.top.tiles, tiles_of(TOP_AT, HEADER_BYTES as u64), "the header only");
+        }
+    }
+
+    /// Memory that ends inside the structure: the nodes before it, and said so.
+    #[test]
+    fn walk_stops_at_truncated_memory() {
+        let blas = [(0x10_0000_0000u64, build(&random_tris(5, 4), 0))];
+        let top = top_over(&blas, 600);
+        let half = top.data.len() / 2 + 0x40;
+        let regions = vec![(blas[0].0, blas[0].1.data.clone()), (TOP_AT, top.data[..half].to_vec())];
+        let s = walk_all(&regions, &Limits::default());
+        assert_eq!(s.top.cut, Some("node unreadable"));
+        assert!(s.top.nodes > 100 && s.top.nodes < node_count(&top, INSTANCE_BYTES, 600), "{} nodes", s.top.nodes);
+        assert!(s.top.span.1 <= TOP_AT + half as u64);
+        assert_eq!(s.referenced, [blas[0].0]);
+    }
+
+    /// The node, scene and byte caps end a walk with what it found.
+    #[test]
+    fn walk_stops_at_its_caps() {
+        let blas = [(0x10_0000_0000u64, build(&random_tris(300, 4), 0))];
+        let top = top_over(&blas, 600);
+        let regions = vec![(blas[0].0, blas[0].1.data.clone()), (TOP_AT, top.data.clone())];
+        let s = walk_all(&regions, &Limits { nodes: 10, ..Default::default() });
+        assert_eq!((s.top.nodes, s.top.cut), (10, Some("node cap")));
+        let all = node_count(&top, INSTANCE_BYTES, 600);
+        let s = walk_all(&regions, &Limits { scene_nodes: all + 7, ..Default::default() });
+        assert_eq!((s.top.nodes, s.bottoms[0].nodes, s.cut), (all, 7, Some("node cap")));
+        let s = walk_all(&regions, &Limits { bytes: WALK_TILE, ..Default::default() });
+        assert_eq!(s.top.cut, Some("byte cap"));
+        assert!(s.top.span.1 <= TOP_AT + WALK_TILE);
+        let s = walk_all(&regions, &Limits { bottoms: 0, ..Default::default() });
+        assert_eq!((s.referenced.len(), s.cut), (0, Some("bottom-level cap")));
+    }
+
+    /// The parent pointer of every node reached, at header@52 / @56's place: before the nodes
+    /// here (in the tile before the structure's); one too far is left out, without overflow.
+    #[test]
+    fn walk_reaches_the_parent_pointers() {
+        let blas = [(0x10_0000_0000u64, build(&random_tris(5, 4), 0))];
+        let mut top = top_over(&blas, 600);
+        let last = (top.data.len() - INSTANCE_BYTES) as u64 / 64;
+        // shift = 0x40_0000 >> 6 − 0x40 >> 2 = 65520: the pointers from 4·(4 − 65520) on
+        put(&mut top.data, 52, &[0x40_0000, 0x40]);
+        let regions = vec![(blas[0].0, blas[0].1.data.clone()), (TOP_AT, top.data.clone())];
+        let s = walk_all(&regions, &Limits::default());
+        let p = |k: u64| TOP_AT - 4 * (65520 - k);
+        assert_eq!(s.top.parents, Some((p(4), p(last) + 4)));
+        assert_eq!(s.top.cut, None);
+        let len = top.data.len() as u64;
+        assert_eq!(s.top.tiles, [tiles_of(p(4), p(last) + 4 - p(4)), tiles_of(TOP_AT, len)].concat());
+        put(&mut top.data, 52, &[0, 0xFFFF_FFFC]);
+        let regions = vec![(blas[0].0, blas[0].1.data.clone()), (TOP_AT, top.data.clone())];
+        let s = walk_all(&regions, &Limits::default());
+        assert_eq!((s.top.parents, s.top.cut), (None, Some("parent pointer out of range")));
+        assert_eq!(s.top.tiles, tiles_of(TOP_AT, len));
     }
 
     #[test]

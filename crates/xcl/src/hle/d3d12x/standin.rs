@@ -46,7 +46,9 @@ struct Shared {
 impl Drop for Shared {
     fn drop(&mut self) {
         unsafe {
-            unref(self.pipeline);
+            // (lists in flight may bind it: it goes once the queues are past them, as XCL's other
+            // pipelines do – `late_release::hold_pipeline`)
+            let_go(self.pipeline);
             if self.root_signature != 0 {
                 unref(self.root_signature);
             }
@@ -55,6 +57,16 @@ impl Drop for Shared {
 }
 
 static SHARED: Mutex<Option<HashMap<Key, Weak<Shared>>>> = Mutex::new(None);
+
+/// A driver pipeline no shell stands on any more is let go (its reference is taken over).
+fn let_go(pipeline: usize) {
+    // (a test keeps what would be held, on its own thread)
+    #[cfg(test)]
+    if tests::LET_GO.with(|l| l.borrow_mut().as_mut().map(|v| v.push(pipeline)).is_some()) {
+        return;
+    }
+    super::late_release::hold_pipeline(pipeline);
+}
 
 unsafe fn method(obj: usize, slot: usize) -> usize {
     *(*(obj as *const *const usize)).add(slot)
@@ -266,6 +278,16 @@ fn vtable() -> usize {
 mod tests {
     use super::*;
 
+    thread_local! {
+        /// Some: the driver pipelines `let_go` would hold, kept here instead
+        pub(super) static LET_GO: std::cell::RefCell<Option<Vec<usize>>> = const { std::cell::RefCell::new(None) };
+    }
+
+    /// What `let_go` was given on this thread since the last call (and keeps it from now on).
+    fn let_go_taken() -> Vec<usize> {
+        LET_GO.with(|l| l.borrow_mut().replace(Vec::new()).unwrap_or_default())
+    }
+
     /// A COM object that counts its references and has one interface.
     #[repr(C)]
     struct Counted {
@@ -311,6 +333,7 @@ mod tests {
     #[test]
     fn pipelines_of_one_key_share_a_driver_pipeline_while_one_of_them_lives() {
         let (rs, a, b) = (counted(), counted(), counted());
+        let_go_taken();
         unsafe {
             let (s1, d1) = shell(key(rs, 1), || Ok(at(a))).unwrap();
             let (s2, d2) = shell(key(rs, 1), || panic!("made again")).unwrap();
@@ -321,17 +344,44 @@ mod tests {
             assert_eq!(refs(rs), 3, "the root signature is held by each driver pipeline");
             assert_eq!(release(s1), 0);
             assert_eq!(refs(a), 1, "still stands in for the second");
+            assert_eq!(let_go_taken(), Vec::<usize>::new(), "still stands in for the second");
             assert_eq!(release(s2), 0);
-            assert_eq!((refs(a), refs(rs)), (0, 2), "gone with the last");
+            // lists in flight may bind it: let go (held until the queues are past them), not
+            // released here
+            assert_eq!((refs(a), refs(rs)), (1, 2), "the root signature goes with the last");
+            assert_eq!(let_go_taken(), vec![at(a)], "the pipeline is let go with the last");
+            unref(at(a));
+            assert_eq!(refs(a), 0, "gone with the last");
             let c = counted();
             let (s4, d4) = shell(key(rs, 1), || Ok(at(c))).unwrap();
             assert_eq!(d4, at(c), "made again when none of its key is alive");
             release(s3);
             release(s4);
             assert_eq!(refs(rs), 1);
+            assert_eq!(let_go_taken(), vec![at(b), at(c)]);
             assert_eq!(shell(key(rs, 9), || Err(E_INVALIDARG)).err(), Some(E_INVALIDARG));
             assert_eq!(refs(rs), 1);
+            assert_eq!(let_go_taken(), Vec::<usize>::new(), "nothing made, nothing let go");
         }
+        LET_GO.with(|l| l.borrow_mut().take());
+    }
+
+    /// The driver pipeline of a key's last shell goes through `late_release`: released once the
+    /// queues are past the lists that may bind it (at once with `XCL_LATE_RELEASE=0`).
+    #[test]
+    fn a_driver_pipeline_let_go_is_released_once_the_queues_are_past_it() {
+        let (rs, a) = (counted(), counted());
+        unsafe {
+            let (s, _) = shell(key(rs, 5), || Ok(at(a))).unwrap();
+            assert_eq!(release(s), 0);
+        }
+        assert_eq!(refs(rs), 1);
+        // (a queue XCL knows of may still be busy: the batch waits for its fence)
+        let start = std::time::Instant::now();
+        while refs(a) != 0 && start.elapsed() < std::time::Duration::from_secs(10) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(refs(a), 0, "released once the queues are past");
     }
 
     #[test]
@@ -368,8 +418,12 @@ mod tests {
             assert_eq!(set_private_data_interface(s, &id, at(held)), S_OK);
             release(s);
             assert_eq!(refs(held), 2, "let go with the object");
+            let_go_taken();
             release(other);
+            assert_eq!(let_go_taken(), vec![at(a)]);
+            unref(at(a));
             assert_eq!(refs(a), 0);
         }
+        LET_GO.with(|l| l.borrow_mut().take());
     }
 }

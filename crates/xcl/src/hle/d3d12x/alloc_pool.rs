@@ -31,8 +31,13 @@ struct Backing {
 }
 
 impl Backing {
+    /// The GPU has passed every submit of a recording on this allocator.
+    unsafe fn idle(&self) -> bool {
+        self.marks.values().all(|(f, v)| super::real::fence_completed(f) >= *v)
+    }
+
     unsafe fn free(&self) -> bool {
-        self.users.is_empty() && self.marks.values().all(|(f, v)| f.GetCompletedValue() >= *v)
+        self.users.is_empty() && self.idle()
     }
 }
 
@@ -91,6 +96,19 @@ pub(super) fn forget_list(list: usize) {
     let Some(s) = g.as_mut() else { return };
     s.last_submit.remove(&list);
     s.recordings.remove(&list);
+    unpin(s, list);
+}
+
+/// The PC list's recording ended but the list stays (a split segment moved to the spares): its
+/// allocator is no longer held for it. Its last submit stays known, so it is not handed out
+/// again while the GPU still runs that submit (`in_flight`).
+pub(super) fn unpin_list(list: usize) {
+    let mut g = STATE.lock().unwrap();
+    let Some(s) = g.as_mut() else { return };
+    unpin(s, list);
+}
+
+fn unpin(s: &mut State, list: usize) {
     if let Some(backing) = s.of_list.remove(&list) {
         if let Some(b) = s.backings.get_mut(&backing) {
             b.users.remove(&list);
@@ -121,6 +139,13 @@ pub(super) use recording_backing as recording_backing_for_test;
 
 pub(super) fn recording_backing(list: usize) -> Option<usize> {
     STATE.lock().unwrap().as_ref()?.of_list.get(&list).copied()
+}
+
+/// The title's allocator `alloc` stands for the PC allocator `pc` (as after a Reset put its own
+/// aside); `pc == alloc` ends that.
+#[cfg(test)]
+pub(super) fn stand_in_for_test(alloc: usize, pc: usize) {
+    STATE.lock().unwrap().get_or_insert_with(State::default).cur.insert(alloc, pc);
 }
 
 /// The PC allocator the title's allocator `alloc` stands for now.
@@ -159,7 +184,7 @@ pub unsafe fn note_resubmits(queue: *mut c_void, lists: &[*mut c_void]) -> usize
     for &l in lists {
         let l = l as usize;
         let Some(last) = s.last_submit.get(&l) else { continue };
-        if last.fence.GetCompletedValue() >= last.value {
+        if super::real::fence_completed(&last.fence) >= last.value {
             continue;
         }
         let same_recording = s.recordings.get(&l).copied().unwrap_or(0) == last.recording;
@@ -178,11 +203,84 @@ pub unsafe fn note_resubmits(queue: *mut c_void, lists: &[*mut c_void]) -> usize
     found
 }
 
+/// How long a submit waits for the previous submits of its lists (`XCL_RESUBMIT_WAIT_MS`, 2 000;
+/// 0: not at all, as before).
+fn resubmit_wait() -> std::time::Duration {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    std::time::Duration::from_millis(*MS.get_or_init(|| std::env::var("XCL_RESUBMIT_WAIT_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(2000)))
+}
+
+/// `lists` are about to be submitted: the ones whose previous submit the GPU has not finished
+/// (`note_resubmits`) wait for it first, `limit` at most for all of them; then they go as they
+/// are. On the PC a list must not be executed again before its previous execution is done (debug
+/// layer id 553); a console lets a title do it, and a retail title did it about once a second in
+/// its world – 128 times before its device was removed with shader memory faults, and not once in
+/// a run that ended well. Returns (lists waited for, of them not done in time).
+pub unsafe fn wait_for_previous_submits(lists: &[*mut c_void]) -> (usize, usize) {
+    wait_for_previous_submits_within(lists, resubmit_wait())
+}
+
+unsafe fn wait_for_previous_submits_within(lists: &[*mut c_void], limit: std::time::Duration) -> (usize, usize) {
+    if !enabled() || limit.is_zero() {
+        return (0, 0);
+    }
+    // (the fences are taken out: nothing is waited for with STATE held)
+    let pending: Vec<(ID3D12Fence, u64)> = {
+        let g = STATE.lock().unwrap();
+        let Some(s) = g.as_ref() else { return (0, 0) };
+        lists
+            .iter()
+            .filter_map(|&l| s.last_submit.get(&(l as usize)))
+            .filter(|l| super::real::fence_completed(&l.fence) < l.value)
+            .map(|l| (l.fence.clone(), l.value))
+            .collect()
+    };
+    if pending.is_empty() {
+        return (0, 0);
+    }
+    let start = std::time::Instant::now();
+    let mut late = 0;
+    for (fence, value) in &pending {
+        // (XCL's own fence, read without the title's hook; a removed device reads as the largest
+        // value: no wait then. Such a submit is milliseconds from done: a short poll)
+        let mut polls = 0u32;
+        while super::real::fence_completed(fence) < *value {
+            if start.elapsed() >= limit {
+                late += 1;
+                break;
+            }
+            if polls < 64 {
+                std::thread::yield_now();
+            } else {
+                std::thread::sleep(std::time::Duration::from_micros(200));
+            }
+            polls += 1;
+        }
+    }
+    static WAITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = WAITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if late > 0 {
+        crate::xlog_warn!(
+            "D3D12.X: {late} of {} previous submits of lists submitted again were not done after {} ms – they go as they are (#{n} such submits)",
+            pending.len(),
+            limit.as_millis()
+        );
+    } else if n <= 8 || n.is_power_of_two() {
+        crate::xlog_info!(
+            "D3D12.X: a submit waited {:.1} ms for the previous submits of {} of its lists (#{n} such submits)",
+            start.elapsed().as_secs_f64() * 1e3,
+            pending.len()
+        );
+    }
+    (pending.len(), late)
+}
+
 /// Whether the GPU has not finished the last submit of the PC list `list` (#1452: it must not be
 /// submitted again before that; `title_list` records the title's next recording elsewhere).
+/// (`fence_completed`: XCL's own fence, without the title's hook, STATE held)
 pub fn in_flight(list: usize) -> bool {
     let g = STATE.lock().unwrap();
-    g.as_ref().and_then(|s| s.last_submit.get(&list)).is_some_and(|l| unsafe { l.fence.GetCompletedValue() } < l.value)
+    g.as_ref().and_then(|s| s.last_submit.get(&list)).is_some_and(|l| unsafe { super::real::fence_completed(&l.fence) } < l.value)
 }
 
 /// `lists` were just submitted to `queue`.
@@ -218,26 +316,53 @@ pub unsafe fn executed(queue: *mut c_void, lists: &[*mut c_void]) {
     }
 }
 
+/// The lists recording on the PC allocators of `alloc` hold them no more: the allocator a title
+/// list keeps for its put-off dispatches goes with the list, before the list's segments that
+/// recorded on it are released (`list_x::on_release`), and `forget` gives back only what nothing
+/// holds.
+pub(super) fn unpin_users(alloc: usize) {
+    let mut g = STATE.lock().unwrap();
+    if let Some(s) = g.as_mut() {
+        unpin_users_in(s, alloc);
+    }
+}
+
+fn unpin_users_in(s: &mut State, alloc: usize) {
+    let mine: Vec<usize> = s.cur.get(&alloc).copied().into_iter().chain(s.aside.get(&alloc).into_iter().flatten().copied()).chain([alloc]).collect();
+    for b in mine {
+        if let Some(b) = s.backings.get_mut(&b) {
+            for l in std::mem::take(&mut b.users) {
+                s.of_list.remove(&l);
+            }
+        }
+    }
+}
+
 /// Whether the GPU may still run a recording made on the title's allocator `alloc`.
 pub(super) unsafe fn allocator_in_flight(alloc: usize) -> bool {
     let g = STATE.lock().unwrap();
     let Some(s) = g.as_ref() else { return false };
     let mine = s.cur.get(&alloc).into_iter().chain(s.aside.get(&alloc).into_iter().flatten()).chain([&alloc]);
-    let busy = mine.filter_map(|b| s.backings.get(b)).any(|b| b.marks.values().any(|(f, v)| f.GetCompletedValue() < *v));
+    let busy = mine.filter_map(|b| s.backings.get(b)).any(|b| !b.idle());
     busy
 }
 
 /// The title's allocator `alloc` is gone (its last Release): nothing of it stays here – a later
 /// allocator may get its address, and must not go on with this one's PC allocators. The ones
 /// made here go with it (those lists still record on are left alone: not freed, not tracked).
+/// What ended recordings on `alloc` itself used goes back when the GPU is done with it, as at a
+/// Reset: nothing else would give it back (only a Reset of a later allocator at its address).
 pub unsafe fn forget(alloc: usize) {
-    let made: Vec<usize> = {
+    let (own, made): (bool, Vec<usize>) = {
         let mut g = STATE.lock().unwrap();
         let Some(s) = g.as_mut() else { return };
         s.types.remove(&alloc);
         let mut mine: Vec<usize> = s.aside.remove(&alloc).unwrap_or_default();
         mine.extend(s.cur.remove(&alloc));
         mine.push(alloc);
+        // (before the loop: `alloc` may be in `mine` more than once, and its backing goes at the
+        // first)
+        let own = s.backings.get(&alloc).is_none_or(|x| x.free());
         let mut made = Vec::new();
         for b in mine {
             let free = s.backings.get(&b).is_none_or(|x| x.free());
@@ -250,10 +375,15 @@ pub unsafe fn forget(alloc: usize) {
                 made.push(b);
             }
         }
-        made
+        (own, made)
     };
     // (outside the lock: their Release comes back here)
+    if own {
+        super::console_list::allocator_reset(alloc as *mut c_void);
+    }
     for b in made {
+        // what ended recordings on it used goes with it
+        super::console_list::allocator_reset(b as *mut c_void);
         drop(ID3D12CommandAllocator::from_raw(b as *mut c_void));
     }
 }
@@ -261,13 +391,41 @@ pub unsafe fn forget(alloc: usize) {
 /// The title resets its allocator `alloc`. `None`: reset it as it is (nothing holds a
 /// recording on it, or this is off). `Some(hr)`: done here – the PC allocator in use was put
 /// aside with its recordings and another one took its place.
+///
+/// What ended recordings left in unified memory is held per PC allocator
+/// (`console_list::hold_until_reset`). It goes back here for the PC allocators of `alloc` whose
+/// submits the GPU has passed – not for one put aside because the GPU still runs what was
+/// recorded on it (#1358).
 pub unsafe fn title_reset(alloc: *mut c_void) -> Option<HRESULT> {
+    title_reset_with(alloc, |raw| super::real::reset_pc_allocator(raw))
+}
+
+/// `title_reset` with the PC Reset supplied (tests).
+unsafe fn title_reset_with(alloc: *mut c_void, reset: impl FnMut(*mut c_void) -> HRESULT) -> Option<HRESULT> {
     if !enabled() {
         return None;
     }
-    let mut g = STATE.lock().unwrap();
-    let s = g.get_or_insert_with(State::default);
-    title_reset_in(s, alloc, |raw| super::real::reset_pc_allocator(raw))
+    let (hr, done) = {
+        let mut g = STATE.lock().unwrap();
+        let s = g.get_or_insert_with(State::default);
+        let hr = title_reset_in(s, alloc, reset);
+        (hr, done_with(s, alloc as usize))
+    };
+    // (outside the lock)
+    for b in done {
+        super::console_list::allocator_reset(b as *mut c_void);
+    }
+    hr
+}
+
+/// The PC allocators of the title's allocator `a` (the one in use and those put aside) whose
+/// submits the GPU has passed: the recordings on them that have ended need their memory no more.
+unsafe fn done_with(s: &State, a: usize) -> Vec<usize> {
+    let cur = s.cur.get(&a).copied().unwrap_or(a);
+    std::iter::once(cur)
+        .chain(s.aside.get(&a).into_iter().flatten().copied())
+        .filter(|b| s.backings.get(b).is_none_or(|x| x.idle()))
+        .collect()
 }
 
 /// The allocator transition, with the PC Reset supplied so failure/retry needs no GPU in tests.
@@ -330,6 +488,27 @@ unsafe fn title_reset_in(s: &mut State, alloc: *mut c_void, mut reset: impl FnMu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// When a title list goes, the segments that recorded its put-off dispatches on its own
+    /// allocator hold neither the PC allocator it stands for now nor the ones put aside: `forget`
+    /// then releases those the GPU is done with (they were left behind, with what was held on them).
+    #[test]
+    fn the_own_allocator_of_a_list_that_goes_is_held_by_none_of_its_segments() {
+        let (own, now, aside, other) = (0x1000usize, 0x2000usize, 0x3000usize, 0x4000usize);
+        let (seg, old_seg, elsewhere) = (0x5000usize, 0x6000usize, 0x7000usize);
+        let mut s = State::default();
+        s.cur.insert(own, now);
+        s.aside.insert(own, vec![aside]);
+        move_list(&mut s, seg, now);
+        move_list(&mut s, old_seg, aside);
+        move_list(&mut s, elsewhere, other);
+        assert!(!unsafe { s.backings[&now].free() });
+        unpin_users_in(&mut s, own);
+        assert!(unsafe { s.backings[&now].free() && s.backings[&aside].free() }, "nothing holds them");
+        assert!(!s.of_list.contains_key(&seg) && !s.of_list.contains_key(&old_seg));
+        assert_eq!(s.of_list.get(&elsewhere), Some(&other), "a list on another allocator keeps its hold");
+        assert!(s.backings[&other].users.contains(&elsewhere));
+    }
 
     #[test]
     fn a_spare_whose_reset_fails_stays_available_for_retry() {
@@ -435,6 +614,129 @@ mod tests {
         assert!(pending_still_held, "final list Release must retain the submitted-work fence");
         assert!(reusable, "a released list cannot keep a completed backing busy");
         assert_eq!(fence.releases.get(), 1);
+    }
+
+    /// What an ended recording left in unified memory stays while the GPU has not passed the
+    /// submits on its PC allocator – also when the title's Reset puts that allocator aside and
+    /// goes on with another (#1358) – and goes back at the first Reset after the GPU has.
+    #[test]
+    fn ended_recordings_keep_their_memory_until_the_gpu_passes_their_allocator() {
+        use std::cell::Cell;
+        use std::mem::{offset_of, size_of};
+
+        #[repr(C)]
+        struct Fence {
+            vtable: *const usize,
+            value: Cell<u64>,
+        }
+        unsafe extern "system" fn completed(this: *mut c_void) -> u64 {
+            (*this.cast::<Fence>()).value.get()
+        }
+        unsafe extern "system" fn release(_: *mut c_void) -> u32 {
+            0
+        }
+        extern "system" fn unexpected_call() { std::process::abort(); }
+
+        const SLOT: usize = size_of::<usize>();
+        let mut vtable = [unexpected_call as usize; size_of::<ID3D12Fence_Vtbl>() / SLOT];
+        vtable[offset_of!(ID3D12Fence_Vtbl, GetCompletedValue) / SLOT] = completed as usize;
+        vtable[offset_of!(ID3D12Fence_Vtbl, base__.base__.base__.base__.Release) / SLOT] = release as usize;
+        let mut fence = Fence { vtable: vtable.as_ptr(), value: Cell::new(0) };
+        let mut ids = Box::new([0u8; 4]);
+        let alloc = ids.as_mut_ptr() as usize;
+        let (spare, list, block) = (alloc + 1, alloc + 2, alloc + 3);
+        // a list recorded on the title's allocator, was submitted, and is gone; the GPU has not
+        // run the submit yet
+        created_on(list, alloc, D3D12_COMMAND_LIST_TYPE_DIRECT.0);
+        {
+            let mut g = STATE.lock().unwrap();
+            let s = g.as_mut().unwrap();
+            // the map owns one synthetic fence reference, dropped below
+            let f = unsafe { ID3D12Fence::from_raw(std::ptr::from_mut(&mut fence).cast()) };
+            s.backings.get_mut(&alloc).unwrap().marks.insert(1, (f, 1));
+            // a PC allocator put aside earlier that nothing uses any more
+            s.aside.insert(alloc, vec![spare]);
+        }
+        forget_list(list);
+        super::super::console_list::hold_until_reset(alloc, vec![block]);
+
+        let mut resets = Vec::new();
+        let first = unsafe { title_reset_with(alloc as *mut c_void, |raw| { resets.push(raw as usize); 0 }) };
+        let stand_in = current(alloc);
+        let held = super::super::console_list::take_pending_for_test(alloc);
+        super::super::console_list::hold_until_reset(alloc, held.clone());
+        fence.value.set(1);
+        let second = unsafe { title_reset_with(alloc as *mut c_void, |raw| { resets.push(raw as usize); 0 }) };
+        let after = super::super::console_list::take_pending_for_test(alloc);
+        // (before the assertions: nothing synthetic stays in the pool)
+        {
+            let mut g = STATE.lock().unwrap();
+            let s = g.as_mut().unwrap();
+            for b in [alloc, spare] {
+                s.backings.remove(&b);
+                s.cur.remove(&b);
+                s.aside.remove(&b);
+                s.types.remove(&b);
+            }
+        }
+        assert_eq!((first, stand_in), (Some(0), spare), "the GPU still runs the submit: the spare takes the place");
+        assert_eq!(held, vec![block], "the memory of a recording the GPU still runs is held over the Reset");
+        assert_eq!((second, resets), (Some(0), vec![spare, spare]));
+        assert!(after.is_empty(), "the GPU passed the submit: the memory goes back");
+    }
+
+    /// The title's Reset (through `real::alloc_reset`) while the GPU has not run a submit of a
+    /// recording on its allocator: the allocator is put aside, and what the recording left in
+    /// unified memory stays until the GPU has passed it (#1358).
+    #[test]
+    fn a_reset_that_puts_the_allocator_aside_keeps_what_the_gpu_still_reads() {
+        unsafe {
+            let Ok(dev) = crate::gpu::agility::create_device(None, windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0) else {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            };
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let a = alloc.as_raw();
+            if !super::super::real::is_adopted(a) {
+                super::super::real::adopt(a, super::super::real::Kind::CommandAllocator);
+            }
+            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+            let l = list.as_raw() as usize;
+            created_on(l, a as usize, D3D12_COMMAND_LIST_TYPE_DIRECT.0);
+            list.Close().unwrap();
+            // the queue runs the list only once `gate` is signalled
+            let gate: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            queue.Wait(&gate, 1).unwrap();
+            queue.ExecuteCommandLists(&[Some(list.cast::<ID3D12CommandList>().unwrap())]);
+            executed(queue.as_raw(), &[l as *mut c_void]);
+            // the list's recording ends; what it put in unified memory is held for the allocator
+            forget_list(l);
+            let block = l + 1;
+            super::super::console_list::hold_until_reset(a as usize, vec![block]);
+
+            alloc.Reset().unwrap();
+            let stand_in = current(a as usize);
+            let held = super::super::console_list::take_pending_for_test(a as usize);
+            super::super::console_list::hold_until_reset(a as usize, held.clone());
+
+            gate.Signal(1).unwrap();
+            let done: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            queue.Signal(&done, 1).unwrap();
+            let start = std::time::Instant::now();
+            while done.GetCompletedValue() < 1 && start.elapsed().as_secs() < 10 {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            let ran = done.GetCompletedValue() >= 1;
+            alloc.Reset().unwrap();
+            let after = super::super::console_list::take_pending_for_test(a as usize);
+            drop(list);
+            drop(alloc);
+
+            assert_ne!(stand_in, a as usize, "the GPU had not run the submit: another PC allocator took the place");
+            assert_eq!(held, vec![block], "the memory of a recording the GPU had not run is held over the Reset");
+            assert!(ran, "the queue finishes");
+            assert!(after.is_empty(), "the GPU passed the submit: the next Reset gives the memory back");
+        }
     }
 
     /// A list recorded once and submitted again after the title reset its allocator: the
@@ -548,6 +850,49 @@ mod tests {
             assert_eq!(while_running, 1, "a submit while the previous one runs must be noticed");
             assert_eq!(after_done, 0, "a finished previous submit is not a resubmit");
             assert_eq!(after_forget, 0, "a forgotten list has no previous submit");
+        }
+    }
+
+    /// A list whose previous submit still runs is waited for before it is submitted again: until
+    /// that submit is done, or the limit; a list with nothing running is not waited for.
+    #[test]
+    fn a_resubmit_waits_for_the_previous_submit() {
+        unsafe {
+            let Ok(dev) = crate::gpu::agility::create_device(None, windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0) else {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            };
+            // a fence the GPU has not reached stands for a submit still running
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let mut ids = Box::new([0u8; 2]);
+            let (alloc, list) = (ids.as_mut_ptr() as usize, ids.as_mut_ptr() as usize + 1);
+            created_on(list, alloc, D3D12_COMMAND_LIST_TYPE_DIRECT.0);
+            {
+                let mut g = STATE.lock().unwrap();
+                let s = g.as_mut().unwrap();
+                let recording = s.recordings[&list];
+                s.last_submit.insert(list, LastSubmit { queue: 0x10, fence: fence.clone(), value: 1, recording });
+            }
+            let lists = [list as *mut c_void];
+            // it never finishes: the limit ends the wait, and says so
+            let t = std::time::Instant::now();
+            assert_eq!(wait_for_previous_submits_within(&lists, std::time::Duration::from_millis(30)), (1, 1));
+            assert!(t.elapsed() >= std::time::Duration::from_millis(30));
+            // no limit: no wait
+            assert_eq!(wait_for_previous_submits_within(&lists, std::time::Duration::ZERO), (0, 0));
+            // it finishes meanwhile: the wait ends then, far before the limit
+            let signal = fence.clone();
+            let done = std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                signal.Signal(1).unwrap();
+            });
+            let t = std::time::Instant::now();
+            assert_eq!(wait_for_previous_submits_within(&lists, std::time::Duration::from_secs(20)), (1, 0));
+            assert!(t.elapsed() < std::time::Duration::from_secs(10), "the wait ends when the submit is done");
+            done.join().unwrap();
+            // nothing runs now: nothing to wait for
+            assert_eq!(wait_for_previous_submits_within(&lists, std::time::Duration::from_secs(20)), (0, 0));
+            forget_list(list);
+            forget(alloc);
         }
     }
 }

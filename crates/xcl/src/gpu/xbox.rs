@@ -144,6 +144,19 @@ impl Fssm {
         }
     }
 
+    /// The constant data blocks that follow program `p` in the code region, as the program
+    /// addresses them (`s_getpc_b64`: from its own start): (address, dwords of the block).
+    pub fn rodata(&self, p: &Program) -> Vec<(u32, Vec<u32>)> {
+        self.data_blocks
+            .iter()
+            .filter(|b| b.offset >= p.offset + p.len)
+            .filter_map(|b| {
+                let bytes = self.data.get(b.offset..b.offset + b.len)?;
+                Some(((b.offset - p.offset) as u32, bytes.chunks_exact(4).map(|w| u32::from_le_bytes(w.try_into().unwrap())).collect()))
+            })
+            .collect()
+    }
+
     /// The header says the code is for 32-lane waves: bit 5 of the flags word at +0xD4
     /// (measured on a retail pack: set for every program with 32-bit EXEC writes, clear for
     /// every one with 64-bit ones). An unused field (0xDEADBEEF) says nothing.

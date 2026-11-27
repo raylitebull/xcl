@@ -152,7 +152,7 @@ A gamepad is recommended ([Controls](#controls)). The game folder is never modif
 | **D3D12.X compute** | ✅ | console device slots, console descriptor heaps (T# / V# / S#), buffers at their console addresses, compute command lists recorded in the console format and replayed (tables, barriers, clears, copies) | the game's BVH builder and FSR 4 record and run through XCL |
 | **D3D12.X graphics** | ✅ | device, resources and heaps (also placed in title memory), pipelines; the title's graphics command lists – draws, indirect draws, graphics root arguments, barriers, copies, clears – and command lists recorded by console code, replayed; `PresentX` and frame pacing into an XCL window | Minecraft Preview plays its worlds (millions of draws, none skipped); Fortnite and XDefiant draw their screens |
 | **Textures** | ✅ | GFX10 tiling (all 14 2D swizzle modes, the 6 3D thick modes, linear), mip chains with mip tail, arrays, cubes and 3D textures → PC textures | 912 / 912 entries detiled in the tested retail archive; GPU upload bit exact in test fixtures |
-| **Ray tracing** | ✅ | BLAS / TLAS built on the GPU by the game's own XboxBvhBuilder; RDNA2 BVH node format; BVH intersection instructions emulated in shaders | GPU traversal = brute force reference; the game's builder output checked on the GPU |
+| **Ray tracing** | ✅ | BLAS / TLAS built on the GPU by the game's own XboxBvhBuilder; RDNA2 BVH node format; BVH intersection instructions emulated in shaders, with misses for nodes outside mapped memory windows | GPU traversal = brute force reference; the game's builder output checked on the GPU |
 | **Upscaling** | ✅ | the game's AMD FSR 4 console DLL (`amd_fidelityfx_upscaler_xbox.dll`): context, the 29 pipelines in the console driver's own container (FSPX) translated, a frame's 20 passes recorded and run on the GPU | end-to-end with the real DLL: a 1280×720 → 1920×1080 frame on an RX 9070, the input's gradient in the output |
 
 Far-jump address calculations are resolved to fixed targets only when branches enter at the start of the calculation.
@@ -259,6 +259,14 @@ xcl shaders D:\data\shaders.rpf --measure-pso HEX --repeat 3         # cold driv
 xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 ```
 
+Fill the reusable DXIL cache ahead of a run with the read-only package wrapper. Add
+`-Pipelines` to warm the GPU driver's compute-pipeline cache too (slower and GPU/driver-specific):
+
+```powershell
+.\scripts\precompile-shaders.ps1 -Package 'D:\data\shaders.rpf'
+.\scripts\precompile-shaders.ps1 -Package 'D:\data\shaders.rpf' -Pipelines
+```
+
 <details>
 <summary><b>Switches, caches, logs and the files XCL writes</b></summary>
 
@@ -268,8 +276,11 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   processed records. The timer counts seconds since one finished (or preparation started);
   five seconds without progress counts as a stall, and the window shows when the last one ended.
   XCL prepares supported shader stages and compute pipelines, including
-  split pieces and their whole fallback. Graphics pipelines that need state supplied by the
-  title are created during play. Later launches reuse matching cache entries.
+  split pieces and their whole fallback. Graphics pipelines are created during play the first
+  time; the ones a run used are recorded with their state (`used-graphics-pipelines.bin` beside
+  the shader cache, at most `XCL_GFX_RECORDS_MB`, default 64) and built before the title starts
+  on the next launch, with their driver blobs kept, so the title makes them from those in
+  milliseconds. `XCL_PREPARE_GRAPHICS=0` leaves that pass out. Later launches reuse matching cache entries.
   Closing the window cancels the launch. A compiler or driver failure stops it and reports
   the cause. Null-renderer runs skip shader preparation. With presentation disabled, the gate runs without a window.
   `XCL_PREPARE=0` leaves the preparation out: the game starts at once and builds the shaders it
@@ -309,7 +320,10 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   `XCL_DIRECT_SPLIT_INSTRUCTIONS` sets the target instructions per piece (default 12500,
   zero disables splitting). Loops stay in one piece. A strongly connected component over the
   target gets its own piece, up to four times the target. Larger components and indirect
-  dispatches use the whole pipeline.
+  dispatches use the whole pipeline. A chained dispatch runs in slabs of groups that share one
+  scratch buffer of at most `XCL_SPLIT_SCRATCH_MB` (default 256); the chains of one recording
+  share it, and `XCL_SPLIT_SCRATCH_TOTAL_MB` (default 384) bounds what all recordings not yet
+  reset hold together (past it a dispatch runs in smaller slabs).
 - Huge pipelines (translated DXIL of `XCL_HUGE_PSO_BYTES` or more, default 262144) built on the
   background `xcl-pso*` workers take turns in the driver's compiler: `XCL_HUGE_PSO_CONCURRENCY`
   at once (default 1, maximum 64). Pipelines of 4 MiB or more use a separate one-wide lane so
@@ -322,6 +336,13 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   `XCL_PSO_TRACE=1` logs every driver compile. A huge compute program the driver refuses is
   logged with the driver's verdict (`the driver refused the compute PSO of record HASH … with
   0x…`): its dispatches are skipped.
+- A loop in a translated compute program run by a Dispatch (not ExecuteIndirect) is ended
+  after its dispatch's share of passes for each entry (between 1024 and 65 536 a thread, fewer the
+  more threads the dispatch has; the direct DXIL translator ends the thread's program there), so
+  one that runs away does not hold the GPU past the time Windows gives it. The direct
+  translator's compact form (programs of 20 000 instructions and more) and `XCL_PER_LANE` keep
+  only the thread's 65 536 passes in all. `XCL_DISPATCH_LOOP_BUDGET=0` leaves every loop the
+  thread's 65 536 passes, as before (to compare).
 - With `XCL_DRED=1`, a D3D12 device removal logs GPU breadcrumbs in `xcl.log`.
   XCL examines up to 4,096 command lists and reports up to 64 unfinished lists, starting with
   those on which the GPU completed at least one operation. For each, it names the translated
@@ -330,6 +351,10 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 - `XCL_DSTORAGE_PARALLEL_DECOMPRESS=1` enables parallel CPU decompression for file-backed zlib
   requests with virtual destinations. Defaults: four workers and a shared 32 MiB staging budget
   (`XCL_DSTORAGE_WORKERS`, `XCL_DSTORAGE_MEMORY_BUDGET_MIB`). Requests retire in queue order.
+- The queue's page mappings (`CopyPageMappingsBatchX`: a title maps the pages its texture streaming
+  fills into its GPU views) are applied: a GPU-view page shows the physical page mapped into it.
+  `XCL_PAGE_MAPPINGS=0` turns them off (the call is ignored and a GPU-view page shows its CPU view at
+  the same offset, as before).
 - Every run writes `report.json` (called stubs, unknown D3D12.X slots and interfaces, XGameRuntime
   classes asked for, shader statistics, audio formats, crash).
   `d3d12.presents` counts presentations, not visible content. With `XCL_FRAME_DUMP=N` (`N > 1`),
@@ -338,6 +363,17 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   (decoded 8-bit R+G+B > 30). The field is `null` until a frame is sampled; `non_dark_samples` is
   `null` if its format cannot be decoded. Intermediate render-target dumps do not update it.
   Sampling uses every fourth pixel in each direction (`XCL_FRAME_DUMP_FULL=1`: every pixel).
+  `XCL_DUMP_TARGETS=<draws>[,<frames>]` logs, for the first frames with that many draws and dispatches,
+  each render target and the depth buffer drawn into (draws ran / stand-in / PC / skipped) and dumps
+  the eight drawn into most (`target<k>_<n>.bmp`); `XCL_DUMP_AFTER_S=<s>` waits `s` seconds first.
+  `XCL_CAPTURE_FRAME=<draws>[,<s>]` writes the command stream of the first frame with that many draws
+  and dispatches (`s` seconds after the first present at the earliest) to `capture_<frame>/` next to
+  the log: `frame.jsonl` (every submit, barrier, copy, clear, draw and dispatch in the order the GPU got
+  them, with render targets and root arguments), `resources.jsonl`, `pipelines.jsonl`, the pipelines'
+  shaders translated again and `summary.txt`. Every frame is recorded until then, which costs time.
+  `XCL_GPU_TIMES=<frames>[,<s>]` times every draw and dispatch of the next `frames` busy frames (from
+  `s` seconds after the first present) with GPU timestamps and logs the 60 programs that took the
+  most GPU time per frame (`D3D12.X: GPU times:` lines); the times are coarse, fine for ranking.
   A coarse sample can miss detail; a non-dark sample does not establish correct rendering or gameplay.
 - **Diagnostics for a bug report** (all off by default; set them in the environment of `xcl run`):
   - `XCL_RUN_SECONDS=n`: the title ends itself after `n` seconds, with the GPU drained and

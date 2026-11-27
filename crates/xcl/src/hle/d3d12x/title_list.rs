@@ -134,6 +134,8 @@ unsafe extern "system" fn close(this: *mut c_void) -> HRESULT {
     let pc = *((this as usize + F_BACKING) as *const *mut c_void);
     let f: unsafe extern "system" fn(*mut c_void) -> HRESULT = std::mem::transmute(pc_slot(pc, 9));
     let hr = f(pc);
+    super::capture::list_end(this as usize);
+    super::title_textures::note_list_closed(this as usize);
     let n = *((this as usize + F_RING_AT) as *const usize);
     if hr < 0 && n > 0 {
         let first = n.saturating_sub(RING);
@@ -197,6 +199,7 @@ pub(super) unsafe extern "system" fn reset(this: *mut c_void, alloc: usize, pso:
             }
         }
         *((this as usize + F_RING_AT) as *mut usize) = 0;
+        super::capture::list_begin(this as usize, pso);
     }
     hr
 }
@@ -292,9 +295,27 @@ pub(super) fn put_spare(wrapper: *mut c_void, pc: *mut c_void) {
     sg.get_or_insert_with(HashMap::new).entry(wrapper as usize).or_default().spares.push(pc as usize);
 }
 
+/// The closed PC command lists `wrapper` keeps for reuse.
+#[cfg(test)]
+pub(super) fn spares_for_test(wrapper: *mut c_void) -> Vec<usize> {
+    SEGMENTS.lock().unwrap().as_ref().and_then(|m| m.get(&(wrapper as usize))).map_or(Vec::new(), |b| b.spares.clone())
+}
+
 /// Add the closed segment `pc` to `wrapper`'s recording, after the ones it has.
 pub(super) fn push_segment(wrapper: *mut c_void, pc: *mut c_void) {
-    SEGMENTS.lock().unwrap().get_or_insert_with(HashMap::new).entry(wrapper as usize).or_default().extra_active.push(pc as usize);
+    let mut sg = SEGMENTS.lock().unwrap();
+    let extra = &mut sg.get_or_insert_with(HashMap::new).entry(wrapper as usize).or_default().extra_active;
+    extra.push(pc as usize);
+    SEGMENTS_PEAK.fetch_max(extra.len(), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// the most extra segments a recording has had (of `MAX_EXTRA_SEGMENTS`)
+static SEGMENTS_PEAK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The most extra segments a title list's recording has had so far (the put-off dispatches'
+/// line: `pso_async::put_off_line`).
+pub(super) fn segments_peak() -> usize {
+    SEGMENTS_PEAK.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Switch `wrapper` from closed segment `old_pc` to newly opened segment `new_pc`.
@@ -302,11 +323,9 @@ pub(super) unsafe fn activate_segment(wrapper: *mut c_void, old_pc: *mut c_void,
     *((wrapper as usize + F_BACKING) as *mut usize) = new_pc as usize;
     {
         let mut sg = SEGMENTS.lock().unwrap();
-        sg.get_or_insert_with(HashMap::new)
-            .entry(wrapper as usize)
-            .or_default()
-            .extra_active
-            .push(new_pc as usize);
+        let extra = &mut sg.get_or_insert_with(HashMap::new).entry(wrapper as usize).or_default().extra_active;
+        extra.push(new_pc as usize);
+        SEGMENTS_PEAK.fetch_max(extra.len(), std::sync::atomic::Ordering::Relaxed);
     }
     let mut wg = WRAPPER_OF.lock().unwrap();
     let m = wg.get_or_insert_with(HashMap::new);
@@ -396,17 +415,23 @@ unsafe extern "system" fn add_ref(this: *mut c_void) -> u32 {
 /// list's last reference.
 unsafe extern "system" fn release(this: *mut c_void) -> u32 {
     let pc = *((this as usize + F_PRIMARY) as *const *mut c_void);
+    let adopted = super::real::is_adopted(pc);
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(pc_slot(pc, 2));
     let n = f(pc);
     if n == 0 {
+        super::capture::forget(this as usize);
         let book = SEGMENTS.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize)));
         {
             let mut wg = WRAPPER_OF.lock().unwrap();
             if let Some(m) = wg.as_mut() {
-                m.remove(&(pc as usize));
+                if m.get(&(pc as usize)) == Some(&(this as usize)) {
+                    m.remove(&(pc as usize));
+                }
                 if let Some(ref b) = book {
                     for &seg in b.extra_active.iter().chain(b.spares.iter()).chain(b.first.iter()) {
-                        m.remove(&seg);
+                        if m.get(&seg) == Some(&(this as usize)) {
+                            m.remove(&seg);
+                        }
                     }
                 }
             }
@@ -414,12 +439,15 @@ unsafe extern "system" fn release(this: *mut c_void) -> u32 {
         if let Some(b) = book {
             for seg in b.extra_active.into_iter().chain(b.spares.into_iter()).chain(b.first) {
                 let raw = seg as *mut c_void;
+                super::alloc_pool::forget_list(seg);
                 super::bind::forget(raw);
                 let rel: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(pc_slot(raw, 2));
                 rel(raw);
             }
         }
-        super::bind::forget(pc);
+        if !adopted {
+            super::bind::forget(pc);
+        }
         std::alloc::dealloc(this as *mut u8, std::alloc::Layout::from_size_align(OBJECT_BYTES, 64).unwrap());
     }
     n
@@ -486,6 +514,77 @@ mod tests {
             assert_eq!(r(o), 2);
             assert_eq!(r(o), 1);
             assert_eq!(r(o), 0); // the object is freed with it
+            drop(Box::from_raw(fake));
+        }
+    }
+
+    #[test]
+    fn reset_releases_retired_split_segment_from_alloc_pool() {
+        unsafe extern "system" fn fake_reset(_this: *mut c_void, _alloc: usize, _pso: usize) -> HRESULT {
+            0
+        }
+        let mut vt = vec![0usize; LIST_SLOTS];
+        vt[0] = fake_qi as usize;
+        vt[1] = fake_add_ref as usize;
+        vt[2] = fake_release as usize;
+        vt[10] = fake_reset as usize;
+        let primary = Box::into_raw(Box::new(Fake { vt: vt.as_ptr(), refs: 1 }));
+        let seg = Box::into_raw(Box::new(Fake { vt: vt.as_ptr(), refs: 1 }));
+        let alloc1 = 0x7E57_A110usize;
+        let alloc2 = 0x7E57_A120usize;
+        unsafe {
+            let w = wrap(primary as *mut c_void);
+            super::super::alloc_pool::created_on(seg as usize, alloc1, 0);
+            assert_eq!(super::super::alloc_pool::recording_backing_for_test(seg as usize), Some(alloc1));
+            activate_segment(w, primary as *mut c_void, seg as *mut c_void);
+            assert_eq!(reset(w, alloc2, 0), 0);
+            assert_eq!(
+                super::super::alloc_pool::recording_backing_for_test(seg as usize),
+                None,
+                "retired split segment must be forgotten by alloc_pool so its allocator can be reused"
+            );
+            assert_eq!(release(w), 0);
+            drop(Box::from_raw(primary));
+            drop(Box::from_raw(seg));
+        }
+    }
+
+    #[test]
+    fn release_does_not_remove_reused_pc_from_wrapper_map() {
+        static REUSED_WRAPPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        unsafe extern "system" fn fake_release_reusing_pc(this: *mut c_void) -> u32 {
+            let f = &mut *(this as *mut Fake);
+            f.refs -= 1;
+            if f.refs == 0 {
+                // Simulate another thread immediately creating a new wrapper on the same PC address.
+                f.refs = 1;
+                let w2 = wrap(this);
+                REUSED_WRAPPER.store(w2 as usize, std::sync::atomic::Ordering::Release);
+                return 0;
+            }
+            f.refs
+        }
+        let mut vt = vec![0usize; LIST_SLOTS];
+        vt[0] = fake_qi as usize;
+        vt[1] = fake_add_ref as usize;
+        vt[2] = fake_release_reusing_pc as usize;
+        let fake = Box::into_raw(Box::new(Fake { vt: vt.as_ptr(), refs: 1 }));
+        REUSED_WRAPPER.store(0, std::sync::atomic::Ordering::Release);
+        unsafe {
+            let w1 = wrap(fake as *mut c_void);
+            assert_eq!(release(w1), 0);
+            let w2 = REUSED_WRAPPER.load(std::sync::atomic::Ordering::Acquire) as *mut c_void;
+            assert!(!w2.is_null());
+            assert_eq!(
+                wrapper_of(fake as *mut c_void),
+                Some(w2),
+                "old wrapper release must not erase the new wrapper registered for a reused pc address"
+            );
+            // Switch vtable to normal fake_release so w2 cleans up without recursing.
+            let mut vt2 = vt.clone();
+            vt2[2] = fake_release as usize;
+            (*fake).vt = vt2.as_ptr();
+            assert_eq!(release(w2), 0);
             drop(Box::from_raw(fake));
         }
     }

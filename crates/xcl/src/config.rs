@@ -419,6 +419,24 @@ mod tests {
         }
     }
 
+    /// The Series S profile changes the title memory budget only: unified memory (`uma_mb`, the
+    /// window plan's size) is the memory mode's, the same as a Series X run's in that mode.
+    #[test]
+    fn the_series_s_budget_leaves_unified_memory_as_it_is() {
+        let manifest = crate::manifest::Manifest {
+            anaconda_memory: Some("Advanced".into()),
+            lockhart_memory: Some("Advanced".into()),
+            ..Default::default()
+        };
+        let resolved = |device: &str| {
+            let mut c = Config { device_type: device.into(), ..Config::default() };
+            c.resolve(Some(&manifest));
+            (c.title_memory_mb, c.uma_mb)
+        };
+        assert_eq!(resolved("anaconda"), (13_824, 4095));
+        assert_eq!(resolved("lockhart"), (8_192, 4095));
+    }
+
     #[test]
     fn raytracing_tier_parsing() {
         assert_eq!(parse_raytracing_tier("auto"), None);

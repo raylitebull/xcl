@@ -14,7 +14,13 @@ static LIVE: AtomicU64 = AtomicU64::new(0);
 static PEAK: AtomicU64 = AtomicU64::new(0);
 static WANTED: AtomicU64 = AtomicU64::new(0);
 
+/// (only when a count changed since the last line: called every 10 s in every run)
 pub(crate) fn log_counts() {
+    static LAST: Mutex<[u64; 7]> = Mutex::new([0; 7]);
+    let now = [&PROGRAMS, &PIECES, &DISPATCHES, &SLABS, &LIVE, &PEAK, &WANTED].map(|c| c.load(Ordering::Relaxed));
+    if std::mem::replace(&mut *LAST.lock().unwrap(), now) == now {
+        return;
+    }
     let mib = |a: &AtomicU64| a.load(Ordering::Relaxed) >> 20;
     crate::xlog_info!("compute split: {} programs split, {} pieces built, {} chained dispatches issued in {} slabs; scratch {} MiB (most {}, largest dispatch {} in one slab)",
         PROGRAMS.load(Ordering::Relaxed), PIECES.load(Ordering::Relaxed), DISPATCHES.load(Ordering::Relaxed), SLABS.load(Ordering::Relaxed),
@@ -42,8 +48,18 @@ impl PipelineBuilder {
     unsafe fn pipeline(&self, dxil: &[u8], iid: &GUID) -> Option<ID3D12PipelineState> {
         let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC { NodeMask: self.node, Flags: self.flags, ..Default::default() };
         let mut raw = std::ptr::null_mut();
-        let (hr, _, _) = compute_container(self.device.as_raw(), self.create, &desc, self.signature.as_raw(),
+        let (hr, in_driver, _) = compute_container(self.device.as_raw(), self.create, &desc, self.signature.as_raw(),
             dxil, self.record, iid, &mut raw, ComputeBuild::Chain);
+        // (as `translated_compute_pso_once` logs a huge whole program the driver refuses)
+        if hr < 0 && dxil.len() >= huge_pso_bytes() {
+            crate::xlog_warn!(
+                "D3D12.X: the driver refused a dispatch chain's compute PSO of record {:016x} ({} B DXIL, driver cache {}) with {hr:#x} after {} ms in the driver",
+                self.record,
+                dxil.len(),
+                driver_cache::name(dxil, self.flags.0),
+                in_driver.as_millis()
+            );
+        }
         (hr >= 0 && !raw.is_null()).then(|| ID3D12PipelineState::from_raw(raw))
     }
 }
@@ -55,11 +71,20 @@ struct Chain {
     whole_code: Vec<u8>,
     whole: OnceLock<ID3D12PipelineState>,
     build_whole: Mutex<()>,
+    /// a thread of its own builds the whole form (`whole_ready`)
+    whole_sent: std::sync::atomic::AtomicBool,
 }
+
+/// A chain for the thread that builds its whole form (D3D12 objects are free-threaded).
+struct ChainRef(Arc<Chain>);
+unsafe impl Send for ChainRef {}
 
 impl Chain {
     unsafe fn whole(&self) -> Result<ID3D12PipelineState, String> {
         if let Some(p) = self.whole.get() { return Ok(p.clone()); }
+        // (a driver compile on the title's thread, of the largest programs: the title is held
+        // while it lasts, as in any other long PC call)
+        let _call = super::super::pso_async::pc_call();
         let _guard = self.build_whole.lock().unwrap();
         if let Some(p) = self.whole.get() { return Ok(p.clone()); }
         let p = self.builder.pipeline(&self.whole_code, &pc_iid(Kind::PipelineState)).ok_or("whole compute pipeline")?;
@@ -91,7 +116,7 @@ pub(super) unsafe fn build(this: *mut c_void, create: PsoFn, desc: &D3D12_COMPUT
     let mut pieces = built.into_iter().collect::<Option<Vec<_>>>()?.into_iter();
     let first = pieces.next()?;
     let chain = Arc::new(Chain { builder, tail: pieces.collect(), words: plan.dwords_per_group,
-        whole_code: whole.to_vec(), whole: OnceLock::new(), build_whole: Mutex::new(()) });
+        whole_code: whole.to_vec(), whole: OnceLock::new(), build_whole: Mutex::new(()), whole_sent: Default::default() });
     PROGRAMS.fetch_add(1, Ordering::Relaxed);
     PIECES.fetch_add(plan.pieces.len() as u64, Ordering::Relaxed);
     *result = first.into_raw();
@@ -107,6 +132,48 @@ pub(super) fn forget(pso: usize) {
 pub(in crate::hle::d3d12x) unsafe fn whole(pso: usize) -> Result<Option<ID3D12PipelineState>, String> {
     let chain = CHAINS.lock().unwrap().get(&pso).cloned();
     chain.map(|c| c.whole()).transpose()
+}
+
+/// The whole form of a split program for an indirect dispatch, which runs no chain (its group
+/// counts are the GPU's).
+pub(in crate::hle::d3d12x) enum Whole {
+    /// no split program: the pipeline as it is
+    Plain,
+    Ready(ID3D12PipelineState),
+    /// still being built on a thread of its own: this dispatch goes without it
+    Late,
+}
+
+/// `whole` where a compute pipeline's dispatches go on without it while it is built
+/// (`pso_async::cs_goes_on`): the whole form, the largest program the driver compiles, is built
+/// by a thread of its own, once, and until it is there its dispatches are left out as those of
+/// any late compute pipeline. Built in the call, a retail title's render thread stood in the
+/// driver's compiler for it (1.1 MB of DXIL) and every other thread that dispatched it stood
+/// behind `build_whole`: no frame for over two minutes after its first world frame.
+pub(in crate::hle::d3d12x) unsafe fn whole_ready(pso: usize) -> Result<Whole, String> {
+    let chain = CHAINS.lock().unwrap().get(&pso).cloned();
+    let Some(chain) = chain else { return Ok(Whole::Plain) };
+    if let Some(p) = chain.whole.get() {
+        return Ok(Whole::Ready(p.clone()));
+    }
+    if !super::super::pso_async::cs_goes_on() {
+        return chain.whole().map(Whole::Ready);
+    }
+    if !chain.whole_sent.swap(true, Ordering::AcqRel) {
+        let job = ChainRef(chain.clone());
+        // (named as the pipeline workers: a huge compile takes its turn at the gate)
+        let spawned = std::thread::Builder::new().name("xcl-pso-whole".into()).stack_size(64 << 20).spawn(move || {
+            let job = job;
+            if let Err(e) = unsafe { job.0.whole() } {
+                crate::xlog_warn!("D3D12.X: the whole form of a split compute program was not built ({e}): its indirect dispatches stay left out");
+            }
+        });
+        if spawned.is_err() {
+            chain.whole_sent.store(false, Ordering::Release);
+            return chain.whole().map(Whole::Ready);
+        }
+    }
+    Ok(Whole::Late)
 }
 
 struct Scratch {
@@ -199,6 +266,18 @@ unsafe fn scratch_buffer(dev: &ID3D12Device, bytes: u64) -> Option<ID3D12Resourc
     resource
 }
 
+/// A piece or the whole form on `list`: on a list XCL adopted (a title's) past the hook of a
+/// title's SetPipelineState, as `bind::bind_abi` binds a compute pipeline. Through the hook it
+/// became the list's bound pipeline (the first one of a list split after it) and got a DRED
+/// marker without a label.
+unsafe fn bind(list: &ID3D12GraphicsCommandList, pso: &ID3D12PipelineState) {
+    if is_adopted(list.as_raw()) {
+        super::super::list_x::set_compute_pipeline(list.as_raw(), pso.as_raw());
+    } else {
+        list.SetPipelineState(pso);
+    }
+}
+
 /// Called with the original six ABI views bound. The extended signature is
 /// common to every piece and the whole fallback. Choose before recording any
 /// part of the dispatch, including when scratch allocation fails.
@@ -220,7 +299,7 @@ pub(in crate::hle::d3d12x) unsafe fn dispatch(list: &ID3D12GraphicsCommandList, 
     let most = scratch.as_ref().map_or(1, |(s, _)| (s.bytes / group).max(1));
     let slabs = pso::dispatch_slabs(grid, most);
     let Some((scratch, used)) = scratch else {
-        list.SetPipelineState(&chain.whole()?);
+        bind(list, &chain.whole()?);
         list.Dispatch(x, y, z);
         return Ok(());
     };
@@ -229,7 +308,7 @@ pub(in crate::hle::d3d12x) unsafe fn dispatch(list: &ID3D12GraphicsCommandList, 
     RECORDINGS.lock().unwrap().entry(allocator).or_default().push(held.clone());
     DISPATCHES.fetch_add(1, Ordering::Relaxed);
     SLABS.fetch_add(slabs.len() as u64, Ordering::Relaxed);
-    pso::record_dispatch_chain(list, grid, most, &held.scratch.buffer, used, std::iter::once(&held.first).chain(&held.chain.tail));
+    pso::record_dispatch_chain(list, grid, most, &held.scratch.buffer, used, std::iter::once(&held.first).chain(&held.chain.tail), |p| bind(list, p));
     Ok(())
 }
 

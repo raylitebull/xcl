@@ -93,6 +93,13 @@ pub trait Ir: Sink {
     fn can_wave_branch(&self) -> bool {
         !self.whole_needs_exchange()
     }
+    /// compute, at the start: the lanes outside the dispatch's thread limits leave next (`last`:
+    /// each axis's last thread that runs; `groups`: the console's group, unfolded, of a group of
+    /// `threads`), every lane still here. A hardware wave that meets another one counting its
+    /// lanes (the split form) learns how many of the other one's stay.
+    fn before_lanes_leave(&mut self, threads: [u32; 3], groups: [Self::V; 3], last: [Self::V; 3]) {
+        let _ = (threads, groups, last);
+    }
     /// the number of bits set in `v` (`countbits`)
     fn count_bits(&mut self, v: Self::V) -> Self::V;
     /// `d` lowered with another lowering's instruction semantics (#1426's `Lw::inst_guarded`):
@@ -1237,6 +1244,11 @@ pub fn survey_compute<I: Ir>(insts: &[Decoded], cs: &super::CsInterface, wave64:
 }
 
 fn lower_with<I: Ir>(insts: &[Decoded], stage: Stage, wave64: bool, mut ir: I, survey: bool) -> R<(I, Vec<u8>, Vec<String>)> {
+    // the lanes past a dispatch's thread limit leave at the start (`IO_THREAD_LIMIT`): a group
+    // barrier would wait for them (#1426's form keeps them, out of EXEC, in such a program)
+    if matches!(stage, Stage::Compute(_)) && insts.iter().any(|d| d.inst.name == "S_BARRIER") {
+        return Err("s_barrier: the lanes past a dispatch's thread limit leave at the start".into());
+    }
     let kernel = matches!(stage, Stage::Kernel);
     let graphics = matches!(stage, Stage::Vertex | Stage::Pixel);
     // a PS: lanes may run outside the launch EXEC (its helper lanes); a VS has none, each D3D
@@ -1304,12 +1316,15 @@ fn lower_with<I: Ir>(insts: &[Decoded], stage: Stage, wave64: bool, mut ir: I, s
             prev = c;
         }
     }
-    // compute: every lane that runs is in EXEC, and nothing is stored at the end – the skip and
-    // store blocks are left unreachable (a bare `ret`)
+    // compute: every lane that runs is in EXEC, and nothing is stored at the end – the store
+    // blocks are left unreachable, and the skip block (a bare `ret`) takes the groups past a
+    // folded dispatch's count
     if kernel {
         preds[skip] = vec![0];
         preds[sstore] = vec![exit];
         preds[vstore] = vec![exit, sstore];
+    } else if matches!(stage, Stage::Compute(_)) {
+        preds[skip] = vec![0];
     }
     preds[exit] = kernel.then_some(skip).into_iter().chain(ends.iter().map(|&b| tail[b])).collect();
     for i in 0..count {
@@ -1402,11 +1417,46 @@ fn lower_with<I: Ir>(insts: &[Decoded], stage: Stage, wave64: bool, mut ir: I, s
         }
         Stage::Compute(cs) => {
             let (flat, tid) = l.ir.compute_ids(cs.threads);
+            // a dispatch folded into Y (`IO_GROUP_LIMIT` not 0: the console's group count in X):
+            // the group in X from both ids, the groups past the count leave at once
+            let a = l.ir.int(super::IO_GROUP_LIMIT as u32);
+            let limit = l.ir.io_load(a);
+            let (gx, gy) = (l.ir.group_id(0), l.ir.group_id(1));
+            let k = l.ir.int(super::FOLD_X);
+            let rows = l.ir.bin(Bin::Mul, gy, k);
+            let group = l.ir.bin(Bin::Add, gx, rows);
+            let z = l.ir.int(0);
+            let folded = l.ir.icmp(Cmp::Ne, limit, z);
+            let ids = [l.ir.select(folded, group, gx), l.ir.select(folded, z, gy)];
+            let inside = l.ir.icmp(Cmp::Ult, group, limit);
+            let t = l.ir.boolean(true);
+            let runs = l.ir.select(folded, inside, t);
+            // a dispatch with thread dimensions (`IO_THREAD_LIMIT`, 0: no limit): a lane whose
+            // thread along an axis (the console's group, unfolded, times the group size plus
+            // its thread in the group) is at or past the count leaves with the groups past a
+            // folded count, as a thread the console never started: every lane that runs is
+            // still in EXEC. (A count less 1 is the last thread that runs: 0 passes them all.)
+            let groups = [ids[0], ids[1], l.ir.group_id(2)];
+            let mut stays = t;
+            let mut last = [z; 3];
+            for k in 0..3 {
+                let a = l.ir.int(super::IO_THREAD_LIMIT[k] as u32);
+                let n = l.ir.io_load(a);
+                let all = l.ir.int(u32::MAX);
+                last[k] = l.ir.bin(Bin::Add, n, all);
+                let size = l.ir.int(cs.threads[k]);
+                let first = l.ir.bin(Bin::Mul, groups[k], size);
+                let thread = l.ir.bin(Bin::Add, first, tid[k]);
+                let ok = l.ir.icmp(Cmp::Ule, thread, last[k]);
+                stays = l.ir.bin(Bin::And, stays, ok);
+            }
+            l.ir.before_lanes_leave(cs.threads, groups, last);
+            let runs = l.ir.bin(Bin::And, runs, stays);
             // system SGPRs after the user data: the enabled group ids, then TG_SIZE
             let mut next = cs.user_sgprs as u8;
             for k in 0..3 {
                 if cs.tgid[k as usize] {
-                    let g = l.ir.group_id(k);
+                    let g = if k < 2 { ids[k as usize] } else { l.ir.group_id(k) };
                     l.write_num(0, next, g);
                     next += 1;
                 }
@@ -1436,7 +1486,7 @@ fn lower_with<I: Ir>(insts: &[Decoded], stage: Stage, wave64: bool, mut ir: I, s
             // every lane that runs is in EXEC
             let t = l.ir.boolean(true);
             l.write_bit(0, EXEC, t);
-            l.ir.br(blk(0));
+            l.ir.br_if(runs, blk(0), skip);
             l.ir.at(skip);
             l.ssa.seal(&mut l.ir, skip);
             l.ir.ret();
@@ -3096,6 +3146,95 @@ pub(crate) mod tests {
             }
         }
         mem
+    }
+
+    /// Each thread stores its index in the dispatch at that word: `(gid.x << sh) + v0` (a group
+    /// of `1 << sh` threads in X, `gid.x` in s2), or with `rows` (an 8 x 8 group, `gid.y` in s3,
+    /// `rows` groups of them in X) `(((gid.y << 3) + v1) * 8 * rows) + (gid.x << 3) + v0`. With
+    /// `count` it stores the lanes of its wave in EXEC (`s_bcnt1` of EXEC) instead.
+    pub(crate) fn thread_index_program(sh: u64, rows: Option<u64>, count: Option<bool>) -> Vec<I> {
+        let leak = |f: Vec<(&'static str, u64)>| -> &'static [(&'static str, u64)] { Box::leak(f.into_boxed_slice()) };
+        let mut p: Vec<I> = vec![("V_LSHL_ADD_U32", "ENC_VOP3", leak(vec![("VDST", 4), ("SRC0", 2), ("SRC1", 128 + sh), ("SRC2", V)]))];
+        if let Some(r) = rows {
+            p.push(("V_LSHL_ADD_U32", "ENC_VOP3", &[("VDST", 5), ("SRC0", 3), ("SRC1", 131), ("SRC2", V + 1)]));
+            p.push(("V_LSHL_ADD_U32", "ENC_VOP3", leak(vec![("VDST", 4), ("SRC0", V + 5), ("SRC1", 128 + 3 + r.trailing_zeros() as u64), ("SRC2", V + 4)])));
+        }
+        p.extend_from_slice(&[("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 6), ("SRC0", 130), ("VSRC1", 4)]), ("V_MOV_B32", "ENC_VOP1", &[("VDST", 7), ("SRC0", 128)])]);
+        if let Some(wave64) = count {
+            p.push(if wave64 { ("S_BCNT1_I32_B64", "ENC_SOP1", &[("SDST", 8), ("SSRC0", EXEC as u64)]) } else { ("S_BCNT1_I32_B32", "ENC_SOP1", &[("SDST", 8), ("SSRC0", EXEC as u64)]) });
+            p.push(("V_MOV_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", 8)]));
+        }
+        p.extend_from_slice(&[("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 6), ("DATA", 4), ("SADDR", 0x7D)]), ENDPGM]);
+        p
+    }
+
+    /// The lanes past a dispatch's thread limit (`IO_THREAD_LIMIT`) leave the per-lane form at
+    /// its start, as threads the console never started: they store nothing and are in no
+    /// ballot. In wave32 and wave64, for a limit in the last console wave of a group and one in
+    /// the upper half of a wave64; folded into Y (the console's group from both ids); in Y of
+    /// 8 x 8 groups, and in X and Y; a limit of 0 limits nothing.
+    #[test]
+    fn the_lanes_past_a_thread_limit_leave_the_per_lane_form() {
+        use crate::gpu::recomp::{CsInterface, FOLD_X, IO_GROUP_LIMIT, IO_THREAD_LIMIT};
+        const NONE: u32 = 0xFFFF_FFFF;
+        // the memory after the `groups` (each wave of each) run with `io` set
+        let run = |lines: &[I], cs: &CsInterface, wave64: bool, groups: &[[u32; 3]], set: &[(usize, u32)], words: usize| {
+            let ir = lower_compute(&decode(lines), cs, wave64, Interp::default()).unwrap_or_else(|e| panic!("{e}"));
+            let lanes = if wave64 { 64 } else { 32 };
+            let mut io = vec![0u32; KERNEL_SGPRS];
+            for &(k, v) in set {
+                io[k] = v;
+            }
+            let (mut res, mut mem) = (vec![0u32; KERNEL_SGPRS], vec![NONE; words]);
+            let threads: u32 = cs.threads.iter().product();
+            for &g in groups {
+                for w in (0..threads).step_by(lanes) {
+                    ir.run_with((lanes as u32).min(threads - w) as usize, w, g, &io, &mut res, &mut mem);
+                }
+            }
+            mem
+        };
+        let cs = |threads: [u32; 3], y: bool| CsInterface { threads, user_sgprs: 2, tgid: [true, y, false], tg_size: false, tid_components: if y { 2 } else { 1 } };
+        let limit = |x: u32, y: u32| vec![(IO_THREAD_LIMIT[0], x), (IO_THREAD_LIMIT[1], y)];
+        for wave64 in [false, true] {
+            let lanes = if wave64 { 64 } else { 32 };
+            // 64 threads a group, 4 groups
+            let groups: Vec<[u32; 3]> = (0..4).map(|g| [g, 0, 0]).collect();
+            for l in [3 * 64 + 40, 3 * 64 + 20, 0] {
+                let mem = run(&thread_index_program(6, None, None), &cs([64, 1, 1], false), wave64, &groups, &limit(l, 0), 256);
+                for (k, &got) in mem.iter().enumerate() {
+                    assert_eq!(got, if l == 0 || (k as u32) < l { k as u32 } else { NONE }, "wave64 {wave64}, limit {l}: thread {k}");
+                }
+                // EXEC holds the wave's threads below the limit
+                let mem = run(&thread_index_program(6, None, Some(wave64)), &cs([64, 1, 1], false), wave64, &groups, &limit(l, 0), 256);
+                for (k, &got) in mem.iter().enumerate() {
+                    let first = k as u32 / lanes * lanes;
+                    let n = if l == 0 { lanes } else { l.saturating_sub(first).min(lanes) };
+                    assert_eq!(got, if l == 0 || (k as u32) < l { n } else { NONE }, "wave64 {wave64}, limit {l}: thread {k}'s EXEC");
+                }
+            }
+            // folded: 65 537 console groups of 4 threads as 65 535 x 2; the groups about the fold
+            // and past the count (the last console group ends at its fourth thread)
+            let (n, l) = (FOLD_X + 2, 4 * (FOLD_X + 1) + 3);
+            let around = [[FOLD_X - 1, 0, 0], [0, 1, 0], [1, 1, 0], [2, 1, 0]];
+            let mut set = limit(l, 0);
+            set.push((IO_GROUP_LIMIT, n));
+            let mem = run(&thread_index_program(2, None, None), &cs([4, 1, 1], false), wave64, &around, &set, 4 * (FOLD_X as usize + 3));
+            for (k, &got) in mem.iter().enumerate() {
+                let ran = (k as u32) >= 4 * (FOLD_X - 1) && (k as u32) < l;
+                assert_eq!(got, if ran { k as u32 } else { NONE }, "wave64 {wave64}, folded: thread {k}");
+            }
+            // 2 x 2 groups of 8 x 8: 16 x 16 threads, a limit in Y (13) and in X and Y (11 x 13)
+            let groups = [[0, 0, 0], [1, 0, 0], [0, 1, 0], [1, 1, 0]];
+            for (lx, ly) in [(0, 13), (11, 13), (0, 0)] {
+                let mem = run(&thread_index_program(3, Some(2), None), &cs([8, 8, 1], true), wave64, &groups, &limit(lx, ly), 256);
+                for (k, &got) in mem.iter().enumerate() {
+                    let (x, y) = (k as u32 % 16, k as u32 / 16);
+                    let ran = (lx == 0 || x < lx) && (ly == 0 || y < ly);
+                    assert_eq!(got, if ran { k as u32 } else { NONE }, "wave64 {wave64}, limit {lx} x {ly}: thread ({x}, {y})");
+                }
+            }
+        }
     }
 
     /// 2-D and 3-D groups of 64 threads.

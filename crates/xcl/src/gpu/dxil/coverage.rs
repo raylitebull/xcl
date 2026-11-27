@@ -246,14 +246,15 @@ pub fn percentiles(v: &[u64]) -> (u64, u64, u64) {
 
 /// One program through the direct translator for `mode`. Panics (outside the translator's
 /// own thread) come back as `"panic: …"`; `validate` runs DXC's validator on the result
-/// (the translator itself only validates in debug / test builds).
-pub fn translate_mode(code: &[u8], mode: &Mode, o: KernelOptions, validate: bool) -> Result<Vec<u8>, String> {
+/// (the translator itself only validates in debug / test builds). `rodata`: the constant data
+/// after the program (`xbox::Fssm::rodata`).
+pub fn translate_mode(code: &[u8], mode: &Mode, o: KernelOptions, validate: bool, rodata: &[(u32, Vec<u32>)]) -> Result<Vec<u8>, String> {
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match mode {
-        Mode::Kernel => kernel::translate_full(code, o),
-        Mode::Compute(cs) => kernel::translate_compute(code, o, cs),
-        Mode::Vertex(vs) => kernel::translate_vertex(code, KernelOptions { split: false, ..o }, vs),
-        Mode::Pixel(ps) => kernel::translate_pixel(code, KernelOptions { split: false, ..o }, ps),
-        Mode::Mesh(ms) => kernel::translate_mesh(code, o, ms),
+        Mode::Kernel => kernel::translate_entry_rodata(code, o, kernel::Entry::Kernel, rodata),
+        Mode::Compute(cs) => kernel::translate_entry_rodata(code, o, kernel::Entry::Compute(cs.clone()), rodata),
+        Mode::Vertex(vs) => kernel::translate_entry_rodata(code, KernelOptions { split: false, ..o }, kernel::Entry::Vertex(vs.clone()), rodata),
+        Mode::Pixel(ps) => kernel::translate_entry_rodata(code, KernelOptions { split: false, ..o }, kernel::Entry::Pixel(ps.clone()), rodata),
+        Mode::Mesh(ms) => kernel::translate_entry_rodata(code, o, kernel::Entry::Mesh(ms.clone()), rodata),
         Mode::Geometry(g) => kernel::translate_geometry(code, o, g),
     }));
     let k = match r {
@@ -405,7 +406,7 @@ mod tests {
         let mut r = Report::default();
         for (name, code, mode) in [("ok", ok.clone(), Mode::Kernel), ("gs", ok, Mode::Geometry(Default::default()))] {
             let t0 = std::time::Instant::now();
-            let res = translate_mode(&code, &mode, o, false).map(|d| d.len());
+            let res = translate_mode(&code, &mode, o, false, &[]).map(|d| d.len());
             r.add(name, &Sample { stage: stage_name(&mode), result: res, time: t0.elapsed(), hlsl_size: None });
         }
         assert_eq!(r.stages["kernel"].translated, 1, "{}", r.text(5));

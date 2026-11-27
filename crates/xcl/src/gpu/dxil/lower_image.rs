@@ -5,7 +5,7 @@
 //! `recomp/emit.rs` `mimg` and `bvh_intersect`; compute rules: no implicit
 //! derivatives, so implicit-LOD samples take LOD 0 / the bias).
 
-use super::lower::{err, LResult, Lw, VAR_VGPR};
+use super::lower::{err, LResult, Lw, VAR_VGPR, VAR_WIN};
 use super::module::{BinOp, Pred, Value};
 use super::ops::{AtomicOp, CompType, Sampler, TexKind, Texture};
 use super::ops_core::op;
@@ -948,7 +948,22 @@ impl Lw {
             let act = self.act();
             let out = [self.tmp_var(), self.tmp_var(), self.tmp_var(), self.tmp_var()];
             self.guarded(act, &mut |lw| {
-                lw.bvh_intersect(ty, a, extent, origin, dir, inv, sort, out)?;
+                if lw.windowed() {
+                    // The raw memory accessor returns zeros for a missing
+                    // window. Those zeros are not a box with four child IDs.
+                    let window = lw.rd(VAR_WIN);
+                    let valid = lw.cmpc(Pred::ULt, window, lw.mems.len() as u32);
+                    let tri = lw.cmpc(Pred::ULt, ty, 4);
+                    for (&t, bits) in out.iter().zip([0x7f80_0000, 0x3f80_0000, 0, 0]) {
+                        let triangle = lw.c(bits);
+                        let box_miss = lw.c(u32::MAX);
+                        let miss = lw.sel(tri, triangle, box_miss);
+                        lw.wr(t, miss);
+                    }
+                    lw.guarded(valid, &mut |lw| lw.bvh_intersect(ty, a, extent, origin, dir, inv, sort, out))?;
+                } else {
+                    lw.bvh_intersect(ty, a, extent, origin, dir, inv, sort, out)?;
+                }
                 for (c, &t) in out.iter().enumerate() {
                     let v = lw.rd(t);
                     lw.wr(VAR_VGPR + (vdata + c as u64) as u32, v);

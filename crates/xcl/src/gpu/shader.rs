@@ -215,8 +215,8 @@ pub fn readable(p: usize, len: usize) -> bool {
     if crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(p, len)) {
         return true;
     }
-    if resident_and_readable(p, end) {
-        return true;
+    if let Some(answer) = pages_readable(p, end) {
+        return answer;
     }
     let mut cur = p;
     while cur < end {
@@ -230,36 +230,59 @@ pub fn readable(p: usize, len: usize) -> bool {
     true
 }
 
-/// Whether each page of `[p, end)` (up to 16 pages) is in the working set with a readable
-/// protection, asked of the kernel for all the pages in one call that touches none of them.
-/// `readable` asks this first because `VirtualQuery` sizes the whole region around an address by
-/// walking it: in a title's 2 GB block of committed memory that took 20–25 ms a call, and a retail game's
-/// streaming thread, which has the page arrays of its DirectStorage requests checked, spent most
-/// of the world load there. `false` for a page that is not resident (never touched, paged out,
-/// guard, reserved, no access): the `VirtualQuery` walk answers for those.
-fn resident_and_readable(p: usize, end: usize) -> bool {
+/// Whether each page of `[p, end)` is readable, asked of the working set – the kernel answers for
+/// up to 512 pages in one call that touches none of them. `readable` asks this first because
+/// `VirtualQuery` sizes the whole region around an address by walking it: in a title's 2 GB block
+/// of committed memory that took 20–30 ms a call. A retail game's streaming thread, which has
+/// the page arrays of its DirectStorage requests checked, spent most of the world load there;
+/// so did the submits, which check each texture of more than 64 KiB that was written (30–50 ms
+/// of a frame).
+///
+/// None: ask `VirtualQuery` – the working set cannot be asked, or a range of up to 16 pages (a
+/// title's pointer that may be garbage) has a page that is not resident (never touched, paged
+/// out, guard, reserved, no access). In a longer range such a page is read by the kernel (a
+/// byte of it): a committed one is then resident, as the caller's reads would make it, any other
+/// is not readable.
+fn pages_readable(p: usize, end: usize) -> Option<bool> {
+    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Memory::{PAGE_GUARD, PAGE_NOACCESS};
     use windows_sys::Win32::System::ProcessStatus::{K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_INFORMATION};
-    const MAX_PAGES: usize = 16;
-    let first = p >> 12;
-    let pages = ((end - 1) >> 12) - first + 1;
-    if pages > MAX_PAGES {
-        return false;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    const SMALL: usize = 16;
+    const BATCH: usize = 512;
+    let (first, last) = (p >> 12, (end - 1) >> 12);
+    let small = last - first < SMALL;
+    let mut ws: [PSAPI_WORKING_SET_EX_INFORMATION; BATCH] = unsafe { std::mem::zeroed() };
+    let mut at = first;
+    while at <= last {
+        let n = (last - at + 1).min(BATCH);
+        for (k, e) in ws[..n].iter_mut().enumerate() {
+            e.VirtualAddress = ((at + k) << 12) as *mut std::ffi::c_void;
+            e.VirtualAttributes.Flags = 0;
+        }
+        let size = (n * std::mem::size_of::<PSAPI_WORKING_SET_EX_INFORMATION>()) as u32;
+        if unsafe { K32QueryWorkingSetEx(GetCurrentProcess(), ws.as_mut_ptr() as *mut std::ffi::c_void, size) } == 0 {
+            return None;
+        }
+        for e in &ws[..n] {
+            // PSAPI_WORKING_SET_EX_BLOCK: bit 0 Valid, bits 4-14 Win32Protection
+            let flags = unsafe { e.VirtualAttributes.Flags };
+            let protect = ((flags >> 4) & 0x7FF) as u32;
+            if flags & 1 != 0 && protect != 0 && protect & (PAGE_NOACCESS | PAGE_GUARD) == 0 {
+                continue;
+            }
+            if small {
+                return None;
+            }
+            let (mut byte, mut got) = (0u8, 0usize);
+            let ok = unsafe { ReadProcessMemory(GetCurrentProcess(), e.VirtualAddress as *const std::ffi::c_void, &mut byte as *mut u8 as *mut std::ffi::c_void, 1, &mut got) };
+            if ok == 0 || got != 1 {
+                return Some(false);
+            }
+        }
+        at += n;
     }
-    let mut ws: [PSAPI_WORKING_SET_EX_INFORMATION; MAX_PAGES] = unsafe { std::mem::zeroed() };
-    for (k, e) in ws[..pages].iter_mut().enumerate() {
-        e.VirtualAddress = ((first + k) << 12) as *mut std::ffi::c_void;
-    }
-    let size = (pages * std::mem::size_of::<PSAPI_WORKING_SET_EX_INFORMATION>()) as u32;
-    if unsafe { K32QueryWorkingSetEx(windows_sys::Win32::System::Threading::GetCurrentProcess(), ws.as_mut_ptr() as *mut std::ffi::c_void, size) } == 0 {
-        return false;
-    }
-    // PSAPI_WORKING_SET_EX_BLOCK: bit 0 Valid, bits 4-14 Win32Protection
-    ws[..pages].iter().all(|e| {
-        let flags = unsafe { e.VirtualAttributes.Flags };
-        let protect = ((flags >> 4) & 0x7FF) as u32;
-        flags & 1 != 0 && protect != 0 && protect & (PAGE_NOACCESS | PAGE_GUARD) == 0
-    })
+    Some(true)
 }
 
 /// Record a shader blob submitted by the title. Safe on garbage pointers.
@@ -290,7 +313,7 @@ pub fn capture(stage: &str, ptr: usize, len: usize) {
         *st.stats.unknown_parts.entry(p.fourcc.clone()).or_default() += 1;
     }
     drop(g);
-    if !dumps_enabled() {
+    if !dumps_enabled(stage, h) {
         let names: Vec<&str> = parts.iter().map(|p| p.fourcc.as_str()).collect();
         crate::xlog_info!("[SHADER] {stage} {h:016x}: {} B, format {}, parts [{}]", blob.len(), kind.label(), names.join(","));
         if kind == Kind::XboxNative {
@@ -320,9 +343,21 @@ pub fn capture(stage: &str, ptr: usize, len: usize) {
 /// more for that: the report's `recomp_*` counts come from it). Off by default: a retail game's
 /// ~17 000 dumps took 4.8 GB, and translating each again took its loading threads ~0.1 s a
 /// program at every start.
-fn dumps_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("XCL_DUMP_SHADERS").is_ok_and(|v| v == "1"))
+/// `XCL_DUMP_SHADERS=ps,0123456789abcdef`: only the shaders of those stages (as the log names
+/// them: `vs`, `ps`, `cs` …) and the ones with those dump hashes (16 hex digits).
+fn dumps_enabled(stage: &str, h: u64) -> bool {
+    static WANTED: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    dump_wanted(WANTED.get_or_init(|| dump_list(&std::env::var("XCL_DUMP_SHADERS").unwrap_or_default())), stage, h)
+}
+
+/// The items of an `XCL_DUMP_SHADERS` value.
+fn dump_list(v: &str) -> Vec<String> {
+    v.split(',').map(|s| s.trim().to_ascii_lowercase()).filter(|s| !s.is_empty()).collect()
+}
+
+/// Whether a list of `XCL_DUMP_SHADERS` items asks for the shader of `stage` with dump hash `h`.
+fn dump_wanted(list: &[String], stage: &str, h: u64) -> bool {
+    list.iter().any(|s| s == "1" || s.eq_ignore_ascii_case(stage) || (s.len() == 16 && u64::from_str_radix(s, 16) == Ok(h)))
 }
 
 /// Console container without dumps: its FSSM variants and instructions accounted.
@@ -432,6 +467,38 @@ pub fn stats() -> ShaderStats {
 
 #[cfg(test)]
 mod tests {
+    /// Ranges of any size are answered page by page: committed pages (touched or not) are
+    /// readable, a reserved or no-access page anywhere in the range is not.
+    #[test]
+    fn readable_answers_for_long_ranges_page_by_page() {
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, VirtualProtect, MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE};
+        const PAGES: usize = 1200;
+        unsafe {
+            // (reserved pages of its own behind the committed ones)
+            let base = VirtualAlloc(std::ptr::null(), (PAGES + 16) << 12, MEM_RESERVE, PAGE_READWRITE) as usize;
+            assert_ne!(base, 0);
+            assert!(!VirtualAlloc(base as *const _, PAGES << 12, MEM_COMMIT, PAGE_READWRITE).is_null());
+            assert!(super::readable(base, PAGES << 12), "committed, none touched");
+            for k in (0..PAGES).step_by(3) {
+                *((base + (k << 12)) as *mut u8) = 1;
+            }
+            assert!(super::readable(base, PAGES << 12), "committed, some touched");
+            assert!(super::readable(base + 100, (PAGES << 12) - 100), "not from a page's start");
+            assert!(!super::readable(base, (PAGES << 12) + 1), "past the end");
+            let hole = base + (700 << 12);
+            VirtualFree(hole as *mut _, 1 << 12, MEM_DECOMMIT);
+            assert!(!super::readable(base, PAGES << 12), "a reserved page inside");
+            assert!(super::readable(base, 700 << 12), "up to the hole");
+            assert!(super::readable(hole + (1 << 12), 499 << 12), "behind the hole");
+            assert!(!super::readable(hole, 16), "the hole itself");
+            let mut old = 0;
+            assert_ne!(VirtualProtect((base + (40 << 12)) as *const _, 1 << 12, PAGE_NOACCESS, &mut old), 0);
+            assert!(!super::readable(base, 100 << 12), "a no-access page inside");
+            assert!(super::readable(base, 40 << 12));
+            VirtualFree(base as *mut _, 0, MEM_RELEASE);
+        }
+    }
+
     use super::*;
 
     fn container(parts: &[(&[u8; 4], &[u8])]) -> Vec<u8> {
@@ -481,6 +548,23 @@ mod tests {
         assert!(l.contains("FSSM #0 [PS]") && l.contains("v_add_f32"), "{l}");
     }
 
+    /// `XCL_DUMP_SHADERS`: `1` is every shader, a stage name that stage, 16 hex digits one
+    /// shader – and a hash is not taken for a stage, nor "1" for a hash.
+    #[test]
+    fn a_dump_list_names_stages_and_hashes() {
+        let h = 0x0942_b913_6a89_143du64;
+        assert!(dump_wanted(&dump_list("1"), "cs", h));
+        assert!(!dump_wanted(&dump_list(""), "ps", h));
+        assert!(!dump_wanted(&dump_list("0"), "ps", 0));
+        let ps = dump_list(" PS , 0942b9136a89143d ");
+        assert!(dump_wanted(&ps, "ps", 7), "a stage");
+        assert!(dump_wanted(&ps, "vs", h), "a hash, whatever its stage");
+        assert!(!dump_wanted(&ps, "vs", h + 1));
+        assert!(!dump_wanted(&dump_list("0000000000000001"), "vs", 7));
+        assert!(dump_wanted(&dump_list("0000000000000001"), "vs", 1));
+        assert!(!dump_wanted(&dump_list("1x"), "vs", 1), "not every shader");
+    }
+
     #[test]
     fn readable_rejects_garbage() {
         assert!(!readable(0, 10));
@@ -503,14 +587,15 @@ mod tests {
             std::ptr::write_volatile(page(0) as *mut u8, 1);
             std::ptr::write_volatile(page(1) as *mut u8, 1);
             // written pages: answered from the working set
-            assert!(resident_and_readable(page(0), page(2)));
+            assert_eq!(pages_readable(page(0), page(2)), Some(true));
             assert!(readable(page(0), 2 << 12));
             assert!(readable(page(0) + 100, 8));
             // untouched pages: the region walk answers, and they stay untouched
-            assert!(!resident_and_readable(page(5), page(5) + 8));
+            assert_eq!(pages_readable(page(5), page(5) + 8), None);
             assert!(readable(page(5), 8));
             assert!(readable(page(6), 1 << 12));
-            assert!(!resident_and_readable(page(5), page(7)));
+            assert_eq!(pages_readable(page(5), page(7)), None);
+            assert_eq!(pages_readable(page(3), page(3) + 8), None, "a guard page is not touched to answer");
             assert!(!readable(page(2), 8));
             assert!(!readable(page(3), 8));
             assert!(!readable(page(4), 8));
@@ -524,9 +609,9 @@ mod tests {
             assert!(!readable(page(0), 20 << 12));
             VirtualFree(base as *mut _, 0, MEM_RELEASE);
         }
-        // more pages than one working-set query takes: the region walk
+        // a range of many pages: the working set too
         let v = vec![1u8; 32 << 12];
-        assert!(!resident_and_readable(v.as_ptr() as usize, v.as_ptr() as usize + v.len()));
+        assert_eq!(pages_readable(v.as_ptr() as usize, v.as_ptr() as usize + v.len()), Some(true));
         assert!(readable(v.as_ptr() as usize, v.len()));
     }
 }

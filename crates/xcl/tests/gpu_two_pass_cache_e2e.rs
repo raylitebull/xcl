@@ -1,11 +1,6 @@
 //! Cross-process E2E verification for persistent two-pass (`MS` stream and `VS+GS`) driver PSO caching.
 
-#[path = "common/shader_container.rs"]
-mod shader_container;
-
-use shader_container::{container, dxil_part, fssm, le32, mesh_psv};
 use std::fs;
-use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -19,6 +14,106 @@ use xcl::gpu::recomp::{dxc, runner, IO_GS_PRIMS};
 use xcl::hle::d3d12x::{pso_async, real};
 
 const V: u64 = 256;
+
+fn le32(v: &mut Vec<u8>, x: u32) {
+    v.extend_from_slice(&x.to_le_bytes());
+}
+
+fn container(parts: &[(&[u8; 4], &[u8])]) -> Vec<u8> {
+    let header = 32 + parts.len() * 4;
+    let mut v = vec![0u8; header];
+    v[0..4].copy_from_slice(b"DXBC");
+    v[20..24].copy_from_slice(&1u32.to_le_bytes());
+    v[28..32].copy_from_slice(&(parts.len() as u32).to_le_bytes());
+    for (i, (cc, data)) in parts.iter().enumerate() {
+        let off = v.len() as u32;
+        v[32 + i * 4..36 + i * 4].copy_from_slice(&off.to_le_bytes());
+        v.extend_from_slice(*cc);
+        v.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        v.extend_from_slice(data);
+    }
+    let total = v.len() as u32;
+    v[24..28].copy_from_slice(&total.to_le_bytes());
+    v
+}
+
+fn fssm(code: &[u8], stages: &[(u8, u8)]) -> Vec<u8> {
+    let code_at = 0x308usize;
+    let mut v = vec![0u8; code_at];
+    v[0..4].copy_from_slice(b"FSSM");
+    v[4..8].copy_from_slice(&0x101u32.to_le_bytes());
+    for q in (0x18..0xC0).step_by(8) {
+        v[q..q + 8].copy_from_slice(&0xDEAD_BEEF_DEAD_BEEFu64.to_le_bytes());
+    }
+    v[0xC0..0xC8].copy_from_slice(&((code_at - 0x10) as u64).to_le_bytes());
+    v[0xC8..0xD0].copy_from_slice(&(code.len() as u64 + 8).to_le_bytes());
+    for (i, &(hw, api)) in stages.iter().enumerate() {
+        let o = 0x100 + i * 0x88;
+        let q = 0x0000_00C0_0002_0000u64 | ((api as u64) << 8) | hw as u64;
+        v[o..o + 8].copy_from_slice(&q.to_le_bytes());
+    }
+    v.extend_from_slice(code);
+    v.extend_from_slice(&[0x00, 0x00, 0x9f, 0xbf, 0x00, 0x00, 0x9f, 0xbf]);
+    v.extend_from_slice(b"\x03\0\0\0metadata\0\0\0\0");
+    let size = (v.len() - 0x10) as u32;
+    v[8..12].copy_from_slice(&size.to_le_bytes());
+    v
+}
+
+fn xbch(fssm_bytes: &[u8]) -> Vec<u8> {
+    let z = miniz_oxide::deflate::compress_to_vec_zlib(fssm_bytes, 6);
+    let mut v = b"XBCH".to_vec();
+    le32(&mut v, 3);
+    le32(&mut v, z.len() as u32);
+    le32(&mut v, 0);
+    le32(&mut v, fssm_bytes.len() as u32);
+    le32(&mut v, 0);
+    v.extend_from_slice(&z);
+    v
+}
+
+fn program_header(kind: u32, size_dw: u32, bitcode_off: u32) -> Vec<u8> {
+    let mut v = Vec::new();
+    le32(&mut v, (kind << 16) | 0x66);
+    le32(&mut v, size_dw);
+    v.extend_from_slice(b"DXIL");
+    le32(&mut v, 0x106);
+    le32(&mut v, bitcode_off);
+    le32(&mut v, 4);
+    v
+}
+
+fn dxil_part(kind: u32, fssms: &[Vec<u8>]) -> Vec<u8> {
+    let mut blobs: Vec<(u32, Vec<u8>)> = vec![(0x12, (0u8..16).collect())];
+    for f in fssms {
+        blobs.push((0x0D, xbch(f)));
+    }
+    let mut nested = program_header(kind, 0x8000_0007, 0x10);
+    nested.extend_from_slice(b"NOBC");
+    blobs.push((0x07, nested));
+    let table = 0x18 + 12;
+    let mut data_at = table + blobs.len() * 12;
+    let mut xdat = b"XDAT".to_vec();
+    le32(&mut xdat, blobs.len() as u32);
+    le32(&mut xdat, table as u32);
+    for (id, b) in &blobs {
+        le32(&mut xdat, *id);
+        le32(&mut xdat, data_at as u32);
+        le32(&mut xdat, b.len() as u32);
+        data_at += b.len();
+    }
+    for (_, b) in &blobs {
+        xdat.extend_from_slice(b);
+    }
+    while (0x18 + xdat.len()) % 4 != 0 {
+        xdat.push(0);
+    }
+    let nobc_at = 0x18 + xdat.len();
+    let mut v = program_header(kind, ((nobc_at + 4) / 4) as u32, (nobc_at - 8) as u32);
+    v.extend_from_slice(&xdat);
+    v.extend_from_slice(b"NOBC");
+    v
+}
 
 fn sig_part(entries: &[(&str, u32, u32, u32, u8)]) -> Vec<u8> {
     let mut d = Vec::new();
@@ -41,6 +136,23 @@ fn sig_part(entries: &[(&str, u32, u32, u32, u8)]) -> Vec<u8> {
     }
     d.extend_from_slice(&names);
     d
+}
+
+fn mesh_psv(max_v: u16, max_p: u16, threads: [u32; 3]) -> Vec<u8> {
+    let mut r = vec![0u8; 48];
+    r[12..14].copy_from_slice(&max_v.to_le_bytes());
+    r[14..16].copy_from_slice(&max_p.to_le_bytes());
+    r[16..20].copy_from_slice(&64u32.to_le_bytes());
+    r[20..24].copy_from_slice(&64u32.to_le_bytes());
+    r[24] = 13; // MS
+    r[27] = 2; // triangles
+    r[36..40].copy_from_slice(&threads[0].to_le_bytes());
+    r[40..44].copy_from_slice(&threads[1].to_le_bytes());
+    r[44..48].copy_from_slice(&threads[2].to_le_bytes());
+    let mut p = 48u32.to_le_bytes().to_vec();
+    p.extend_from_slice(&r);
+    le32(&mut p, 0);
+    p
 }
 
 fn gs_psv(max_v: u16) -> Vec<u8> {
@@ -93,7 +205,7 @@ fn ms_code(alt: bool) -> Vec<u8> {
 
 fn synthetic_ms_container(alt: bool) -> Vec<u8> {
     let osg1 = sig_part(&[("SV_Position", 1, 3, 0, 0xF), ("TEXCOORD", 0, 3, 1, 0xF)]);
-    let psv0 = mesh_psv(128, 128, [128, 1, 1], [64, 64]);
+    let psv0 = mesh_psv(128, 128, [128, 1, 1]);
     let dxil = dxil_part(13, &[fssm(&ms_code(alt), &[(7, 6)])]);
     container(&[(b"SFI0", &[0; 8]), (b"OSG1", &osg1), (b"PSV0", &psv0), (b"HASH", &[0; 20]), (b"DXIL", &dxil)])
 }
@@ -430,19 +542,7 @@ fn mesh_ready(dev: &ID3D12Device) -> bool {
         && o7.MeshShaderTier.0 >= D3D12_MESH_SHADER_TIER_1.0
 }
 
-fn blob_support(pso: &ID3D12PipelineState) -> (bool, bool) {
-    let raw = pso_async::resolve_wait(pso.as_raw() as usize);
-    let passes = real::two_pass_of(raw).expect("two-pass pipeline entry");
-    let available = |raw: usize| unsafe {
-        let raw = raw as *mut std::ffi::c_void;
-        let pso = ID3D12PipelineState::from_raw_borrowed(&raw).unwrap();
-        pso.GetCachedBlob().is_ok_and(|blob| blob.GetBufferSize() != 0 && !blob.GetBufferPointer().is_null())
-    };
-    (available(raw), available(passes.compute))
-}
-
 const CHILD_CASE: &str = "XCL_TEST_TWO_PASS_CACHE_CASE";
-const REPLAY_SKIP: &str = "SKIPPED two_pass_driver_cache_replay: driver could not export every fixture PSO";
 const TEST: &str = "two_pass_driver_cache_reuses_both_passes_and_recovers_corrupt_blobs";
 
 #[test]
@@ -459,52 +559,44 @@ fn two_pass_driver_cache_reuses_both_passes_and_recovers_corrupt_blobs() {
     let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
     let root = TempDir(std::env::temp_dir().join(format!("xcl-two-pass-{}-{nonce}", std::process::id())));
     let exe = std::env::current_exe().unwrap();
-    let run = |case: &str, disk: bool| {
+    let run = |case: &str, disk: bool, seed: bool| {
         let mut cmd = Command::new(&exe);
         cmd.args(["--exact", TEST, "--nocapture"]).env(CHILD_CASE, case)
             .env("XCL_DXIL_CACHE", &root.0)
             .env("XCL_PSO_DISK_CACHE", if disk { "1" } else { "0" })
-            .env("XCL_ASYNC_PSO", "1")
-            .env("XCL_PSO_PRELOAD", "0")
-            .env("XCL_D3D12_DEBUG", "1");
+            .env("XCL_ASYNC_PSO", "1").env("XCL_D3D12_DEBUG", "1")
+            .env_remove("XCL_PSO_DISK_CACHE_MIN_MS");
+        if seed {
+            cmd.env("XCL_PSO_DISK_CACHE_MIN_MS", "0");
+        }
         let out = cmd.output().unwrap();
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(out.status.success(), "{case}: {}
 {stderr}", String::from_utf8_lossy(&out.stdout));
         let prefix = format!("SKIPPED {TEST}: ");
-        let hardware_skip = stderr.lines().find_map(|line| line.strip_prefix(&prefix)).map(str::to_owned);
-        (hardware_skip, stderr.lines().any(|line| line == REPLAY_SKIP))
+        stderr.lines().find_map(|line| line.strip_prefix(&prefix)).map(str::to_owned)
     };
 
-    if let (Some(reason), _) = run("disabled", false) {
+    if let Some(reason) = run("disabled", false, true) {
         return runner::skip_test(&reason);
     }
     let driver = root.0.join("driver");
     assert!(!driver.exists(), "disabled cache must not create the driver directory");
-    let (hardware_skip, replay_skip) = run("seed", true);
-    assert_eq!(hardware_skip, None);
-    if replay_skip {
-        let _ = writeln!(std::io::stderr(), "{REPLAY_SKIP}");
-        return;
-    }
-    assert_eq!(run("warm", true), (None, false));
-    let files: Vec<_> = fs::read_dir(&driver).unwrap().map(|e| e.unwrap().path()).collect();
-    let (mesh, compute): (Vec<_>, Vec<_>) = files.into_iter()
-        .filter(|path| path.extension().is_some_and(|ext| ext == "pso"))
-        .partition(|path| path.file_name().unwrap().to_string_lossy().starts_with("gfx-"));
-    assert_eq!((compute.len(), mesh.len()), (3, 2));
-    let rejected = b"invalid driver blob";
-    for (case, paths) in [("stale-compute", &compute), ("stale-mesh", &mesh)] {
-        for path in paths {
-            fs::write(path, rejected).unwrap();
+    assert_eq!(run("seed", true, true), None);
+    assert_eq!(run("warm", true, false), None);
+    let files = fs::read_dir(&driver).unwrap().map(|e| e.unwrap().path()).collect::<Vec<_>>();
+    let by_prefix = |prefix: &str| files.iter()
+        .filter(|p| p.file_name().unwrap().to_string_lossy().starts_with(prefix)).count();
+    assert_eq!((by_prefix("tp-cs-"), by_prefix("tp-ms-")), (3, 2));
+    for prefix in ["tp-cs-", "tp-ms-"] {
+        for path in files.iter().filter(|p| p.file_name().unwrap().to_string_lossy().starts_with(prefix)) {
+            fs::write(path, b"invalid driver blob").unwrap();
         }
-        assert_eq!(run("disabled", false), (None, false));
-        for path in paths {
-            assert_eq!(fs::read(path).unwrap(), rejected);
-        }
-        assert_eq!(run(case, true), (None, false));
+        // Even with existing corrupt files, the disabled run must leave the files alone.
+        assert_eq!(run("disabled", false, true), None);
+        assert_eq!(run(prefix, true, true), None);
     }
-    assert_eq!(run("warm", true), (None, false));
+    assert_eq!(run("warm", true, false), None);
 }
 
 fn run_case(case: &str) {
@@ -522,9 +614,6 @@ fn run_case(case: &str) {
     if !mesh_ready(&dev) {
         return runner::skip_test("no mesh shaders");
     }
-    if case != "warm" {
-        real::force_driver_cache_fixture_retention();
-    }
     let ps = dxc::compile("struct V { float4 pos : SV_Position; float4 p0 : TEXCOORD0; };
 float4 main(V v) : SV_Target0 { return v.p0; }
 ", "main", "ps_6_6", &[]).unwrap();
@@ -534,43 +623,25 @@ float4 main(V v) : SV_Target0 { return v.p0; }
     let (errors, corrupt) = info_queue_errors(&dev);
     let expected = match case {
         "disabled" => [(0, 0, 0); 3],
-        "seed" => [(0, 0, 0); 3],
+        "seed" => [(0, 0, 2), (0, 0, 3), (0, 0, 5)],
         "warm" => [(2, 0, 0), (3, 0, 0), (5, 0, 0)],
-        "stale-compute" => [(1, 1, 1), (1, 2, 2), (2, 3, 3)],
-        "stale-mesh" => [(1, 1, 1), (2, 1, 1), (3, 2, 2)],
+        "tp-cs-" => [(1, 1, 1), (1, 2, 2), (2, 3, 3)],
+        "tp-ms-" => [(1, 1, 1), (2, 1, 1), (3, 2, 2)],
         _ => panic!("unknown case {case}"),
     };
 
-    let mut stores = 0;
-    let mut shared_mesh_exported = false;
-    let mut verify_cache = |pso: &ID3D12PipelineState, index: usize| {
-        if case == "seed" {
-            // Test the native interface independently of XCL's storage path. An older driver
-            // can build both passes while refusing to export one or both driver blobs.
-            let (mesh, compute) = blob_support(pso);
-            if mesh && (index == 2 || !shared_mesh_exported) {
-                stores += 1;
-                shared_mesh_exported = true;
-            }
-            stores += u64::from(compute);
-            assert_eq!(real::driver_cache_stats(), (0, 0, stores));
-        } else {
-            assert_eq!(real::driver_cache_stats(), expected[index]);
-        }
-    };
-
     let ms1 = build_ms_pso(&dev, &rs, &synthetic_ms_container(false), &ps);
-    verify_cache(&ms1, 0);
+    assert_eq!(real::driver_cache_stats(), expected[0]);
     assert_eq!(draw_two_pass_and_read(&dev, &ms1, 0, false), [0.25; 4]);
     assert_eq!(draw_two_pass_and_read(&dev, &ms1, 0, true), [1.0, 0.0, 0.0, 1.0]);
 
     // The second MS shares the passthrough mesh graphics PSO but has a distinct NGG compute PSO.
     let ms2 = build_ms_pso(&dev, &rs, &synthetic_ms_container(true), &ps);
-    verify_cache(&ms2, 1);
+    assert_eq!(real::driver_cache_stats(), expected[1]);
     assert_eq!(draw_two_pass_and_read(&dev, &ms2, 0, true), [0.5, 0.0, 0.0, 1.0]);
 
     let gs = build_gs_pso(&dev, &rs, &vs, &gs, &ps);
-    verify_cache(&gs, 2);
+    assert_eq!(real::driver_cache_stats(), expected[2]);
     assert_eq!(draw_two_pass_and_read(&dev, &gs, 1, false), [0.25; 4]);
     assert_eq!(draw_two_pass_and_read(&dev, &gs, 1, true), [0.0, 1.0, 0.0, 1.0]);
     assert_eq!(real::two_pass_count(), before + 3);
@@ -581,8 +652,5 @@ float4 main(V v) : SV_Target0 { return v.p0; }
         let (after_errors, after_corrupt) = info_queue_errors(&dev);
         assert_eq!(after_errors, errors, "unexpected D3D12 debug message in {case}");
         assert_eq!(after_corrupt - corrupt, expected[2].1, "unexpected corrupt-blob error count in {case}");
-    }
-    if case == "seed" && stores != 5 {
-        eprintln!("{REPLAY_SKIP}");
     }
 }

@@ -50,13 +50,25 @@ unsafe fn borrowed<R>(fence: usize, f: impl FnOnce(&ID3D12Fence) -> R) -> Option
 }
 
 fn refresh() {
-    let g = FENCES.lock().unwrap_or_else(|e| e.into_inner());
-    for (&p, f) in g.iter().flatten() {
-        if let Some(c) = f.cell {
-            if let Some(v) = unsafe { borrowed(p, |f| f.GetCompletedValue()) } {
-                c.0.store(v, Ordering::Release);
-            }
-        }
+    // one at a time: two of them would put an older value over a newer one
+    static ONE: Mutex<()> = Mutex::new(());
+    let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+    let values: Vec<(&'static Cell, u64)> = {
+        let g = FENCES.lock().unwrap_or_else(|e| e.into_inner());
+        g.iter()
+            .flatten()
+            .filter_map(|(&p, f)| Some((f.cell?, unsafe { borrowed(p, |f| super::real::fence_completed(f)) }?)))
+            .collect()
+    };
+    if values.is_empty() {
+        return;
+    }
+    // what the lists wrote into the title's memory lands before the values that say they are done
+    // (the title reads a cell and then the memory: the cell is no promise of the hooked
+    // GetCompletedValue, which lands it as well). Not with FENCES held: see `note_queue_signal`.
+    unsafe { super::sparse::settle_readbacks_within(20) };
+    for (c, v) in values {
+        c.0.store(v, Ordering::Release);
     }
 }
 
@@ -99,7 +111,7 @@ pub(super) fn pending_summary() -> String {
     let g = FENCES.lock().unwrap_or_else(|e| e.into_inner());
     let mut parts = Vec::new();
     for (&p, f) in g.iter().flatten() {
-        let done = unsafe { borrowed(p, |f| f.GetCompletedValue()) }.unwrap_or(0);
+        let done = unsafe { borrowed(p, |f| super::real::fence_completed(&f)) }.unwrap_or(0);
         if done < f.signalled || done < f.waited {
             parts.push(format!("{p:#x}(done={done:#x}/sig={:#x}/wait={:#x},cell={})", f.signalled, f.waited, f.cell.is_some()));
         }

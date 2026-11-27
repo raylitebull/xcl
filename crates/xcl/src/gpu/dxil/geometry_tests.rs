@@ -1,7 +1,7 @@
 //! Geometry mode in the direct translator: a GS with per-lane loops and cuts, validated in
 //! every form and its records compared on the GPU with a model (and the HLSL path's native form).
 
-use super::kernel::{translate_geometry, KernelOptions};
+use super::kernel::{translate_geometry, translate_geometry_unrefused, KernelOptions};
 use crate::gpu::dxbc::SigElement;
 use crate::gpu::rdna2::encode;
 use crate::gpu::recomp::{dxc, mesh_passthrough, runner, translate_geometry as hlsl_geometry, GsInterface, HEAP_WINDOWS, IO_GS_PRIMS, IO_GS_VERTICES, MESH_HEADER};
@@ -74,18 +74,64 @@ fn opts(split: bool, windows: u32) -> KernelOptions {
     KernelOptions { wave64: true, split, mem_windows: windows, sampler_base: 0 }
 }
 
-/// Both forms, ES alone, GS alone and four memory windows translate and validate.
+/// The direct translator's refusal of a split pass with an ES phase (`kernel::translate_geometry`).
+const SPLIT_ES_REFUSED: &str = "split wave64 geometry: the ES phase exchanges at group barriers";
+
+/// The direct translation, or – on exactly the split form's refusal – the HLSL path's container
+/// (complete, compiled by DXC), as `pso::console_geometry` falls back. Empty: refused, no DXC.
+fn direct_or_hlsl(code: &[u8], o: KernelOptions, g: &GsInterface) -> Vec<u8> {
+    match translate_geometry(code, o, g) {
+        Ok(k) => k.dxil,
+        Err(e) if e.contains(SPLIT_ES_REFUSED) => {
+            let t = hlsl_geometry(code, g.clone(), o.split, o.mem_windows).unwrap_or_else(|e| panic!("HLSL: {e}"));
+            assert!(t.complete(), "{:?}", t.unsupported_why);
+            if dxc::location().is_err() {
+                runner::skip_test("no DXC");
+                return Vec::new();
+            }
+            dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}"))
+        }
+        Err(e) => panic!("direct DXIL: {e}"),
+    }
+}
+
+/// Both forms, ES alone, GS alone, four memory windows and a title's (the heap's and 16) translate
+/// and validate (the split form with an ES phase on the HLSL path while the safe barrier is wanted).
 #[test]
 fn geometry_forms_validate() {
     let (code, g) = branchy_program();
+    let heap = crate::gpu::recomp::HEAP_WINDOWS | 16;
     for split in [false, true] {
-        translate_geometry(&code, opts(split, 1), &g).unwrap_or_else(|e| panic!("split {split}: {e}"));
-        translate_geometry(&code, opts(split, 4), &g).unwrap_or_else(|e| panic!("split {split}, 4 windows: {e}"));
+        direct_or_hlsl(&code, opts(split, 1), &g);
+        direct_or_hlsl(&code, opts(split, 4), &g);
+        direct_or_hlsl(&code, opts(split, heap), &g);
         let es_alone = GsInterface { gs_start: None, ..g.clone() };
-        translate_geometry(&code[..4], opts(split, 1), &es_alone).unwrap_or_else(|e| panic!("ES alone: {e}"));
+        direct_or_hlsl(&code[..4], opts(split, 1), &es_alone);
+        direct_or_hlsl(&code[..4], opts(split, heap), &es_alone);
         let gs_alone = GsInterface { gs_start: Some(0), ..g.clone() };
         translate_geometry(&code[4..], opts(split, 1), &gs_alone).unwrap_or_else(|e| panic!("GS alone: {e}"));
     }
+}
+
+/// The split form's ES phase meets its other half at a group barrier at every exchange (#1727's
+/// pattern; the HLSL path spins): with the safe barrier wanted the direct translator leaves such
+/// a pass to the HLSL path. The GS alone (no partner) and the native wave64 form stay direct.
+#[test]
+fn split_geometry_with_an_es_phase_is_left_to_the_hlsl_path() {
+    if !crate::gpu::recomp::emit::safe_barrier_wanted() {
+        return;
+    }
+    let (code, g) = branchy_program();
+    let es_alone = GsInterface { gs_start: None, ..g.clone() };
+    for (what, code, g) in [("ES+GS", &code[..], &g), ("ES alone", &code[..4], &es_alone)] {
+        for windows in [1, 4, crate::gpu::recomp::HEAP_WINDOWS | 16] {
+            let e = translate_geometry(code, opts(true, windows), g).err().unwrap_or_else(|| panic!("{what}, {windows:#x} windows: translated"));
+            assert!(e.contains(SPLIT_ES_REFUSED), "{what}: {e}");
+            translate_geometry(code, opts(false, windows), g).unwrap_or_else(|e| panic!("{what} native, {windows:#x} windows: {e}"));
+        }
+    }
+    let gs_alone = GsInterface { gs_start: Some(0), ..g.clone() };
+    translate_geometry(&code[4..], opts(true, 1), &gs_alone).unwrap_or_else(|e| panic!("GS alone: {e}"));
 }
 
 /// The records of `branchy_program` for `prims` primitives: (group, record dwords).
@@ -156,7 +202,8 @@ fn gpu_geometry_direct_records() {
         forms.push(false);
     }
     for split in forms {
-        let direct = translate_geometry(&code, opts(split, 1), &g).unwrap().dxil;
+        // (the split form: the HLSL path's while the safe barrier is wanted)
+        let direct = direct_or_hlsl(&code, opts(split, 1), &g);
         let (_, got) = runner::mesh_draw(&direct, &msb, &ps, 2, rec.record_dwords(), &io, &mem, 32, [0.0; 4]).unwrap();
         check(&format!("direct, split {split}"), &got);
         let t = hlsl_geometry(&code, g.clone(), split, 1).unwrap();
@@ -168,20 +215,24 @@ fn gpu_geometry_direct_records() {
 }
 
 /// The GS epilogue coalesces the 2-dword header store and each 4-dword vertex attribute store
-/// into wide `rawBufferStore` calls (mask 3 and mask 15) instead of per-dword scalar stores.
+/// into wide `rawBufferStore` calls (mask 3 and mask 15) instead of per-dword scalar stores, in
+/// both forms (the split one as `XCL_SAFE_BARRIER=0` translates it: while the safe barrier is
+/// wanted it is left to the HLSL path, `split_geometry_with_an_es_phase_is_left_to_the_hlsl_path`).
 #[test]
 fn geometry_epilogue_coalesces_header_and_vertex_stores() {
     let (code, g) = branchy_program();
-    let k = translate_geometry(&code, opts(true, 1), &g).expect("translate geometry");
-    super::validate::validate(&k.dxil).expect("validate geometry");
-    let dis = super::validate::disassemble(&k.dxil).expect("disassemble geometry");
-    let stores: Vec<&str> = dis.lines().filter(|l| l.contains("call void @dx.op.rawBufferStore.i32(")).collect();
-    // 1 two-dword header store (mask 3), 2 four-dword vertex register stores (mask 15), 1 triangle store (mask 1).
-    let mask_count = |mask: u8| stores.iter().filter(|l| l.contains(&format!(", i8 {mask}, i32 4)"))).count();
-    assert_eq!(mask_count(3), 1, "expected 1 coalesced 2-dword header store:\n{}", stores.join("\n"));
-    assert_eq!(mask_count(15), 2, "expected 2 coalesced 4-dword vertex stores:\n{}", stores.join("\n"));
-    assert_eq!(mask_count(1), 1, "expected only 1 scalar store (triangle index):\n{}", stores.join("\n"));
-    assert_eq!(stores.len(), 4, "expected 4 total rawBufferStore calls:\n{}", stores.join("\n"));
+    for split in [false, true] {
+        let k = translate_geometry_unrefused(&code, opts(split, 1), &g).unwrap_or_else(|e| panic!("translate geometry, split {split}: {e}"));
+        super::validate::validate(&k.dxil).expect("validate geometry");
+        let dis = super::validate::disassemble(&k.dxil).expect("disassemble geometry");
+        let stores: Vec<&str> = dis.lines().filter(|l| l.contains("call void @dx.op.rawBufferStore.i32(")).collect();
+        // 1 two-dword header store (mask 3), 2 four-dword vertex register stores (mask 15), 1 triangle store (mask 1).
+        let mask_count = |mask: u8| stores.iter().filter(|l| l.contains(&format!(", i8 {mask}, i32 4)"))).count();
+        assert_eq!(mask_count(3), 1, "split {split}: expected 1 coalesced 2-dword header store:\n{}", stores.join("\n"));
+        assert_eq!(mask_count(15), 2, "split {split}: expected 2 coalesced 4-dword vertex stores:\n{}", stores.join("\n"));
+        assert_eq!(mask_count(1), 1, "split {split}: expected only 1 scalar store (triangle index):\n{}", stores.join("\n"));
+        assert_eq!(stores.len(), 4, "split {split}: expected 4 total rawBufferStore calls:\n{}", stores.join("\n"));
+    }
 }
 
 /// ES+GS with pre-fetched ES vertex inputs (`v9..v12`) under `HEAP_WINDOWS`: `geom_init`
@@ -210,9 +261,11 @@ fn geometry_es_inputs_validate_and_run_with_heap_windows() {
         gs_start: Some(gs_start),
     };
 
+    // (the direct split form as `XCL_SAFE_BARRIER=0` translates it, and the form the runtime
+    // takes: the HLSL path's while the safe barrier is wanted)
     for split in [false, true] {
-        translate_geometry(&code, opts(split, 4 | HEAP_WINDOWS), &g)
-            .unwrap_or_else(|err| panic!("split {split}, 4 heap windows: {err}"));
+        translate_geometry_unrefused(&code, opts(split, 4 | HEAP_WINDOWS), &g).unwrap_or_else(|err| panic!("split {split}, 4 heap windows: {err}"));
+        direct_or_hlsl(&code, opts(split, 4 | HEAP_WINDOWS), &g);
     }
 
     if runner::adapter().is_err() || runner::wave64_programs_supported() != Ok(true) {
@@ -220,7 +273,7 @@ fn geometry_es_inputs_validate_and_run_with_heap_windows() {
         return;
     }
     let split = runner::split_wave64();
-    let dxil = translate_geometry(&code, opts(split, 4 | HEAP_WINDOWS), &g).unwrap().dxil;
+    let dxil = translate_geometry_unrefused(&code, opts(split, 4 | HEAP_WINDOWS), &g).unwrap().dxil;
     let mut io = vec![0u32; 128];
     io[IO_GS_PRIMS] = 1; // 1 primitive = 3 vertices
     io[IO_GS_VERTICES] = 0; // pre-fetched vertices start at byte 0 of window 0

@@ -127,6 +127,20 @@ fn run_picked_game() -> i32 {
     let Some(target) = target else { return 0 };
     let _ = std::fs::create_dir_all(xcl::launcher::data_root());
     let _ = std::fs::write(&last_file, target.to_string_lossy().as_bytes());
+    // which console XCL is to the game, unless the environment says (`XCL_DEVICE_TYPE`)
+    if std::env::var_os("XCL_DEVICE_TYPE").is_none() {
+        let console_file = xcl::launcher::data_root().join("last-console.txt");
+        let saved = std::fs::read_to_string(&console_file).ok();
+        let picked = {
+            let _ui = Ui::enter();
+            console_menu(console_of(saved.as_deref()))
+        };
+        let Some(console) = picked else { return 0 };
+        let _ = std::fs::write(&console_file, console);
+        // (the menu runs before the game and before XCL starts any thread of its own)
+        std::env::set_var("XCL_DEVICE_TYPE", console);
+        println!("console: {}", console_name(console));
+    }
     println!("xcl run \"{}\"", target.display());
     let code = xcl::launcher::run_from_menu(&target);
     if code != 0 {
@@ -247,6 +261,56 @@ fn menu(last: Option<&std::path::Path>) -> Choice {
     }
 }
 
+/// The device type a saved choice names: "lockhart" (Series S) or, for anything else and for
+/// no choice yet, "anaconda" (Series X), the names `XCL_DEVICE_TYPE` takes.
+fn console_of(saved: Option<&str>) -> &'static str {
+    match saved.map(str::trim) {
+        Some(s) if s.eq_ignore_ascii_case("lockhart") => "lockhart",
+        _ => "anaconda",
+    }
+}
+
+fn console_name(console: &str) -> &'static str {
+    if console == "lockhart" { "Xbox Series S" } else { "Xbox Series X" }
+}
+
+/// The second menu: which console XCL is to the game. A game asks which console it runs on and
+/// sizes its memory, its resolution and its detail by the answer; XCL keeps what it learns
+/// about a game's memory per console. `last` is the default. None: cancelled. Without a task
+/// dialog on this system: `last`, unasked.
+fn console_menu(last: &'static str) -> Option<&'static str> {
+    use windows_sys::Win32::UI::Controls::*;
+    const X: i32 = 110;
+    const S: i32 = 111;
+    type TaskDialogIndirect = unsafe extern "system" fn(*const TASKDIALOGCONFIG, *mut i32, *mut i32, *mut i32) -> i32;
+    let Some(f) = (unsafe { system_proc("comctl32.dll", "TaskDialogIndirect") }) else { return Some(last) };
+    let title = wide("XCL");
+    let heading = wide("Which console should XCL be?");
+    let content = wide("The game asks which console it runs on and sets its memory, resolution and detail by the answer. This can be changed at every start; XCL_DEVICE_TYPE sets it without this question.");
+    let x = wide("Xbox Series X\nThe game's full settings. Needs the most video memory.");
+    let s = wide("Xbox Series S\nLower resolution and detail, 8 GB of game memory. Needs less video memory.");
+    let buttons = [TASKDIALOG_BUTTON { nButtonID: X, pszButtonText: x.as_ptr() }, TASKDIALOG_BUTTON { nButtonID: S, pszButtonText: s.as_ptr() }];
+    let mut c: TASKDIALOGCONFIG = unsafe { std::mem::zeroed() };
+    c.cbSize = std::mem::size_of::<TASKDIALOGCONFIG>() as u32;
+    c.hwndParent = unsafe { windows_sys::Win32::System::Console::GetConsoleWindow() };
+    c.dwFlags = TDF_USE_COMMAND_LINKS | TDF_ALLOW_DIALOG_CANCELLATION | TDF_POSITION_RELATIVE_TO_WINDOW;
+    c.dwCommonButtons = TDCBF_CANCEL_BUTTON;
+    c.pszWindowTitle = title.as_ptr();
+    c.pszMainInstruction = heading.as_ptr();
+    c.pszContent = content.as_ptr();
+    c.cButtons = buttons.len() as u32;
+    c.pButtons = buttons.as_ptr();
+    c.nDefaultButton = if last == "lockhart" { S } else { X };
+    let mut pressed = 0i32;
+    let hr = unsafe { std::mem::transmute::<usize, TaskDialogIndirect>(f)(&c, &mut pressed, std::ptr::null_mut(), std::ptr::null_mut()) };
+    match (hr, pressed) {
+        (h, _) if h < 0 => Some(last),
+        (_, X) => Some("anaconda"),
+        (_, S) => Some("lockhart"),
+        _ => None,
+    }
+}
+
 /// The standard Windows open dialog (None: cancelled).
 fn pick_game_file() -> Option<PathBuf> {
     use windows_sys::Win32::UI::Controls::Dialogs::*;
@@ -269,4 +333,20 @@ fn pick_game_file() -> Option<PathBuf> {
     }
     let n = file.iter().position(|&c| c == 0).unwrap_or(file.len());
     Some(PathBuf::from(String::from_utf16_lossy(&file[..n])))
+}
+
+#[cfg(test)]
+mod console_tests {
+    /// A saved choice names the Series S only as "lockhart"; no choice yet, or anything else,
+    /// is the Series X.
+    #[test]
+    fn the_saved_console_is_the_default_of_the_menu() {
+        assert_eq!(super::console_of(None), "anaconda");
+        assert_eq!(super::console_of(Some(" lockhart\n")), "lockhart");
+        assert_eq!(super::console_of(Some("LOCKHART")), "lockhart");
+        assert_eq!(super::console_of(Some("anaconda")), "anaconda");
+        assert_eq!(super::console_of(Some("")), "anaconda");
+        assert_eq!(super::console_name("lockhart"), "Xbox Series S");
+        assert_eq!(super::console_name("anaconda"), "Xbox Series X");
+    }
 }

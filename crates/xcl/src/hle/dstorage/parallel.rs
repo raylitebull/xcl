@@ -1,7 +1,7 @@
 //! Bounded preparation of file-backed zlib requests. The queue thread owns
 //! file reads, cancellation checks, and retirement; decoders own private buffers.
 
-use super::{note_request, read_exact_at, writable, Entry, FileInner, QueueInner, Request, E_ABORT, E_ACCESS_VIOLATION, E_FILE_HANDLE, E_ZLIB_DATA};
+use super::{cpu_range, in_sparse_memory, note_request, read_exact_at, writable, Entry, FileInner, QueueInner, Request, E_ABORT, E_ACCESS_VIOLATION, E_FILE_HANDLE, E_ZLIB_DATA};
 use crate::util::{HRESULT, S_OK};
 use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
@@ -423,7 +423,9 @@ impl<'a> Pipeline<'a> {
         }
         note_request(&req);
         let loaded = (|| {
-            if !writable(req.destination as usize, req.destination_size as usize) {
+            let n = req.destination_size as usize;
+            let at = cpu_range(req.destination as usize, n).ok_or(E_ACCESS_VIOLATION)?;
+            if !in_sparse_memory(at, n) && !writable(at, n) {
                 return Err(E_ACCESS_VIOLATION);
             }
             let handle = task.file.as_ref().and_then(|file| file.handle()).ok_or(E_FILE_HANDLE)?;
@@ -459,10 +461,12 @@ impl<'a> Pipeline<'a> {
         notify_test(self.queue, TestEvent::BeforeRetire(task.seq));
         let result = result.and_then(|payload| {
             let n = task.req.destination_size as usize;
-            let at = task.req.destination as usize;
+            // (a GPU view's bytes go to its CPU view; the pair may have gone meanwhile)
+            let at = cpu_range(task.req.destination as usize, n).ok_or(E_ACCESS_VIOLATION)?;
             // The title can unmap the destination while a decoder runs. The late
             // check resolves lazy pages, and the kernel copy handles a subsequent unmap.
-            if writable(at, n) && (n == 0 || write_destination(at, &payload.bytes[..n])) {
+            if (in_sparse_memory(at, n) || writable(at, n)) && (n == 0 || write_destination(at, &payload.bytes[..n])) {
+                crate::hle::d3d12x::title_textures::note_known_write(at, n);
                 Ok(())
             } else {
                 Err(E_ACCESS_VIOLATION)

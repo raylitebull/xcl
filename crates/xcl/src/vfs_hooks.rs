@@ -527,14 +527,19 @@ unsafe extern "system" fn hk_remove_dir_w(n: *const u16) -> i32 {
 }
 
 /// ReadFile: a buffer in pages the title mapped but has not used yet (`kernelx::lazy`) is
-/// committed first – the kernel's write there would fail rather than fault in the title.
+/// committed first – the kernel's write there would fail rather than fault in the title. What it
+/// puts into graphics memory is noted (`d3d12x::file_reads`).
 unsafe extern "system" fn hk_read_file(h: *mut c_void, buf: *mut c_void, n: u32, read: *mut u32, ov: *mut c_void) -> i32 {
     type F = unsafe extern "system" fn(*mut c_void, *mut c_void, u32, *mut u32, *mut c_void) -> i32;
     let orig = orig!(O_READ_FILE as F);
     if !buf.is_null() {
         crate::hle::kernelx::lazy::ensure(buf as usize, n as usize);
     }
-    orig(h, buf, n, read, ov)
+    let r = orig(h, buf, n, read, ov);
+    let error = windows_sys::Win32::Foundation::GetLastError();
+    crate::hle::d3d12x::file_reads::returned(r != 0, error, buf, n, read, ov);
+    SetLastError(error);
+    r
 }
 
 unsafe extern "system" fn hk_delete_file_w(n: *const u16) -> i32 {
