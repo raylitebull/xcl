@@ -556,6 +556,7 @@ pub fn plan(cfg: &Cfg, lw: &Lw) -> Option<Plan> {
                     let to = crate::gpu::rdna2::sgpr_uses(d).1.into_iter().chain([106]).chain(sdwa);
                     key.extend(to.filter(|&r| r < 126).map(|r| (l >> r) as u64 & 3));
                 }
+                key.push(lw.ps_masks.get(&d.pc).map_or(0, |&f| f as u64 + 1));
                 if d.inst.name == "S_GETPC_B64" {
                     key.push(if param_pc { d.pc.wrapping_sub(blk.pc) } else { d.pc });
                 }

@@ -26,10 +26,14 @@
 
 use std::collections::HashMap;
 use std::ffi::c_void;
+use std::mem::ManuallyDrop;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
-use windows::core::Interface;
+use windows::core::{Interface, PCSTR};
+use windows::Win32::Foundation::RECT;
+use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
@@ -93,7 +97,17 @@ struct Inner {
     made_in: Option<u32>,
     /// [depth, stencil]
     twins: [Option<Twin>; 2],
+    /// cached (DSV heap, shader-visible SRV/UAV heap) per depth resource object for R24G8 fullscreen/CS sync
+    pass_heaps: HashMap<usize, PassHeaps>,
 }
+
+struct PassHeaps {
+    dsv: ID3D12DescriptorHeap,
+    srv_uav: ID3D12DescriptorHeap,
+}
+
+unsafe impl Send for PassHeaps {}
+unsafe impl Sync for PassHeaps {}
 
 /// A plane's twin: a colour texture of the plane's size with unordered access, resting in
 /// UNORDERED_ACCESS.
@@ -273,7 +287,9 @@ pub(super) fn forget(res: usize) {
     }
     let Some(o) = OBJECTS.remove(res) else { return };
     REGISTERED.fetch_sub(1, Ordering::Relaxed);
+    let dropped_heaps = o.cell.inner.lock().unwrap().pass_heaps.remove(&res);
     let gone = CELLS.lock().unwrap().as_mut().map(|cells| leave(cells, &o.cell));
+    drop(dropped_heaps);
     drop(gone);
 }
 
@@ -328,8 +344,7 @@ pub(super) unsafe fn resolve_uav(dev: *mut c_void, res: *mut c_void, rd: Option<
         }
     }
     let stencil = stencil_view(view);
-    // (a D24S8's depth plane: no UAV format holds it as a shader reads it)
-    if if stencil { !matches!(key.format, 19 | 44) } else { !matches!(key.format, 19 | 39 | 53) } {
+    if if stencil { !matches!(key.format, 19 | 44) } else { !matches!(key.format, 19 | 39 | 44 | 53) } {
         return Resolve::Null("its depth plane has no twin yet");
     }
     // (its states stay the title's: the twin would never be copied)
@@ -339,7 +354,14 @@ pub(super) unsafe fn resolve_uav(dev: *mut c_void, res: *mut c_void, rd: Option<
     // (the Cell holds the twin)
     let Some((twin, _)) = plane_twin(&o, stencil as usize, dev) else { return Resolve::Null("the twin could not be made") };
     REDIRECTED.fetch_add(1, Ordering::Relaxed);
-    Resolve::Twin(twin.as_raw(), if stencil { twin_view(view, key.array) } else { depth_twin_view(view, key.array, key.format == 53) })
+    let r16 = is_r16_depth(key.format, o.cell.console_format);
+    Resolve::Twin(twin.as_raw(), if stencil { twin_view(view, key.array) } else { depth_twin_view(view, key.array, r16) })
+}
+
+/// True when the depth plane's twin is 16-bit (`R16_TYPELESS`): PC D16 (`53`) or console
+/// `D16_UNORM_S8_UINT` (`118..=120`) backed by PC `R24G8_TYPELESS` (`44`).
+fn is_r16_depth(format: u32, console_format: u32) -> bool {
+    format == 53 || (format == 44 && matches!(console_format, 118..=120))
 }
 
 /// The twin of `plane` (0 depth, 1 stencil) of the buffer `o` is in, and its number: the one it
@@ -350,7 +372,7 @@ unsafe fn plane_twin(o: &Object, plane: usize, dev: *mut c_void) -> Option<(ID3D
     if let Some(t) = &inner.twins[plane] {
         return Some((t.res.clone(), t.n));
     }
-    let t = make_twin(dev, &key, twin_format(key.format, plane))?;
+    let t = make_twin(dev, &key, twin_format(key.format, o.cell.console_format, plane))?;
     TWINS.fetch_add(1, Ordering::Relaxed);
     let n = MADE.fetch_add(1, Ordering::Relaxed) + 1;
     inner.twins[plane] = Some(Twin { res: t.clone(), n });
@@ -378,7 +400,7 @@ unsafe fn plane_twin(o: &Object, plane: usize, dev: *mut c_void) -> Option<(ID3D
                 key.format,
                 o.cell.console_format,
                 key.at,
-                if key.format == 53 { 16 } else { 32 },
+                if is_r16_depth(key.format, o.cell.console_format) { 16 } else { 32 },
                 state
             );
         }
@@ -386,12 +408,12 @@ unsafe fn plane_twin(o: &Object, plane: usize, dev: *mut c_void) -> Option<(ID3D
     Some((t, n))
 }
 
-/// The format of the twin of `plane` of a buffer of the PC format `format`: R8 for the stencil
-/// plane, R16 for D16's depth, R32 for D32's and D32S8's (the plane copies as R32_TYPELESS).
-fn twin_format(format: u32, plane: usize) -> DXGI_FORMAT {
+/// The format of the twin of `plane` of a buffer of the PC format `format` (and `console_format`):
+/// R8 for stencil, R16 for D16 and console D16S8 (`118..=120`), R32 for D32, D32S8, and D24S8.
+fn twin_format(format: u32, console_format: u32, plane: usize) -> DXGI_FORMAT {
     match (plane, format) {
         (1, _) => DXGI_FORMAT_R8_TYPELESS,
-        (_, 53) => DXGI_FORMAT_R16_TYPELESS,
+        (0, f) if is_r16_depth(f, console_format) => DXGI_FORMAT_R16_TYPELESS,
         _ => DXGI_FORMAT_R32_TYPELESS,
     }
 }
@@ -399,9 +421,11 @@ fn twin_format(format: u32, plane: usize) -> DXGI_FORMAT {
 /// Where a buffer whose depth plane can have a twin rests while the title has it in
 /// UNORDERED_ACCESS: COPY_SOURCE, the state the plane is copied into the twin from.
 pub(super) const PARK: u32 = 0x800;
-/// D3D12_RESOURCE_STATE_UNORDERED_ACCESS, COPY_DEST
+/// D3D12_RESOURCE_STATE_UNORDERED_ACCESS, DEPTH_WRITE, COPY_DEST
 const UNORDERED_ACCESS: u32 = 0x8;
+const DEPTH_WRITE_STATE: u32 = 0x10;
 const COPY_DEST: u32 = 0x400;
+const SRV_ALL: u32 = 0x40 | 0x80;
 /// The states in which nothing writes a depth plane: DEPTH_READ, NON_PIXEL_SHADER_RESOURCE,
 /// PIXEL_SHADER_RESOURCE, INDIRECT_ARGUMENT, COPY_SOURCE, RESOLVE_SOURCE (and their sums).
 const READ_ONLY: u32 = 0x20 | 0x40 | 0x80 | 0x200 | 0x800 | 0x2000;
@@ -418,23 +442,30 @@ pub(super) struct PlaneCopy {
     /// the depth plane's subresources it copies (the twin's have the same numbers)
     pub subs: Vec<u32>,
     pub twin: ID3D12Resource,
+    /// Some(steps) for `R24G8_TYPELESS` fullscreen/CS sync (`steps == true` for console D16S8 `118..=120`),
+    /// None for direct `CopyTextureRegion` (`D32`, `D16`, `D32S8`).
+    pub r24g8_steps: Option<bool>,
+    pub width: u32,
+    pub height: u32,
+    pub array: u16,
+    pub mips: u16,
 }
 
 /// What goes on the PC list with a title's barriers (`plan_barriers`).
 #[derive(Default)]
 pub(super) struct Plan {
-    /// before them: twins into depth planes (the buffer goes PARK → COPY_DEST, the title's
-    /// transition takes it on from COPY_DEST; the twin UNORDERED_ACCESS → COPY_SOURCE and back)
+    /// before them: twins into depth planes (the buffer goes PARK → COPY_DEST / DEPTH_WRITE, the
+    /// title's transition takes it on from there; the twin UNORDERED_ACCESS → COPY_SOURCE/SRV and back)
     pub to_plane: Vec<PlaneCopy>,
     /// after them: depth planes into twins (the buffer rests in PARK; the twin
-    /// UNORDERED_ACCESS → COPY_DEST and back)
+    /// UNORDERED_ACCESS → COPY_DEST and back, or CS UAV write for R24G8)
     pub to_twin: Vec<PlaneCopy>,
 }
 
-/// Whether the depth plane of `o`'s buffer can have a twin: a D32, D16 or D32S8 buffer, and the
-/// object was not made in UNORDERED_ACCESS (that object's states stay the title's).
+/// Whether the depth plane of `o`'s buffer can have a twin: a D32, D16, D32S8 or D24S8/D16S8
+/// buffer, and the object was not made in UNORDERED_ACCESS (that object's states stay the title's).
 fn plane_twinnable(o: &Object) -> bool {
-    matches!(o.cell.key.format, 19 | 39 | 53) && o.state & UNORDERED_ACCESS == 0
+    matches!(o.cell.key.format, 19 | 39 | 44 | 53) && o.state & UNORDERED_ACCESS == 0
 }
 
 /// The title's barriers `barriers` (PC D3D12_RESOURCE_BARRIERs as words, the console's bits
@@ -498,13 +529,15 @@ fn plan_with(barriers: &mut Vec<[u32; 8]>, direct: bool, in_step: &mut Vec<u64>,
                 crate::xlog_warn!("D3D12.X: a buffer with a depth UAV twin goes into or out of UNORDERED_ACCESS on a compute or copy list: the twin is not copied there");
             }
         }
+        let key = o.cell.key;
+        let r24g8_steps = (key.format == 44).then(|| matches!(o.cell.console_format, 118..=120));
         if leaving {
             before = PARK;
             // (a twin whose last way in was not copied holds something else than the plane: not
             // copied back – what the shaders wrote into it is lost, as without a twin)
             let t = (direct && !subs.is_empty()).then(|| twin_if_made(&o)).flatten();
             if let Some((t, k)) = t.filter(|_| entered.load(Ordering::Relaxed)) {
-                before = COPY_DEST;
+                before = if r24g8_steps.is_some() { DEPTH_WRITE_STATE } else { COPY_DEST };
                 let c = TO_PLANE.fetch_add(1, Ordering::Relaxed) + 1;
                 if c <= 4 || c.is_power_of_two() {
                     crate::xlog_info!("D3D12.X: depth UAV twin #{k}: the title moves depth buffer {res:#x} out of UNORDERED_ACCESS into state {after:#x}: the twin is copied into its depth plane first ({c} such copies so far)");
@@ -512,7 +545,17 @@ fn plan_with(barriers: &mut Vec<[u32; 8]>, direct: bool, in_step: &mut Vec<u64>,
                 if subs.len() as u32 == n && !in_step.contains(&id) {
                     in_step.push(id);
                 }
-                plan.to_plane.push(PlaneCopy { depth: res, sub, subs: subs.clone(), twin: t });
+                plan.to_plane.push(PlaneCopy {
+                    depth: res,
+                    sub,
+                    subs: subs.clone(),
+                    twin: t,
+                    r24g8_steps,
+                    width: key.width,
+                    height: key.height,
+                    array: key.array.max(1),
+                    mips: key.mips.max(1),
+                });
             }
             if writes(after) {
                 in_step.retain(|&c| c != id);
@@ -539,7 +582,17 @@ fn plan_with(barriers: &mut Vec<[u32; 8]>, direct: bool, in_step: &mut Vec<u64>,
                         in_step.push(id);
                     }
                     entered.store(true, Ordering::Relaxed);
-                    plan.to_twin.push(PlaneCopy { depth: res, sub, subs, twin: t });
+                    plan.to_twin.push(PlaneCopy {
+                        depth: res,
+                        sub,
+                        subs,
+                        twin: t,
+                        r24g8_steps,
+                        width: key.width,
+                        height: key.height,
+                        array: key.array.max(1),
+                        mips: key.mips.max(1),
+                    });
                 } else {
                     entered.store(false, Ordering::Relaxed);
                 }
@@ -557,6 +610,403 @@ fn plan_with(barriers: &mut Vec<[u32; 8]>, direct: bool, in_step: &mut Vec<u64>,
 /// The depth twin of `o`'s buffer when it has one, and its number.
 fn twin_if_made(o: &Object) -> Option<(ID3D12Resource, u64)> {
     o.cell.inner.lock().unwrap().twins[0].as_ref().map(|t| (t.res.clone(), t.n))
+}
+
+struct SyncPipelines {
+    gfx_rs: ID3D12RootSignature,
+    gfx_pso: ID3D12PipelineState,
+    gfx_pso_steps: ID3D12PipelineState,
+    cs_rs: ID3D12RootSignature,
+    cs_pso: ID3D12PipelineState,
+}
+
+unsafe impl Send for SyncPipelines {}
+unsafe impl Sync for SyncPipelines {}
+
+static SYNC_PIPELINES: Mutex<Option<HashMap<usize, Option<SyncPipelines>>>> = Mutex::new(None);
+
+fn compile_sm5(src: &str, target: &str) -> Option<Vec<u8>> {
+    unsafe {
+        let mut blob = None;
+        let t = format!("{target}\0");
+        let r = D3DCompile(
+            src.as_ptr() as *const c_void,
+            src.len(),
+            PCSTR::null(),
+            None,
+            None,
+            PCSTR(b"main\0".as_ptr()),
+            PCSTR(t.as_ptr()),
+            0,
+            0,
+            &mut blob,
+            None,
+        );
+        match (r, blob) {
+            (Ok(()), Some(b)) => Some(std::slice::from_raw_parts(b.GetBufferPointer() as *const u8, b.GetBufferSize()).to_vec()),
+            _ => None,
+        }
+    }
+}
+
+unsafe fn build_sync_pipelines(dev: &ID3D12Device) -> Option<SyncPipelines> {
+    let vs = compile_sm5(
+        "float4 main(uint id : SV_VertexID) : SV_Position {\n\
+            float2 p = float2((id == 2) ? 3.0 : -1.0, (id == 1) ? 3.0 : -1.0);\n\
+            return float4(p, 0.0, 1.0);\n\
+        }\n",
+        "vs_5_0",
+    )?;
+    let ps = compile_sm5(
+        "Texture2DArray<float> src : register(t0);\n\
+        cbuffer C : register(b0) { uint slice; uint mip; };\n\
+        float main(float4 pos : SV_Position) : SV_Depth {\n\
+            return src.Load(int4(int2(pos.xy), int(slice), int(mip)));\n\
+        }\n",
+        "ps_5_0",
+    )?;
+    // Console D16_UNORM_S8_UINT (118..=120): read R16_TYPELESS twin as R16_UINT and multiply by
+    // asfloat(0x37800080) so 24-bit depth matches tiled-lighting DepthFunc = EQUAL vertex shaders
+    // bit-for-bit on AMD RDNA4.
+    let ps_steps = compile_sm5(
+        "Texture2DArray<uint> src : register(t0);\n\
+        cbuffer C : register(b0) { uint slice; uint mip; };\n\
+        float main(float4 pos : SV_Position) : SV_Depth {\n\
+            return float(src.Load(int4(int2(pos.xy), int(slice), int(mip)))) * asfloat(0x37800080);\n\
+        }\n",
+        "ps_5_0",
+    )?;
+    let cs = compile_sm5(
+        "Texture2DArray<float> src : register(t0);\n\
+        RWTexture2DArray<float> dst : register(u0);\n\
+        cbuffer C : register(b0) { uint w; uint h; uint slices; uint mip; };\n\
+        [numthreads(8, 8, 1)]\n\
+        void main(uint3 id : SV_DispatchThreadID) {\n\
+            if (id.x < w && id.y < h && id.z < slices) {\n\
+                dst[id] = src.Load(int4(int3(id), int(mip)));\n\
+            }\n\
+        }\n",
+        "cs_5_0",
+    )?;
+
+    let srv_range = D3D12_DESCRIPTOR_RANGE {
+        RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+        NumDescriptors: 1,
+        BaseShaderRegister: 0,
+        RegisterSpace: 0,
+        OffsetInDescriptorsFromTableStart: 0,
+    };
+    let uav_range = D3D12_DESCRIPTOR_RANGE {
+        RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_UAV,
+        NumDescriptors: 1,
+        BaseShaderRegister: 0,
+        RegisterSpace: 0,
+        OffsetInDescriptorsFromTableStart: 0,
+    };
+    let dev_raw = dev.as_raw();
+    type CreateRsFn = unsafe extern "system" fn(*mut c_void, u32, *const c_void, usize, *const windows_sys::core::GUID, *mut *mut c_void) -> i32;
+    let create_rs: CreateRsFn = std::mem::transmute(super::real::orig_fn(dev_raw, 16));
+
+    let gfx_params = [
+        D3D12_ROOT_PARAMETER {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
+            Anonymous: D3D12_ROOT_PARAMETER_0 { Constants: D3D12_ROOT_CONSTANTS { ShaderRegister: 0, RegisterSpace: 0, Num32BitValues: 2 } },
+        },
+        D3D12_ROOT_PARAMETER {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
+            Anonymous: D3D12_ROOT_PARAMETER_0 { DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE { NumDescriptorRanges: 1, pDescriptorRanges: &srv_range } },
+        },
+    ];
+    let mut blob = None;
+    D3D12SerializeRootSignature(&D3D12_ROOT_SIGNATURE_DESC { NumParameters: gfx_params.len() as u32, pParameters: gfx_params.as_ptr(), ..Default::default() }, D3D_ROOT_SIGNATURE_VERSION_1, &mut blob, None).ok()?;
+    let blob = blob?;
+    let mut gfx_rs_raw = std::ptr::null_mut();
+    if create_rs(dev_raw, 0, blob.GetBufferPointer(), blob.GetBufferSize(), &ID3D12RootSignature::IID as *const _ as *const _, &mut gfx_rs_raw) < 0 || gfx_rs_raw.is_null() {
+        return None;
+    }
+    let gfx_rs = ID3D12RootSignature::from_raw(gfx_rs_raw);
+
+    let cs_params = [
+        D3D12_ROOT_PARAMETER {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            Anonymous: D3D12_ROOT_PARAMETER_0 { Constants: D3D12_ROOT_CONSTANTS { ShaderRegister: 0, RegisterSpace: 0, Num32BitValues: 4 } },
+        },
+        D3D12_ROOT_PARAMETER {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            Anonymous: D3D12_ROOT_PARAMETER_0 { DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE { NumDescriptorRanges: 1, pDescriptorRanges: &srv_range } },
+        },
+        D3D12_ROOT_PARAMETER {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            Anonymous: D3D12_ROOT_PARAMETER_0 { DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE { NumDescriptorRanges: 1, pDescriptorRanges: &uav_range } },
+        },
+    ];
+    let mut cs_blob = None;
+    D3D12SerializeRootSignature(&D3D12_ROOT_SIGNATURE_DESC { NumParameters: cs_params.len() as u32, pParameters: cs_params.as_ptr(), ..Default::default() }, D3D_ROOT_SIGNATURE_VERSION_1, &mut cs_blob, None).ok()?;
+    let cs_blob = cs_blob?;
+    let mut cs_rs_raw = std::ptr::null_mut();
+    if create_rs(dev_raw, 0, cs_blob.GetBufferPointer(), cs_blob.GetBufferSize(), &ID3D12RootSignature::IID as *const _ as *const _, &mut cs_rs_raw) < 0 || cs_rs_raw.is_null() {
+        return None;
+    }
+    let cs_rs = ID3D12RootSignature::from_raw(cs_rs_raw);
+
+    let mut gfx_desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+        pRootSignature: ManuallyDrop::new(Some(gfx_rs.clone())),
+        VS: D3D12_SHADER_BYTECODE { pShaderBytecode: vs.as_ptr() as *const c_void, BytecodeLength: vs.len() },
+        PS: D3D12_SHADER_BYTECODE { pShaderBytecode: ps.as_ptr() as *const c_void, BytecodeLength: ps.len() },
+        SampleMask: u32::MAX,
+        RasterizerState: D3D12_RASTERIZER_DESC { FillMode: D3D12_FILL_MODE_SOLID, CullMode: D3D12_CULL_MODE_NONE, DepthClipEnable: false.into(), ..Default::default() },
+        DepthStencilState: D3D12_DEPTH_STENCIL_DESC { DepthEnable: true.into(), DepthWriteMask: D3D12_DEPTH_WRITE_MASK_ALL, DepthFunc: D3D12_COMPARISON_FUNC_ALWAYS, StencilEnable: false.into(), ..Default::default() },
+        PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+        NumRenderTargets: 0,
+        DSVFormat: DXGI_FORMAT_D24_UNORM_S8_UINT,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        ..Default::default()
+    };
+    type CreateGfxPsoFn = unsafe extern "system" fn(*mut c_void, *const D3D12_GRAPHICS_PIPELINE_STATE_DESC, *const windows_sys::core::GUID, *mut *mut c_void) -> i32;
+    let create_gfx: CreateGfxPsoFn = std::mem::transmute(super::real::orig_fn(dev_raw, 10));
+    let mut gfx_pso_raw = std::ptr::null_mut();
+    if create_gfx(dev_raw, &gfx_desc, &ID3D12PipelineState::IID as *const _ as *const _, &mut gfx_pso_raw) < 0 || gfx_pso_raw.is_null() {
+        ManuallyDrop::drop(&mut gfx_desc.pRootSignature);
+        return None;
+    }
+    let gfx_pso = ID3D12PipelineState::from_raw(gfx_pso_raw);
+    let _ = gfx_pso.SetName(&windows::core::HSTRING::from("xcl depth_uav r24g8 sync gfx"));
+
+    gfx_desc.PS = D3D12_SHADER_BYTECODE { pShaderBytecode: ps_steps.as_ptr() as *const c_void, BytecodeLength: ps_steps.len() };
+    let mut gfx_pso_steps_raw = std::ptr::null_mut();
+    let hr_steps = create_gfx(dev_raw, &gfx_desc, &ID3D12PipelineState::IID as *const _ as *const _, &mut gfx_pso_steps_raw);
+    ManuallyDrop::drop(&mut gfx_desc.pRootSignature);
+    if hr_steps < 0 || gfx_pso_steps_raw.is_null() {
+        return None;
+    }
+    let gfx_pso_steps = ID3D12PipelineState::from_raw(gfx_pso_steps_raw);
+    let _ = gfx_pso_steps.SetName(&windows::core::HSTRING::from("xcl depth_uav r24g8 sync gfx steps"));
+
+    let mut cs_desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+        pRootSignature: ManuallyDrop::new(Some(cs_rs.clone())),
+        CS: D3D12_SHADER_BYTECODE { pShaderBytecode: cs.as_ptr() as *const c_void, BytecodeLength: cs.len() },
+        ..Default::default()
+    };
+    type CreateCsPsoFn = unsafe extern "system" fn(*mut c_void, *const D3D12_COMPUTE_PIPELINE_STATE_DESC, *const windows_sys::core::GUID, *mut *mut c_void) -> i32;
+    let create_cs: CreateCsPsoFn = std::mem::transmute(super::real::orig_fn(dev_raw, 11));
+    let mut cs_pso_raw = std::ptr::null_mut();
+    let hr_cs = create_cs(dev_raw, &cs_desc, &ID3D12PipelineState::IID as *const _ as *const _, &mut cs_pso_raw);
+    ManuallyDrop::drop(&mut cs_desc.pRootSignature);
+    if hr_cs < 0 || cs_pso_raw.is_null() {
+        return None;
+    }
+    let cs_pso = ID3D12PipelineState::from_raw(cs_pso_raw);
+    let _ = cs_pso.SetName(&windows::core::HSTRING::from("xcl depth_uav r24g8 sync cs"));
+
+    Some(SyncPipelines { gfx_rs, gfx_pso, gfx_pso_steps, cs_rs, cs_pso })
+}
+
+unsafe fn get_sync_pipelines(dev: &ID3D12Device) -> Option<(ID3D12RootSignature, ID3D12PipelineState, ID3D12PipelineState, ID3D12RootSignature, ID3D12PipelineState)> {
+    let key = dev.as_raw() as usize;
+    let mut g = SYNC_PIPELINES.lock().unwrap();
+    let p = g.get_or_insert_with(HashMap::new).entry(key).or_insert_with(|| build_sync_pipelines(dev)).as_ref()?;
+    Some((p.gfx_rs.clone(), p.gfx_pso.clone(), p.gfx_pso_steps.clone(), p.cs_rs.clone(), p.cs_pso.clone()))
+}
+
+unsafe fn ensure_pass_heaps(dev: &ID3D12Device, copy: &PlaneCopy, steps: bool) -> Option<(ID3D12DescriptorHeap, ID3D12DescriptorHeap)> {
+    let o = OBJECTS.get(copy.depth)?;
+    {
+        let inner = o.cell.inner.lock().unwrap();
+        if let Some(h) = inner.pass_heaps.get(&copy.depth) {
+            return Some((h.dsv.clone(), h.srv_uav.clone()));
+        }
+    }
+    let dev_raw = dev.as_raw();
+    type CreateHeapFn = unsafe extern "system" fn(*mut c_void, *const D3D12_DESCRIPTOR_HEAP_DESC, *const windows_sys::core::GUID, *mut *mut c_void) -> i32;
+    type IncSizeFn = unsafe extern "system" fn(*mut c_void, D3D12_DESCRIPTOR_HEAP_TYPE) -> u32;
+    type CreateDsvFn = unsafe extern "system" fn(*mut c_void, *mut c_void, *const D3D12_DEPTH_STENCIL_VIEW_DESC, usize);
+    type CreateSrvFn = unsafe extern "system" fn(*mut c_void, *mut c_void, *const D3D12_SHADER_RESOURCE_VIEW_DESC, usize);
+    type CreateUavFn = unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void, *const D3D12_UNORDERED_ACCESS_VIEW_DESC, usize);
+    let create_heap: CreateHeapFn = std::mem::transmute(super::real::orig_fn(dev_raw, 14));
+    let inc_size: IncSizeFn = std::mem::transmute(super::real::orig_fn(dev_raw, 15));
+    let create_srv: CreateSrvFn = std::mem::transmute(super::real::orig_fn(dev_raw, 18));
+    let create_uav: CreateUavFn = std::mem::transmute(super::real::orig_fn(dev_raw, 19));
+    let create_dsv: CreateDsvFn = std::mem::transmute(super::real::orig_fn(dev_raw, 21));
+
+    let mips = copy.mips.max(1) as u32;
+    let slices = copy.array.max(1) as u32;
+    let depth_raw = copy.depth as *mut c_void;
+
+    let dsv_desc = D3D12_DESCRIPTOR_HEAP_DESC { Type: D3D12_DESCRIPTOR_HEAP_TYPE_DSV, NumDescriptors: mips * slices, Flags: D3D12_DESCRIPTOR_HEAP_FLAG_NONE, NodeMask: 0 };
+    let mut dsv_raw = std::ptr::null_mut();
+    if create_heap(dev_raw, &dsv_desc, &ID3D12DescriptorHeap::IID as *const _ as *const _, &mut dsv_raw) < 0 || dsv_raw.is_null() {
+        return None;
+    }
+    let dsv_heap = ID3D12DescriptorHeap::from_raw(dsv_raw);
+    let dsv_inc = inc_size(dev_raw, D3D12_DESCRIPTOR_HEAP_TYPE_DSV) as usize;
+    let dsv_base = dsv_heap.GetCPUDescriptorHandleForHeapStart().ptr;
+    for m in 0..mips {
+        for a in 0..slices {
+            let dsv = D3D12_DEPTH_STENCIL_VIEW_DESC {
+                Format: DXGI_FORMAT_D24_UNORM_S8_UINT,
+                ViewDimension: D3D12_DSV_DIMENSION_TEXTURE2DARRAY,
+                Flags: D3D12_DSV_FLAG_NONE,
+                Anonymous: D3D12_DEPTH_STENCIL_VIEW_DESC_0 { Texture2DArray: D3D12_TEX2D_ARRAY_DSV { MipSlice: m, FirstArraySlice: a, ArraySize: 1 } },
+            };
+            create_dsv(dev_raw, depth_raw, &dsv, dsv_base + ((m * slices + a) as usize) * dsv_inc);
+        }
+    }
+
+    let srv_desc = D3D12_DESCRIPTOR_HEAP_DESC { Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, NumDescriptors: 2 + mips, Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, NodeMask: 0 };
+    let mut srv_raw = std::ptr::null_mut();
+    if create_heap(dev_raw, &srv_desc, &ID3D12DescriptorHeap::IID as *const _ as *const _, &mut srv_raw) < 0 || srv_raw.is_null() {
+        return None;
+    }
+    let srv_heap = ID3D12DescriptorHeap::from_raw(srv_raw);
+    let inc = inc_size(dev_raw, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize;
+    let base = srv_heap.GetCPUDescriptorHandleForHeapStart().ptr;
+    let twin_srv_fmt = if steps { DXGI_FORMAT_R16_UINT } else { DXGI_FORMAT_R32_FLOAT };
+    let twin_uav_fmt = if steps { DXGI_FORMAT_R16_UNORM } else { DXGI_FORMAT_R32_FLOAT };
+    let twin_srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
+        Format: twin_srv_fmt,
+        ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DARRAY,
+        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+        Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+            Texture2DArray: D3D12_TEX2D_ARRAY_SRV { MostDetailedMip: 0, MipLevels: mips, FirstArraySlice: 0, ArraySize: slices, PlaneSlice: 0, ResourceMinLODClamp: 0.0 },
+        },
+    };
+    create_srv(dev_raw, copy.twin.as_raw(), &twin_srv, base);
+    let depth_srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
+        Format: DXGI_FORMAT_R24_UNORM_X8_TYPELESS,
+        ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DARRAY,
+        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+        Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+            Texture2DArray: D3D12_TEX2D_ARRAY_SRV { MostDetailedMip: 0, MipLevels: mips, FirstArraySlice: 0, ArraySize: slices, PlaneSlice: 0, ResourceMinLODClamp: 0.0 },
+        },
+    };
+    create_srv(dev_raw, depth_raw, &depth_srv, base + inc);
+    for m in 0..mips {
+        let uav = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: twin_uav_fmt,
+            ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2DARRAY,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 { Texture2DArray: D3D12_TEX2D_ARRAY_UAV { MipSlice: m, FirstArraySlice: 0, ArraySize: slices, PlaneSlice: 0 } },
+        };
+        create_uav(dev_raw, copy.twin.as_raw(), std::ptr::null_mut(), &uav, base + (2 + m as usize) * inc);
+    }
+
+    let mut inner = o.cell.inner.lock().unwrap();
+    let h = inner.pass_heaps.entry(copy.depth).or_insert(PassHeaps { dsv: dsv_heap, srv_uav: srv_heap });
+    Some((h.dsv.clone(), h.srv_uav.clone()))
+}
+
+/// Synchronize an `R24G8_TYPELESS` depth plane with its `R16_TYPELESS` (`steps == true`, console
+/// D16S8 `118..=120`) or `R32_TYPELESS` twin on a DIRECT list: fullscreen depth write for
+/// `Twin -> Depth` (`to_twin == false`) and compute readback for `Depth -> Twin` (`to_twin == true`).
+/// Returns `(clobbered_gfx, clobbered_cs)`.
+pub(super) unsafe fn execute_r24g8_copy(list: *mut c_void, copy: &PlaneCopy, steps: bool, to_twin: bool) -> (bool, bool) {
+    let barriers = |b: &[[u32; 8]]| {
+        let f: unsafe extern "system" fn(*mut c_void, u32, *const [u32; 8]) = std::mem::transmute(super::real::orig_fn(list, 26));
+        f(list, b.len() as u32, b.as_ptr());
+    };
+    let tr = |res: usize, sub: u32, before: u32, after: u32| [0, 0, res as u32, (res as u64 >> 32) as u32, sub, before, after, 0];
+    let all = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+
+    let Some(dev) = super::real::list_device(list) else {
+        if !to_twin {
+            barriers(&[tr(copy.depth, copy.sub, PARK, DEPTH_WRITE_STATE)]);
+        }
+        return (false, false);
+    };
+    let Some((gfx_rs, gfx_pso, gfx_pso_steps, cs_rs, cs_pso)) = get_sync_pipelines(&dev) else {
+        if !to_twin {
+            barriers(&[tr(copy.depth, copy.sub, PARK, DEPTH_WRITE_STATE)]);
+        }
+        return (false, false);
+    };
+    let Some((dsv_heap, srv_heap)) = ensure_pass_heaps(&dev, copy, steps) else {
+        if !to_twin {
+            barriers(&[tr(copy.depth, copy.sub, PARK, DEPTH_WRITE_STATE)]);
+        }
+        return (false, false);
+    };
+    let dev_raw = dev.as_raw();
+    type IncSizeFn = unsafe extern "system" fn(*mut c_void, D3D12_DESCRIPTOR_HEAP_TYPE) -> u32;
+    let inc_size: IncSizeFn = std::mem::transmute(super::real::orig_fn(dev_raw, 15));
+    let twin_raw = copy.twin.as_raw() as usize;
+    let srv_raw = srv_heap.as_raw() as usize;
+    let mips_u32 = copy.mips.max(1) as u32;
+    let slices_u32 = copy.array.max(1) as u32;
+
+    if !to_twin {
+        barriers(&[tr(twin_raw, all, UNORDERED_ACCESS, SRV_ALL), tr(copy.depth, copy.sub, PARK, DEPTH_WRITE_STATE)]);
+        let set_heaps: unsafe extern "system" fn(*mut c_void, u32, *const usize) = std::mem::transmute(super::real::orig_fn(list, 28));
+        let set_gfx_rs: unsafe extern "system" fn(*mut c_void, *mut c_void) = std::mem::transmute(super::real::orig_fn(list, 30));
+        let set_pso: unsafe extern "system" fn(*mut c_void, *mut c_void) = std::mem::transmute(super::real::orig_fn(list, 25));
+        let set_topo: unsafe extern "system" fn(*mut c_void, u32) = std::mem::transmute(super::real::orig_fn(list, 20));
+        let set_gfx_table: unsafe extern "system" fn(*mut c_void, u32, u64) = std::mem::transmute(super::real::orig_fn(list, 32));
+        let set_vp: unsafe extern "system" fn(*mut c_void, u32, *const D3D12_VIEWPORT) = std::mem::transmute(super::real::orig_fn(list, 21));
+        let set_sc: unsafe extern "system" fn(*mut c_void, u32, *const RECT) = std::mem::transmute(super::real::orig_fn(list, 22));
+        let set_rt: unsafe extern "system" fn(*mut c_void, u32, *const usize, i32, *const usize) = std::mem::transmute(super::real::orig_fn(list, 46));
+        let set_gfx_consts: unsafe extern "system" fn(*mut c_void, u32, u32, *const u32, u32) = std::mem::transmute(super::real::orig_fn(list, 36));
+        let draw: unsafe extern "system" fn(*mut c_void, u32, u32, u32, u32) = std::mem::transmute(super::real::orig_fn(list, 12));
+
+        set_heaps(list, 1, &srv_raw);
+        set_gfx_rs(list, gfx_rs.as_raw());
+        set_pso(list, if steps { gfx_pso_steps.as_raw() } else { gfx_pso.as_raw() });
+        set_topo(list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST.0 as u32);
+        set_gfx_table(list, 1, srv_heap.GetGPUDescriptorHandleForHeapStart().ptr);
+        let dsv_base = dsv_heap.GetCPUDescriptorHandleForHeapStart().ptr;
+        let dsv_inc = inc_size(dev_raw, D3D12_DESCRIPTOR_HEAP_TYPE_DSV) as usize;
+        for &k in &copy.subs {
+            let m = k % mips_u32;
+            let a = k / mips_u32;
+            let mw = (copy.width >> m).max(1);
+            let mh = (copy.height >> m).max(1);
+            let vp = D3D12_VIEWPORT { TopLeftX: 0.0, TopLeftY: 0.0, Width: mw as f32, Height: mh as f32, MinDepth: 0.0, MaxDepth: 1.0 };
+            let sc = RECT { left: 0, top: 0, right: mw as i32, bottom: mh as i32 };
+            set_vp(list, 1, &vp);
+            set_sc(list, 1, &sc);
+            let dsv = dsv_base + ((m * slices_u32 + a) as usize) * dsv_inc;
+            set_rt(list, 0, std::ptr::null(), 0, &dsv);
+            let c = [a, m];
+            set_gfx_consts(list, 0, 2, c.as_ptr(), 0);
+            draw(list, 3, 1, 0, 0);
+        }
+        barriers(&[tr(twin_raw, all, SRV_ALL, UNORDERED_ACCESS)]);
+        (true, false)
+    } else {
+        barriers(&[tr(copy.depth, copy.sub, PARK, SRV_ALL)]);
+        let set_heaps: unsafe extern "system" fn(*mut c_void, u32, *const usize) = std::mem::transmute(super::real::orig_fn(list, 28));
+        let set_cs_rs: unsafe extern "system" fn(*mut c_void, *mut c_void) = std::mem::transmute(super::real::orig_fn(list, 29));
+        let set_pso: unsafe extern "system" fn(*mut c_void, *mut c_void) = std::mem::transmute(super::real::orig_fn(list, 25));
+        let set_cs_table: unsafe extern "system" fn(*mut c_void, u32, u64) = std::mem::transmute(super::real::orig_fn(list, 31));
+        let set_cs_consts: unsafe extern "system" fn(*mut c_void, u32, u32, *const u32, u32) = std::mem::transmute(super::real::orig_fn(list, 35));
+        let dispatch: unsafe extern "system" fn(*mut c_void, u32, u32, u32) = std::mem::transmute(super::real::orig_fn(list, 14));
+
+        set_heaps(list, 1, &srv_raw);
+        set_cs_rs(list, cs_rs.as_raw());
+        set_pso(list, cs_pso.as_raw());
+        let gpu_base = srv_heap.GetGPUDescriptorHandleForHeapStart().ptr;
+        let inc = inc_size(dev_raw, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as u64;
+        set_cs_table(list, 1, gpu_base + inc);
+        let mut dispatched = vec![false; mips_u32 as usize];
+        for &k in &copy.subs {
+            let m = k % mips_u32;
+            if dispatched[m as usize] {
+                continue;
+            }
+            dispatched[m as usize] = true;
+            let mw = (copy.width >> m).max(1);
+            let mh = (copy.height >> m).max(1);
+            let c = [mw, mh, slices_u32, m];
+            set_cs_consts(list, 0, 4, c.as_ptr(), 0);
+            set_cs_table(list, 2, gpu_base + (2 + m as u64) * inc);
+            dispatch(list, mw.div_ceil(8), mh.div_ceil(8), slices_u32);
+        }
+        let uav_barrier = [2u32, 0, twin_raw as u32, (twin_raw as u64 >> 32) as u32, 0, 0, 0, 0];
+        barriers(&[uav_barrier, tr(copy.depth, copy.sub, SRV_ALL, PARK)]);
+        (false, true)
+    }
 }
 
 /// A UAV of a depth buffer stays a null view (`Resolve::Null`).
@@ -1138,9 +1588,25 @@ mod tests {
     #[test]
     fn a_depth_view_is_a_view_of_a_twin_of_the_planes_size() {
         assert_eq!(
-            [twin_format(39, 0), twin_format(19, 0), twin_format(53, 0), twin_format(44, 1), twin_format(19, 1)],
-            [DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_R16_TYPELESS, DXGI_FORMAT_R8_TYPELESS, DXGI_FORMAT_R8_TYPELESS],
-            "D32, D32S8, D16 depth; stencil"
+            [
+                twin_format(39, 40, 0),
+                twin_format(19, 20, 0),
+                twin_format(53, 55, 0),
+                twin_format(44, 118, 0),
+                twin_format(44, 45, 0),
+                twin_format(44, 45, 1),
+                twin_format(19, 20, 1),
+            ],
+            [
+                DXGI_FORMAT_R32_TYPELESS,
+                DXGI_FORMAT_R32_TYPELESS,
+                DXGI_FORMAT_R16_TYPELESS,
+                DXGI_FORMAT_R16_TYPELESS,
+                DXGI_FORMAT_R32_TYPELESS,
+                DXGI_FORMAT_R8_TYPELESS,
+                DXGI_FORMAT_R8_TYPELESS,
+            ],
+            "D32, D32S8, D16, console D16S8, D24S8 depth; stencil"
         );
         // an R32 twin: the depth as a float unless the title asked for another R32 class
         for (asked, got) in [
@@ -1188,12 +1654,13 @@ mod tests {
             ..Default::default()
         };
         let base = 0x7B30_0000_1000usize;
-        // console D32, D16, D32S8, D24S8; the PC formats of the buffers; the views of their depth
+        // console D32, D16, D32S8, D24S8, D16S8; the PC formats of the buffers; the views of their depth
         for (k, (console, pc, view, on)) in [
             (40u32, DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_R32_FLOAT, "the twin could not be made"),
             (55, DXGI_FORMAT_R16_TYPELESS, DXGI_FORMAT_R16_UNORM, "the twin could not be made"),
             (20, DXGI_FORMAT_R32G8X24_TYPELESS, DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS, "the twin could not be made"),
-            (45, DXGI_FORMAT_R24G8_TYPELESS, DXGI_FORMAT_R24_UNORM_X8_TYPELESS, "its depth plane has no twin yet"),
+            (45, DXGI_FORMAT_R24G8_TYPELESS, DXGI_FORMAT_R24_UNORM_X8_TYPELESS, "the twin could not be made"),
+            (118, DXGI_FORMAT_R24G8_TYPELESS, DXGI_FORMAT_R16_UNORM, "the twin could not be made"),
         ]
         .into_iter()
         .enumerate()
@@ -1369,12 +1836,21 @@ mod tests {
         assert_eq!(plan(tr(res, 1, DEPTH_WRITE, UA)), (vec![tr(res, 1, DEPTH_WRITE, PARK)], vec![(res, 1, vec![1], tw)]));
         assert_eq!(plan(tr(res, 2, DEPTH_WRITE, UA)), (vec![tr(res, 2, DEPTH_WRITE, PARK)], vec![]), "a stencil subresource: parked, not copied");
 
-        // a D24S8 (its depth plane has no twin), an object made in UNORDERED_ACCESS, one XCL does
-        // not keep, a UAV barrier: as they came
-        assert!(register(d24, &desc(3, 64, 64, 45, 1, 6), None, DEPTH_WRITE));
+        // a D24S8/D16S8 now parks and syncs via fullscreen/CS pass
+        assert!(register(d24, &desc(3, 64, 64, 118, 1, 6), None, DEPTH_WRITE));
+        let t24 = stand_in();
+        plant_depth_twin(d24, &t24);
+        assert_eq!(plan(tr(d24, ALL, DEPTH_WRITE, UA)), (vec![tr(d24, ALL, DEPTH_WRITE, PARK)], vec![(d24, ALL, vec![0], t24.as_raw() as usize)]));
+        let mut out_d24 = vec![tr(d24, ALL, UA, DEPTH_READ)];
+        let p_out = plan_with(&mut out_d24, true, &mut Vec::new(), &mut |_r, o| twin_if_made(o));
+        assert_eq!(out_d24, vec![tr(d24, ALL, DEPTH_WRITE, DEPTH_READ)]);
+        assert_eq!(p_out.to_plane.len(), 1);
+        assert_eq!(p_out.to_plane[0].r24g8_steps, Some(true));
+
+        // an object made in UNORDERED_ACCESS, one XCL does not keep, a UAV barrier: as they came
         assert!(register(in_ua, &desc(3, 64, 64, 40, 1, 6), None, UA));
         let uav_barrier = [2, 0, res as u32, (res as u64 >> 32) as u32, 0, 0, 0, 0];
-        for b in [tr(d24, ALL, DEPTH_WRITE, UA), tr(in_ua, ALL, UA, DEPTH_WRITE), tr(unknown, ALL, DEPTH_WRITE, UA), uav_barrier] {
+        for b in [tr(in_ua, ALL, UA, DEPTH_WRITE), tr(unknown, ALL, DEPTH_WRITE, UA), uav_barrier] {
             assert_eq!(plan(b), (vec![b], vec![]), "{b:x?}");
         }
         forget(res);

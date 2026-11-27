@@ -132,6 +132,95 @@ pub(super) unsafe fn transition(list: *mut c_void, res: usize, before: D3D12_RES
     pc::<unsafe extern "system" fn(*mut c_void, u32, *const D3D12_RESOURCE_BARRIER)>(list, PC_RESOURCE_BARRIER)(list, 1, &b);
 }
 
+pub(super) unsafe fn pc_resource_barriers(list: *mut c_void, barriers: &[D3D12_RESOURCE_BARRIER]) {
+    if !barriers.is_empty() {
+        pc::<unsafe extern "system" fn(*mut c_void, u32, *const D3D12_RESOURCE_BARRIER)>(list, PC_RESOURCE_BARRIER)(list, barriers.len() as u32, barriers.as_ptr());
+    }
+}
+
+pub(super) unsafe fn pc_copy_resource(list: *mut c_void, dst: usize, src: usize) {
+    pc::<unsafe extern "system" fn(*mut c_void, usize, usize)>(list, PC_COPY_RESOURCE)(list, dst, src);
+}
+
+pub(super) unsafe fn pc_copy_texture_region(
+    list: *mut c_void,
+    dst: *const D3D12_TEXTURE_COPY_LOCATION,
+    x: u32,
+    y: u32,
+    z: u32,
+    src: *const D3D12_TEXTURE_COPY_LOCATION,
+    bx: *const D3D12_BOX,
+) {
+    pc::<unsafe extern "system" fn(*mut c_void, *const D3D12_TEXTURE_COPY_LOCATION, u32, u32, u32, *const D3D12_TEXTURE_COPY_LOCATION, *const D3D12_BOX)>(list, PC_COPY_TEXTURE_REGION)(
+        list, dst, x, y, z, src, bx,
+    );
+}
+
+pub(super) unsafe fn device_of_list(list: *mut c_void) -> Option<ID3D12Device> {
+    let l = ID3D12GraphicsCommandList::from_raw_borrowed(&list)?;
+    let mut dev: Option<ID3D12Device> = None;
+    l.GetDevice(&mut dev).ok()?;
+    dev
+}
+
+pub(super) unsafe fn acquire_scratch_for_copy(list: *mut c_void, n: u64) -> Option<usize> {
+    if n == 0 || n > MAX_COPY_SCRATCH || list_type(list) == D3D12_COMMAND_LIST_TYPE_BUNDLE {
+        return None;
+    }
+    let bytes = n.next_power_of_two().max(D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT as u64).min(MAX_COPY_SCRATCH);
+    let (raw, cap) = COPY_SCRATCH.lock().unwrap().acquire(list, bytes)?;
+    (cap >= n).then_some(raw)
+}
+
+/// Restore title bindings, PC root signatures, and bound PSO after an internal compute pass.
+pub(super) unsafe fn restore_after_internal_pass(list: *mut c_void, clobbered_gfx: bool, clobbered_cs: bool) {
+    let (bindings, bound_pso, ty, depth_bias, native_bias, had_fallback) = {
+        let mut g = recording(list as usize).lock().unwrap();
+        match g.as_mut().and_then(|m| m.get_mut(&(list as usize))) {
+            Some(s) => {
+                let had_fallback = s.using_fallback_pso;
+                if had_fallback {
+                    s.using_fallback_pso = false;
+                    s.pso_dirty = true;
+                }
+                (
+                    s.bindings.clone(),
+                    s.bound_pso,
+                    s.list_type.unwrap_or(D3D12_COMMAND_LIST_TYPE_DIRECT),
+                    s.depth_bias,
+                    s.native_bias,
+                    had_fallback,
+                )
+            }
+            None => return,
+        }
+    };
+    restore_bindings(list, &bindings, ty);
+    let (rs_gfx, rs_cs) = super::bind::tracked_root_sigs(list);
+    if clobbered_gfx && rs_gfx != 0 {
+        pc::<unsafe extern "system" fn(*mut c_void, usize)>(list, 30)(list, rs_gfx);
+    }
+    if clobbered_cs && rs_cs != 0 {
+        pc::<unsafe extern "system" fn(*mut c_void, usize)>(list, 29)(list, rs_cs);
+    }
+    if bound_pso != 0 {
+        let resolved = super::pso_async::resolve_for_bind(bound_pso);
+        pc::<unsafe extern "system" fn(*mut c_void, usize)>(list, PC_SET_PIPELINE_STATE)(list, resolved);
+        if ty != D3D12_COMMAND_LIST_TYPE_BUNDLE {
+            if let Some((true, static_bias)) = device_x::base_depth_bias_info(bound_pso) {
+                let target = depth_bias.unwrap_or(static_bias);
+                if target != DepthBias::ZERO || native_bias != DepthBias::ZERO {
+                    let _ = try_native_depth_bias(list, target);
+                }
+            } else if depth_bias.is_some() && !had_fallback {
+                if let Some(s) = recording(list as usize).lock().unwrap().as_mut().and_then(|m| m.get_mut(&(list as usize))) {
+                    s.pso_dirty = true;
+                }
+            }
+        }
+    }
+}
+
 /// `op` with the window buffer `res` as a copy destination (back to COMMON after it)
 unsafe fn as_copy_dest(list: *mut c_void, res: usize, op: impl FnOnce()) {
     transition(list, res, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -932,6 +1021,16 @@ unsafe fn try_native_depth_bias(list: *mut c_void, bias: DepthBias) -> bool {
 /// # Safety
 /// `list` must be null or a valid `ID3D12GraphicsCommandList` COM pointer.
 pub unsafe fn on_create(list: *mut c_void, alloc: usize, pso: usize, ty: D3D12_COMMAND_LIST_TYPE) {
+    on_create_with_backing(list, alloc, alloc, pso, ty);
+}
+
+pub unsafe fn on_create_with_backing(
+    list: *mut c_void,
+    title_alloc: usize,
+    pc_alloc: usize,
+    pso: usize,
+    ty: D3D12_COMMAND_LIST_TYPE,
+) {
     if list.is_null() {
         return;
     }
@@ -953,12 +1052,13 @@ pub unsafe fn on_create(list: *mut c_void, alloc: usize, pso: usize, ty: D3D12_C
                 WRITE64_SIGNAL_LISTS.fetch_sub(1, Ordering::AcqRel);
             }
         }
-        super::alloc_pool::created_on(key, alloc, ty.0);
-        m.insert(key, ListState { allocator: alloc, list_type: Some(ty), bound_pso: pso, ..Default::default() });
+        super::alloc_pool::created_on(key, pc_alloc, ty.0);
+        m.insert(key, ListState { allocator: title_alloc, list_type: Some(ty), bound_pso: pso, ..Default::default() });
         old
     };
     drop(old);
     super::title_textures::list_reset(key);
+    super::format_alias::list_reset(key);
     // Dynamic-depth-bias PSOs ignore baked RasterizerState depth bias; seed the list with the
     // initial PSO's static bias if non-zero (CreateCommandList resets RSSetDepthBias to 0).
     if ty != D3D12_COMMAND_LIST_TYPE_BUNDLE && pso != 0 {
@@ -977,6 +1077,7 @@ pub(super) fn on_release(list: usize) {
     super::alloc_pool::forget_list(list);
     release_copy_scratch(list);
     super::title_textures::list_reset(list);
+    super::format_alias::list_reset(list);
     let old = recording(list).lock().unwrap().as_mut().and_then(|m| m.remove(&list));
     if let Some(old) = old {
         if !old.pending_waits.is_empty() {
@@ -1004,6 +1105,7 @@ pub(super) fn on_release(list: usize) {
 pub(super) fn clear_segment_state(list: usize) {
     super::alloc_pool::unpin_list(list);
     super::title_textures::list_reset(list);
+    super::format_alias::list_reset(list);
     if let Some(s) = recording(list).lock().unwrap().as_mut().and_then(|m| m.get_mut(&list)) {
         s.occlusion = Occlusion::default();
         s.written_ranges.clear();
@@ -3564,7 +3666,7 @@ pub(super) unsafe extern "system" fn dispatch_x(this: *mut c_void, x: u32, y: u3
 
 /// command list #146 console compute/UAV barrier (used by `XboxBvhBuilder.dll` between BVH
 /// build passes): emits a global UAV barrier so UMA writes become visible to the next pass
-pub(super) unsafe extern "system" fn uav_barrier_x(this: *mut c_void, _n: u32, _barriers: *const c_void) {
+pub(super) unsafe extern "system" fn uav_barrier_x(this: *mut c_void, n: u32, barriers: *const c_void) {
     let b = D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
         Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
@@ -3573,6 +3675,12 @@ pub(super) unsafe extern "system" fn uav_barrier_x(this: *mut c_void, _n: u32, _
         },
     };
     pc::<unsafe extern "system" fn(*mut c_void, u32, *const D3D12_RESOURCE_BARRIER)>(this, PC_RESOURCE_BARRIER)(this, 1, &b);
+    let mut alias_writers: Vec<(usize, u32)> = Vec::new();
+    super::format_alias::filter_enhanced_barriers(n, barriers, &mut alias_writers);
+    if !alias_writers.is_empty() {
+        super::format_alias::sync_title_writers(this, &alias_writers);
+    }
+    super::format_alias::on_uav_barrier(this, None);
 }
 
 /// A UAV barrier for all resources on `list`, where a list takes one (a copy list and a bundle
@@ -3655,6 +3763,7 @@ unsafe fn predication_buffer(list: *mut c_void) -> Option<usize> {
 /// Before `Close()` on a command list: return `pred_buf` to `COMMON` if it is currently in
 /// `D3D12_RESOURCE_STATE_PREDICATION`.
 pub(super) unsafe fn before_close(list: *mut c_void) {
+    super::format_alias::before_close(list);
     if !PREDICATION_USED.load(Ordering::Acquire) || list.is_null() {
         return;
     }
@@ -3678,6 +3787,7 @@ pub(super) unsafe fn before_close(list: *mut c_void) {
 /// Clear active predication state when `ID3D12GraphicsCommandList::Reset` resets a recording.
 pub(super) fn on_pc_reset(list: *mut c_void) {
     reset_copy_scratch(list);
+    super::format_alias::list_reset(list as usize);
     if !PREDICATION_USED.load(Ordering::Acquire) || list.is_null() {
         return;
     }
@@ -3886,6 +3996,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     // what ran is in the textures' states; the list records anew after its Reset below
     super::title_textures::submitted(&one);
     super::title_textures::list_reset(this as usize);
+    super::format_alias::list_reset(this as usize);
     if !sparse_writes.0.is_empty() || !sparse_writes.1.is_empty() {
         if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&q_raw) {
             super::sparse::readback_after_execute(q, &sparse_writes.0, &sparse_writes.1);
@@ -4690,6 +4801,7 @@ pub(super) unsafe fn reset_pc(this: *mut c_void, alloc: usize, pso: usize) -> i3
         s.list_type == Some(D3D12_COMMAND_LIST_TYPE_BUNDLE)
     };
     super::title_textures::list_reset(this as usize);
+    super::format_alias::list_reset(this as usize);
     // (what the new recording puts in unified memory belongs to the PC allocator it is on)
     super::bind::reset(this, on, pso);
     if !is_bundle && pso != 0 {
@@ -4719,6 +4831,9 @@ pub(super) unsafe extern "system" fn resource_barrier_x(this: *mut c_void, n: u3
     let mut out: Vec<[u32; 8]> = Vec::with_capacity(n as usize + 1);
     // a UAV barrier for all resources is in `out` / a transition from or to UNORDERED_ACCESS
     let (mut any_uav, mut uav_transition) = (false, false);
+    let mut alias_writers: Vec<(usize, u32)> = Vec::new();
+    let mut uav_targets: Vec<usize> = Vec::new();
+    let mut uav_global = false;
     for k in 0..n as usize {
         let mut b = barriers.add(k).read_unaligned();
         let (ty, flags) = (b[0], b[1]);
@@ -4752,6 +4867,12 @@ pub(super) unsafe extern "system" fn resource_barrier_x(this: *mut c_void, n: u3
             // window buffers – other resources over the same memory – which a UAV barrier for
             // the title's resource alone does not order (AMD drivers wait and flush for any UAV
             // barrier, NVIDIA's need not): a UAV barrier for all resources, once per batch
+            let uav_res = (b[2] as u64 | (b[3] as u64) << 32) as usize;
+            if uav_res == 0 {
+                uav_global = true;
+            } else {
+                uav_targets.push(uav_res);
+            }
             b[2..4].fill(0);
             if any_uav {
                 continue;
@@ -4778,6 +4899,8 @@ pub(super) unsafe extern "system" fn resource_barrier_x(this: *mut c_void, n: u3
             }
             // UAV writes before (or after) the transition: the same holds for the window buffers
             uav_transition |= (b[5] | b[6]) & UNORDERED_ACCESS != 0;
+            let res = (b[2] as u64 | (b[3] as u64) << 32) as usize;
+            super::format_alias::note_title_transition(res, b[4], b[5], b[6], flags, &mut alias_writers);
         }
         out.push(b);
     }
@@ -4820,6 +4943,13 @@ pub(super) unsafe extern "system" fn resource_barrier_x(this: *mut c_void, n: u3
     if let Some(p) = &plane_copies {
         plane_copies_on(this, &p.to_twin, true);
     }
+    if !alias_writers.is_empty() {
+        super::format_alias::sync_title_writers(this, &alias_writers);
+    }
+    if any_uav || uav_transition {
+        let targets = if uav_global || uav_targets.is_empty() { None } else { Some(uav_targets.as_slice()) };
+        super::format_alias::on_uav_barrier(this, targets);
+    }
 }
 
 /// The copies between depth planes and their twins around a title's barriers
@@ -4835,7 +4965,14 @@ unsafe fn plane_copies_on(list: *mut c_void, copies: &[super::depth_uav::PlaneCo
     let at = |res: usize, k: u32| D3D12_TEXTURE_COPY_LOCATION { pResource: transmute_copy(&res), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: k } };
     let copy = pc::<unsafe extern "system" fn(*mut c_void, *const D3D12_TEXTURE_COPY_LOCATION, u32, u32, u32, *const D3D12_TEXTURE_COPY_LOCATION, *const D3D12_BOX)>(list, PC_COPY_TEXTURE_REGION);
     let (copy_src, copy_dst) = (D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32, D3D12_RESOURCE_STATE_COPY_DEST.0 as u32);
+    let (mut clobbered_gfx, mut clobbered_cs) = (false, false);
     for c in copies {
+        if let Some(steps) = c.r24g8_steps {
+            let (cg, cc) = super::depth_uav::execute_r24g8_copy(list, c, steps, to_twin);
+            clobbered_gfx |= cg;
+            clobbered_cs |= cc;
+            continue;
+        }
         let twin = c.twin.as_raw() as usize;
         let twin_in = if to_twin { copy_dst } else { copy_src };
         if to_twin {
@@ -4848,6 +4985,9 @@ unsafe fn plane_copies_on(list: *mut c_void, copies: &[super::depth_uav::PlaneCo
             copy(list, &dst, 0, 0, 0, &src, std::ptr::null());
         }
         barriers(&[tr(twin, all, twin_in, UNORDERED_ACCESS)]);
+    }
+    if clobbered_gfx || clobbered_cs {
+        restore_after_internal_pass(list, clobbered_gfx, clobbered_cs);
     }
 }
 
@@ -5041,7 +5181,9 @@ pub(super) unsafe extern "system" fn copy_texture_region_x(this: *mut c_void, ds
         note_copy_into(this as usize, transmute_copy::<_, usize>(&l.pResource), f.Offset, n);
     }
     let (Some(d), Some(s)) = (pc_location(dst), pc_location(src)) else { return };
-    pc::<unsafe extern "system" fn(*mut c_void, *const D3D12_TEXTURE_COPY_LOCATION, u32, u32, u32, *const D3D12_TEXTURE_COPY_LOCATION, *const D3D12_BOX)>(this, PC_COPY_TEXTURE_REGION)(this, &d, x, y, z, &s, bx);
+    if !super::format_alias::try_copy_texture_region(this, &d, x, y, z, &s, bx) {
+        pc::<unsafe extern "system" fn(*mut c_void, *const D3D12_TEXTURE_COPY_LOCATION, u32, u32, u32, *const D3D12_TEXTURE_COPY_LOCATION, *const D3D12_BOX)>(this, PC_COPY_TEXTURE_REGION)(this, &d, x, y, z, &s, bx);
+    }
     std::mem::forget((d, s)); // borrowed resource pointers
 }
 
@@ -5131,6 +5273,13 @@ unsafe fn clear_uav(this: *mut c_void, slot: usize, gpu: u64, cpu: u64, res: usi
             return refused();
         }
     };
+    if real::is_unaligned_delta_uav(cpu as usize) {
+        static N: AtomicU64 = AtomicU64::new(0);
+        if once(&N, 4) {
+            crate::xlog_warn!("D3D12.X: ClearUnorderedAccessView skipped for unaligned delta buffer UAV (cpu {cpu:#x}, res {res:#x})");
+        }
+        return refused();
+    }
     let Some(res) = uav_clear_resource(res, gpu_slot) else { return refused() };
     pc::<unsafe extern "system" fn(*mut c_void, u64, u64, usize, *const c_void, u32, *const windows::Win32::Foundation::RECT)>(this, slot)(this, gpu, cpu, res, values, n, rects)
 }
@@ -5173,6 +5322,7 @@ unsafe fn trace_resolve(what: &str, dst: usize, src: usize, format: i32, extra: 
 
 /// command list #19 ResolveSubresource(dst, dst sub, src, src sub, format) (PC #19)
 pub(super) unsafe extern "system" fn resolve_subresource_x(this: *mut c_void, dst: usize, dst_sub: u32, src: usize, src_sub: u32, format: i32) {
+    let format = super::device_x::pc_target_format(format as u32) as i32;
     let _c = super::capture::op(this, || {
         use super::capture as c;
         Some(c::Op::Resolve { dst: c::describe(dst), dst_sub, src: c::describe(src), src_sub, format, region: None })
@@ -5187,6 +5337,7 @@ pub(super) unsafe extern "system" fn resolve_subresource_x(this: *mut c_void, ds
 /// mode) (PC #64)
 #[allow(clippy::too_many_arguments)]
 pub(super) unsafe extern "system" fn resolve_subresource_region_x(this: *mut c_void, dst: usize, dst_sub: u32, x: u32, y: u32, src: usize, src_sub: u32, rect: *const windows::Win32::Foundation::RECT, format: i32, mode: i32) {
+    let format = super::device_x::pc_target_format(format as u32) as i32;
     let _c = super::capture::op(this, || {
         use super::capture as c;
         let r = rect.as_ref().map(|r| [r.left, r.top, r.right, r.bottom]);
@@ -5218,7 +5369,10 @@ pub(super) unsafe extern "system" fn copy_resource_x(this: *mut c_void, dst: usi
     let (dd, sd) = (real::buffer_delta(dst), real::buffer_delta(src));
     if dd == 0 && sd == 0 {
         note_copy_into(this as usize, dst, 0, u64::MAX);
-        return pc::<unsafe extern "system" fn(*mut c_void, usize, usize)>(this, PC_COPY_RESOURCE)(this, dst, src);
+        if !super::format_alias::try_copy_resource(this, dst, src) {
+            pc::<unsafe extern "system" fn(*mut c_void, usize, usize)>(this, PC_COPY_RESOURCE)(this, dst, src);
+        }
+        return;
     }
     let n = real::console_buffer(dst).or(real::console_buffer(src)).map_or(0, |b| b.1 as u64);
     copy_buffer_region_x(this, dst, 0, src, 0, n);

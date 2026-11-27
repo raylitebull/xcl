@@ -240,6 +240,8 @@ unsafe fn make(dev: &ID3D12Device) -> Result<Guard, String> {
     let pso: ID3D12PipelineState = dev
         .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC { pRootSignature: transmute_copy(&rs), CS: code, ..Default::default() })
         .map_err(|e| format!("CreateComputePipelineState: {e}"))?;
+    let _ = pso.SetName(&windows::core::HSTRING::from("xcl indirect_guard"));
+    super::dred::label_text(pso.as_raw() as usize, || "xcl indirect_guard".to_string());
     let buffer = |heap: D3D12_HEAP_PROPERTIES, width: u64| -> Result<ID3D12Resource, String> {
         let desc = D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,

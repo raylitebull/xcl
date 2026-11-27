@@ -861,6 +861,9 @@ pub fn copy_words(src: &Slot, dst: &Slot) {
     write(dst, &w[..n]);
     if !src.sampler {
         note_resource(dst, resource_at(src.at).unwrap_or(0));
+        let src_idx = if src.shared_srv != 0 { src.index } else { 0 };
+        let dst_idx = if dst.shared_srv != 0 { dst.index } else { 0 };
+        super::ambient::copy_descriptor(src.at, src_idx, dst.at, dst_idx);
     }
 }
 

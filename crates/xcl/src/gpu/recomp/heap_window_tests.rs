@@ -396,8 +396,8 @@ fn heap_windows_graphics_stages_validate() {
     ps_code.extend(e("S_ENDPGM", "ENC_SOPP", &[]));
 
     let vs = VsInterface { inputs: vec![], outputs: vec![sig("SV_Position", 1, 0)], attr_base: 4, params: None };
-    let ps = PsInterface { inputs: vec![sig("SV_Position", 1, 0)], outputs: vec![sig("SV_Target", 64, 0)], input_ena: 0, attrs: None };
-    let ms = MsInterface { outputs: vec![sig("SV_Position", 1, 0)], threads: 64, max_vertices: 3, max_primitives: 1 };
+    let ps = PsInterface { inputs: vec![sig("SV_Position", 1, 0)], outputs: vec![sig("SV_Target", 64, 0)], input_ena: 0, attrs: None, early_depth: false };
+    let ms = MsInterface { outputs: vec![sig("SV_Position", 1, 0)], threads: 64, max_vertices: 3, max_primitives: 1, params: None };
 
     let has_dxc = super::dxc::location().is_ok();
     for windows in [4u32, crate::gpu::uma::MAX_HEAP_WINDOWS as u32] {

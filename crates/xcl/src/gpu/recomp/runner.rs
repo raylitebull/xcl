@@ -158,7 +158,23 @@ impl TexDim {
     }
 }
 
-/// A texture for kernel tests: SRV at heap index 2·i, UAV (if `uav`) at 2·i + 1.
+/// The typeless depth-stencil format of a stencil view format (None: not a stencil view).
+fn stencil_resource(view: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
+    match view {
+        DXGI_FORMAT_X24_TYPELESS_G8_UINT => Some(DXGI_FORMAT_R24G8_TYPELESS),
+        DXGI_FORMAT_X32_TYPELESS_G8X24_UINT => Some(DXGI_FORMAT_R32G8X24_TYPELESS),
+        _ => None,
+    }
+}
+
+/// The plane a test texture's data and SRV are in: 1 for a stencil view.
+fn first_plane(t: &TestTexture) -> u32 {
+    u32::from(stencil_resource(t.format).is_some())
+}
+
+/// A texture for kernel tests: SRV at heap index 2·i, UAV (if `uav`) at 2·i + 1. A D2 texture in
+/// a stencil view format (X24_TYPELESS_G8_UINT, X32_TYPELESS_G8X24_UINT) is a depth-stencil
+/// buffer whose stencil plane holds `data` (one byte a texel); its SRV is that view of plane 1.
 pub struct TestTexture {
     pub dim: TexDim,
     pub format: DXGI_FORMAT,
@@ -274,15 +290,21 @@ unsafe fn bind_resources(dev: &ID3D12Device, list: &ID3D12GraphicsCommandList, t
             Height: t.height,
             DepthOrArraySize: depth_or_array as u16,
             MipLevels: 1,
-            Format: t.format,
+            Format: stencil_resource(t.format).unwrap_or(t.format),
             SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-            Flags: if t.uav { D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS } else { D3D12_RESOURCE_FLAG_NONE },
+            Flags: if t.uav {
+                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS
+            } else if stencil_resource(t.format).is_some() {
+                D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL
+            } else {
+                D3D12_RESOURCE_FLAG_NONE
+            },
             ..Default::default()
         } };
         let subs = if t.dim == TexDim::D3 { 1 } else { t.depth };
         let mut fps = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); subs as usize];
         let mut size = 0u64;
-        dev.GetCopyableFootprints(&rd, 0, subs, total, Some(fps.as_mut_ptr()), None, None, Some(&mut size));
+        dev.GetCopyableFootprints(&rd, first_plane(t), subs, total, Some(fps.as_mut_ptr()), None, None, Some(&mut size));
         total = (total + size + 511) & !511;
         plans.push(fps);
         descs.push(rd);
@@ -340,7 +362,7 @@ unsafe fn bind_resources(dev: &ID3D12Device, list: &ID3D12GraphicsCommandList, t
             list.CopyBufferRegion(&r, 0, upload.as_ref().unwrap(), fps[0].Offset, rd.Width);
         }
         for (k, fp) in fps.iter().enumerate().filter(|_| t.dim != TexDim::Buffer) {
-            let dst = D3D12_TEXTURE_COPY_LOCATION { pResource: transmute_copy(&r), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: k as u32 } };
+            let dst = D3D12_TEXTURE_COPY_LOCATION { pResource: transmute_copy(&r), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: first_plane(t) + k as u32 } };
             let src = D3D12_TEXTURE_COPY_LOCATION {
                 pResource: transmute_copy(upload.as_ref().unwrap()),
                 Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
@@ -361,7 +383,7 @@ unsafe fn bind_resources(dev: &ID3D12Device, list: &ID3D12GraphicsCommandList, t
             }
             TexDim::D2 => {
                 sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-                sv.Anonymous.Texture2D = D3D12_TEX2D_SRV { MipLevels: 1, ..Default::default() };
+                sv.Anonymous.Texture2D = D3D12_TEX2D_SRV { MipLevels: 1, PlaneSlice: first_plane(t), ..Default::default() };
                 uv.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
             }
             TexDim::D2Array => {

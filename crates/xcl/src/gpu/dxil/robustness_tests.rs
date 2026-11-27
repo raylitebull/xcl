@@ -68,6 +68,7 @@ fn translate_all() -> Vec<Vec<u8>> {
         outputs: vec![el("SV_Target", 0, 64, 3, 0, 0xF)],
         input_ena: 0x302,
         attrs: None,
+        early_depth: false,
     };
     let cs = CsInterface { threads: [64, 1, 1], user_sgprs: 4, tgid: [true, false, false], tg_size: false, tid_components: 1 };
     let o = |wave64, split| KernelOptions { wave64, split, mem_windows: 1, sampler_base: 0 };
@@ -117,7 +118,7 @@ fn a_group_barrier_of_several_hardware_waves_is_left_to_the_hlsl_path() {
     // (the kernel form of the tests is no thread group of a title's: its barrier stays)
     kernel::translate(&code, o(true, true)).expect("kernel");
     // a mesh program's compute pass: two console waves a group, as a retail title's
-    let ms = |threads| crate::gpu::recomp::MsInterface { outputs: vec![el("SV_Position", 0, 1, 3, 0, 0xF)], threads, max_vertices: 64, max_primitives: 64 };
+    let ms = |threads| crate::gpu::recomp::MsInterface { outputs: vec![el("SV_Position", 0, 1, 3, 0, 0xF)], threads, max_vertices: 64, max_primitives: 64, params: None };
     for split in [true, false] {
         let e = kernel::translate_mesh(&code, o(true, split), &ms(128)).err().unwrap_or_else(|| panic!("a mesh pass translated (split {split})"));
         assert!(e.contains("s_barrier in a group of several hardware waves"), "{e}");

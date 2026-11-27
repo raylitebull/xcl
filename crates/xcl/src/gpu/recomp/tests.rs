@@ -1845,7 +1845,7 @@ fn gpu_wave32_pixel_carry_preserves_adjacent_mask_at_triangle_edges() {
     ];
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     let ps = super::PsInterface { inputs: vec![el("SV_Position", 0, 1, 3, 0, 15)],
-        outputs: vec![el("SV_Target", 0, 64, 3, 0, 15)], input_ena: 0x300, attrs: None };
+        outputs: vec![el("SV_Target", 0, 64, 3, 0, 15)], input_ena: 0x300, attrs: None, early_depth: false };
     let t = translate(&code, &Options { wave64: false, mode: Mode::Pixel(ps), ..Default::default() }).unwrap();
     assert!(t.complete(), "{:?}", t.unsupported_why);
     let ps = super::dxc::compile(&t.hlsl, "main", "ps_6_6", &[]).unwrap();
@@ -1900,6 +1900,7 @@ fn gpu_graphics_vs_ps_draw() {
         outputs: vec![el("SV_Target", 0, 64, 3, 0, 0xF)],
         input_ena: 0x302,
         attrs: None,
+        early_depth: false,
     };
     let (vo, po) = (Options { mode: Mode::Vertex(vsi), wave64: true, ..Default::default() }, Options { mode: Mode::Pixel(psi), wave64: true, ..Default::default() });
     let vt = translate(&vs_code, &vo).unwrap();
@@ -1984,6 +1985,7 @@ fn ps_exp_vm_hlsl_and_direct_dxil_codegen() {
         outputs: vec![el("SV_Target", 0, 64, 3, 0, 0xF)],
         input_ena: 0x302,
         attrs: None,
+        early_depth: false,
     };
     let po = Options { mode: Mode::Pixel(psi.clone()), wave64: true, ..Default::default() };
     for (name, ps_code, has_vm) in ps_exp_vm_cases() {
@@ -2033,6 +2035,7 @@ fn gpu_ps_exp_vm_controls_pixel_survival() {
         outputs: vec![el("SV_Target", 0, 64, 3, 0, 0xF)],
         input_ena: 0x302,
         attrs: None,
+        early_depth: false,
     };
     let vo = Options { mode: Mode::Vertex(vsi.clone()), wave64: true, ..Default::default() };
     let po = Options { mode: Mode::Pixel(psi.clone()), wave64: true, ..Default::default() };
@@ -2218,6 +2221,7 @@ fn gpu_rect_list_corners() {
         outputs: vec![el("SV_Target", 0, 64, 3, 0, 0xF)],
         input_ena: 0x302,
         attrs: None,
+        early_depth: false,
     };
     let outputs = vsi.outputs.clone();
     let vt = translate(&vs_code, &Options { mode: Mode::Vertex(vsi), wave64: true, ..Default::default() }).unwrap();
@@ -2288,6 +2292,7 @@ fn draw_psi() -> super::PsInterface {
         outputs: vec![el("SV_Target", 0, 64, 3, 0, 0xF)],
         input_ena: 0x302,
         attrs: None,
+        early_depth: false,
     }
 }
 
@@ -2801,7 +2806,7 @@ fn helper_lane_masks_ps(wave64: bool) -> super::Translation {
         ps_code.extend(encode("S_CBRANCH_EXECNZ", "ENC_SOPP", &[("SIMM16", back)], None).unwrap());
         ps_code.extend(enc(&tail));
         ps_code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
-        let psi = PsInterface { inputs: vec![el("SV_Position", 0, 1, 3, 0, 0xF)], outputs: vec![el("SV_Target", 0, 64, 3, 0, 0xF)], input_ena: 0x302, attrs: None };
+        let psi = PsInterface { inputs: vec![el("SV_Position", 0, 1, 3, 0, 0xF)], outputs: vec![el("SV_Target", 0, 64, 3, 0, 0xF)], input_ena: 0x302, attrs: None, early_depth: false };
         translate(&ps_code, &Options { mode: Mode::Pixel(psi), wave64, ..Default::default() }).unwrap()
     }
 }
@@ -3413,6 +3418,69 @@ fn global_dword_addtid_address_is_saddr_plus_4_per_lane() {
     }
 }
 
+/// scratch_* (ENC_FLAT_SCRATCH) has three address forms on RDNA2 and no SGPR + VGPR one:
+/// SADDR 0x7F (EXEC_HI) is ST, the offset alone; NULL (0x7D) is SV, VADDR + offset; an SGPR
+/// is SS, SGPR + offset. ADDR is read only in the SV form.
+#[test]
+fn scratch_address_forms_follow_saddr() {
+    let scr = |n: &'static str, f: &[(&str, u64)]| encode(n, "ENC_FLAT_SCRATCH", f, None).unwrap();
+    let mut code = Vec::new();
+    code.extend(scr("SCRATCH_STORE_DWORD", &[("ADDR", 2), ("DATA", 5), ("SADDR", 0x7F), ("OFFSET", 16)]));
+    code.extend(scr("SCRATCH_LOAD_DWORD", &[("VDST", 7), ("ADDR", 2), ("SADDR", 0x7D), ("OFFSET", 0xFFC)]));
+    code.extend(scr("SCRATCH_STORE_DWORD", &[("ADDR", 2), ("DATA", 5), ("SADDR", 4), ("OFFSET", 8)]));
+    code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+    let t = translate(&code, &Options::default()).unwrap();
+    assert!(t.complete(), "{:?}\n{}", t.unsupported_why, t.hlsl);
+    assert!(t.hlsl.contains("uint t1_a = 0u + 0x00000010u;"), "ST: the offset alone\n{}", t.hlsl);
+    assert!(t.hlsl.contains("uint t2_a = v2 + 0xFFFFFFFCu;"), "SV: VADDR + the signed offset\n{}", t.hlsl);
+    assert!(t.hlsl.contains("uint t3_a = s4 + 0x00000008u;"), "SS: the SGPR + offset\n{}", t.hlsl);
+    if super::dxc::location().is_ok() {
+        super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+        direct_check(&code, &Options::default());
+    }
+}
+
+/// On hardware: the ST scratch form addresses the offset alone whatever ADDR holds, SS the
+/// SGPR + offset, and SV the lane's VADDR + offset.
+#[test]
+fn gpu_scratch_address_forms() {
+    if !gpu_ready() {
+        return;
+    }
+    let scr = |n: &'static str, f: &[(&str, u64)]| encode(n, "ENC_FLAT_SCRATCH", f, None).unwrap_or_else(|x| panic!("{n}: {x}"));
+    let mut code = Vec::new();
+    // [16] = 0x55 (SV, v3 = 0), then ST writes [16] (ADDR = v2 is not read), SV reads it back
+    code.extend(scr("SCRATCH_STORE_DWORD", &[("ADDR", 3), ("DATA", 9), ("SADDR", 0x7D), ("OFFSET", 16)]));
+    code.extend(scr("SCRATCH_STORE_DWORD", &[("ADDR", 2), ("DATA", 5), ("SADDR", 0x7F), ("OFFSET", 16)]));
+    code.extend(scr("SCRATCH_LOAD_DWORD", &[("VDST", 20), ("ADDR", 3), ("SADDR", 0x7D), ("OFFSET", 16)]));
+    // SS: s4 (8) + 32 = [40], read back through SV
+    code.extend(scr("SCRATCH_STORE_DWORD", &[("ADDR", 2), ("DATA", 6), ("SADDR", 4), ("OFFSET", 32)]));
+    code.extend(scr("SCRATCH_LOAD_DWORD", &[("VDST", 21), ("ADDR", 3), ("SADDR", 0x7D), ("OFFSET", 40)]));
+    // [0x100] = 0x55 (ST), SV writes [0x100 + v2], ST reads [0x100]: lanes with v2 = 0 see the SV store
+    code.extend(scr("SCRATCH_STORE_DWORD", &[("ADDR", 2), ("DATA", 9), ("SADDR", 0x7F), ("OFFSET", 0x100)]));
+    code.extend(scr("SCRATCH_STORE_DWORD", &[("ADDR", 2), ("DATA", 7), ("SADDR", 0x7D), ("OFFSET", 0x100)]));
+    code.extend(scr("SCRATCH_LOAD_DWORD", &[("VDST", 22), ("ADDR", 2), ("SADDR", 0x7F), ("OFFSET", 0x100)]));
+    code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+    let mut st = KernelState::default();
+    st.sgpr[4] = 8;
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        let l32 = l as u32;
+        r[2] = 4 * (l32 % 4);
+        r[3] = 0;
+        r[5] = 0xA0 + l32;
+        r[6] = 0xB0 + l32;
+        r[7] = 0xC0 + l32;
+        r[9] = 0x55;
+    }
+    let r = runner::run_code(&code, &st, &[0u32; 16]).unwrap();
+    for (l, v) in r.vgpr.iter().enumerate().take(64) {
+        let l32 = l as u32;
+        assert_eq!(v[20], 0xA0 + l32, "lane {l}: ST store at the offset alone");
+        assert_eq!(v[21], 0xB0 + l32, "lane {l}: SS store at s4 + offset");
+        assert_eq!(v[22], if l % 4 == 0 { 0xC0 + l32 } else { 0x55 }, "lane {l}: SV store at v2 + offset, ST load at the offset");
+    }
+}
+
 /// On hardware: every lane touches its own dword (EA = SADDR + 4·lane + OFFSET), the
 /// "off" SADDR sentinel gives a zero base and the signed offset can point below the base.
 #[test]
@@ -3679,7 +3747,7 @@ fn gpu_mesh_mode_two_passes() {
         rw_mask: 0xF,
         stream: 0,
     };
-    let ms = MsInterface { outputs: vec![sig("SV_Position", 1, 0), sig("TEXCOORD", 0, 1)], threads: 128, max_vertices: 128, max_primitives: 128 };
+    let ms = MsInterface { outputs: vec![sig("SV_Position", 1, 0), sig("TEXCOORD", 0, 1)], threads: 128, max_vertices: 128, max_primitives: 128, params: None };
     let exp = |tgt: u64, en: u64, v: [u64; 4], done: u64| -> (&'static str, &'static str, Vec<(&'static str, u64)>, Option<u32>) {
         ("EXP", "ENC_EXP", vec![("TGT", tgt), ("EN", en), ("VSRC0", v[0]), ("VSRC1", v[1]), ("VSRC2", v[2]), ("VSRC3", v[3]), ("DONE", done)], None)
     };
@@ -3779,7 +3847,7 @@ fn gpu_mesh_mode_exports_stay_inside_the_record() {
         rw_mask: 0xF,
         stream: 0,
     };
-    let ms = MsInterface { outputs: vec![sig("SV_Position", 1, 0)], threads: 128, max_vertices: 64, max_primitives: 32 };
+    let ms = MsInterface { outputs: vec![sig("SV_Position", 1, 0)], threads: 128, max_vertices: 64, max_primitives: 32, params: None };
     let exp = |tgt: u64, en: u64, v: [u64; 4], done: u64| -> (&'static str, &'static str, Vec<(&'static str, u64)>, Option<u32>) {
         ("EXP", "ENC_EXP", vec![("TGT", tgt), ("EN", en), ("VSRC0", v[0]), ("VSRC1", v[1]), ("VSRC2", v[2]), ("VSRC3", v[3]), ("DONE", done)], None)
     };
@@ -3858,6 +3926,7 @@ fn mesh_passthrough_strips_rdna2_edge_flag_bits() {
         threads: 128,
         max_vertices: 128,
         max_primitives: 128,
+        params: None,
     };
     let unsplit = mesh_passthrough(&ms);
     assert!(unsplit.contains("uint3(p & 0x1FFu, (p >> 10) & 0x1FFu, (p >> 20) & 0x1FFu)"), "{unsplit}");
@@ -3899,7 +3968,7 @@ fn mesh_split_accounts_vertex_chunks() {
         outputs.push(sig("TEXCOORD", 0, k + 1, k));
     }
     outputs.push(sig("SV_ClipDistance", 2, 21, 0));
-    let ms = MsInterface { outputs, threads: 128, max_vertices: 128, max_primitives: 128 };
+    let ms = MsInterface { outputs, threads: 128, max_vertices: 128, max_primitives: 128, params: None };
     let elems = passthrough_elements(&ms, None);
     assert_eq!(elems, 21);
     // 22 rows * 16 B = 352 B/vertex: 64 accounted vertices fit (96 would be 33792 B), so at
@@ -3956,7 +4025,7 @@ fn mesh_layout_independent_of_group_count() {
     }
     outputs.push(sig("SV_ClipDistance", 2, 21, 0));
     // 22 rows * 16 B = 352 B/vertex: 64 accounted vertices fit; 80 declared do not
-    let ms = MsInterface { outputs, threads: 128, max_vertices: 80, max_primitives: 1 };
+    let ms = MsInterface { outputs, threads: 128, max_vertices: 80, max_primitives: 1, params: None };
     let elems = passthrough_elements(&ms, None);
     assert_eq!(elems, 21);
     // one triangle: its 3 copies fit one compact group, so the dispatch count is 1
@@ -4212,7 +4281,7 @@ fn gpu_mesh_mode_reads_memory_windows() {
         rw_mask: 0xF,
         stream: 0,
     };
-    let ms = MsInterface { outputs: vec![sig("SV_Position", 1, 0)], threads: 64, max_vertices: 64, max_primitives: 64 };
+    let ms = MsInterface { outputs: vec![sig("SV_Position", 1, 0)], threads: 64, max_vertices: 64, max_primitives: 64, params: None };
     let list: Vec<(&str, &str, Vec<(&str, u64)>, Option<u32>)> = vec![
         ("V_MBCNT_LO_U32_B32", "ENC_VOP3", vec![("VDST", 0), ("SRC0", 193), ("SRC1", 128)], None),
         ("V_MBCNT_HI_U32_B32", "ENC_VOP3", vec![("VDST", 0), ("SRC0", 193), ("SRC1", V)], None), // thread
@@ -5981,10 +6050,10 @@ fn gpu_more_atomics_sub_dword_scratch_valu() {
     code.extend(glbl("GLOBAL_STORE_SHORT_D16_HI", &[("ADDR", 2), ("DATA", 62), ("SADDR", 2), ("OFFSET", 0x100)]));
     code.extend(glbl("GLOBAL_LOAD_USHORT", &[("VDST", 63), ("ADDR", 2), ("SADDR", 2), ("OFFSET", 0x100)]));
     // scratch (per lane): a dword at 2 · lane + 16, a byte at 2 · lane + 40
-    code.extend(enc("SCRATCH_STORE_DWORD", "ENC_FLAT_SCRATCH", &[("ADDR", 2), ("DATA", 11), ("SADDR", 0x7F), ("OFFSET", 16)]));
-    code.extend(enc("SCRATCH_STORE_BYTE", "ENC_FLAT_SCRATCH", &[("ADDR", 2), ("DATA", 36), ("SADDR", 0x7F), ("OFFSET", 40)]));
-    code.extend(enc("SCRATCH_LOAD_DWORD", "ENC_FLAT_SCRATCH", &[("VDST", 64), ("ADDR", 2), ("SADDR", 0x7F), ("OFFSET", 16)]));
-    code.extend(enc("SCRATCH_LOAD_UBYTE", "ENC_FLAT_SCRATCH", &[("VDST", 65), ("ADDR", 2), ("SADDR", 0x7F), ("OFFSET", 40)]));
+    code.extend(enc("SCRATCH_STORE_DWORD", "ENC_FLAT_SCRATCH", &[("ADDR", 2), ("DATA", 11), ("SADDR", 0x7D), ("OFFSET", 16)]));
+    code.extend(enc("SCRATCH_STORE_BYTE", "ENC_FLAT_SCRATCH", &[("ADDR", 2), ("DATA", 36), ("SADDR", 0x7D), ("OFFSET", 40)]));
+    code.extend(enc("SCRATCH_LOAD_DWORD", "ENC_FLAT_SCRATCH", &[("VDST", 64), ("ADDR", 2), ("SADDR", 0x7D), ("OFFSET", 16)]));
+    code.extend(enc("SCRATCH_LOAD_UBYTE", "ENC_FLAT_SCRATCH", &[("VDST", 65), ("ADDR", 2), ("SADDR", 0x7D), ("OFFSET", 40)]));
     // VALU
     let vv = |n: u64| V + n;
     code.extend(vop3("V_SAD_U8", &[("VDST", 66), ("SRC0", vv(22)), ("SRC1", vv(23)), ("SRC2", vv(24))]));
@@ -6829,7 +6898,7 @@ fn isa_coverage() {
         let Ok(mut code) = encode(inst.name, enc, fields, lit) else { continue };
         code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
         let ok = std::panic::catch_unwind(|| {
-            try_mode(&code, Mode::Kernel) || try_mode(&code, Mode::Pixel(super::PsInterface { inputs: vec![], outputs: vec![], input_ena: 0x7F, attrs: None }))
+            try_mode(&code, Mode::Kernel) || try_mode(&code, Mode::Pixel(super::PsInterface { inputs: vec![], outputs: vec![], input_ena: 0x7F, attrs: None, early_depth: false }))
         })
         .unwrap_or(false);
         let e = per_enc.entry(enc.trim_start_matches("ENC_")).or_default();
@@ -7235,7 +7304,7 @@ fn far_jumps_are_direct_branches() {
 /// programs with cross-half operations included; native wave64 and wave32 programs unchanged.
 #[test]
 fn mesh_split_wave64_form() {
-    let ms = super::MsInterface { threads: 128, max_vertices: 64, max_primitives: 64, outputs: vec![] };
+    let ms = super::MsInterface { threads: 128, max_vertices: 64, max_primitives: 64, outputs: vec![], params: None };
     let lane = prog(&[("V_READFIRSTLANE_B32", "ENC_VOP1", &[("VDST", 0), ("SRC0", V)], None)]);
     let branch = prog(&[("S_CBRANCH_EXECZ", "ENC_SOPP", &[("SIMM16", 0)], None)]);
     for code in [&lane, &branch] {
@@ -9239,7 +9308,7 @@ fn ps_mrtz_sample_mask_writes_sv_coverage() {
             ("EXP", "ENC_EXP", mrtz, None),
             ("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 0), ("VSRC1", 1), ("VSRC2", 2), ("VSRC3", 3), ("DONE", 1), ("VM", 1)], None),
         ]);
-        let psi = PsInterface { inputs: vec![], outputs, input_ena: 0x2, attrs: None };
+        let psi = PsInterface { inputs: vec![], outputs, input_ena: 0x2, attrs: None, early_depth: false };
         let pt = translate(&code, &Options { mode: Mode::Pixel(psi), wave64: true, ..Default::default() }).unwrap();
         assert!(pt.complete(), "{:?}\n{}", pt.unsupported_why, pt.hlsl);
         if super::dxc::location().is_ok() {
@@ -9291,6 +9360,7 @@ fn ps_interp_p0_preserves_bits_and_p2_converts_to_float() {
         outputs: vec![el("SV_Target", 0, 64, 3, 0, 0xF)],
         input_ena: 0x302,
         attrs: None,
+        early_depth: false,
     };
     let pt = translate(&ps_code, &Options { mode: Mode::Pixel(psi), wave64: true, ..Default::default() }).unwrap();
     assert!(pt.complete(), "{:?}\n{}", pt.unsupported_why, pt.hlsl);
@@ -10933,7 +11003,7 @@ fn list_loop_ps() -> super::Translation {
     code.extend(ins("S_CBRANCH_SCC0", "ENC_SOPP", &[("SIMM16", back)], None));
     code.extend(tail);
     code.extend(ins("S_ENDPGM", "ENC_SOPP", &[], None));
-    let psi = PsInterface { inputs: vec![el("SV_Position", 0, 1, 3, 0, 0xF)], outputs: vec![el("SV_Target", 0, 64, 3, 0, 0xF)], input_ena: 0x302, attrs: None };
+    let psi = PsInterface { inputs: vec![el("SV_Position", 0, 1, 3, 0, 0xF)], outputs: vec![el("SV_Target", 0, 64, 3, 0, 0xF)], input_ena: 0x302, attrs: None, early_depth: false };
     translate(&code, &Options { mode: Mode::Pixel(psi), wave64: false, ..Default::default() }).unwrap()
 }
 
@@ -11014,7 +11084,7 @@ fn mask_loop_ps() -> super::Translation {
         ]
         .concat(),
     );
-    let psi = PsInterface { inputs: vec![el("SV_Position", 0, 1, 3, 0, 0xF)], outputs: vec![el("SV_Target", 0, 64, 3, 0, 0xF)], input_ena: 0x302, attrs: None };
+    let psi = PsInterface { inputs: vec![el("SV_Position", 0, 1, 3, 0, 0xF)], outputs: vec![el("SV_Target", 0, 64, 3, 0, 0xF)], input_ena: 0x302, attrs: None, early_depth: false };
     translate(&code, &Options { mode: Mode::Pixel(psi), wave64: false, ..Default::default() }).unwrap()
 }
 

@@ -68,10 +68,58 @@ pub struct Kernel {
     pub dispatch_chain: Option<std::sync::Arc<DispatchChain>>,
 }
 
+pub use super::lower_gfx::nan_guard_enabled;
 pub use super::module::split::DispatchChain;
 
 pub fn dispatch_piece_limit() -> usize {
     std::env::var("XCL_DIRECT_SPLIT_INSTRUCTIONS").ok().and_then(|s| s.parse().ok()).unwrap_or(12_500)
+}
+
+/// `XCL_RT_GATE=miss`: every `image_bvh*_intersect_ray` misses (the four result dwords all ones,
+/// as for a null BVH). Ray-tracing programs then run and write what they write when no ray hits
+/// anything, instead of reading half-built/unmapped BVHs or leaving lighting outputs unwritten.
+pub fn rt_all_miss() -> bool {
+    #[cfg(test)]
+    if let Some(on) = RT_ALL_MISS_FOR_TEST.with(|c| c.get()) {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_RT_GATE").is_ok_and(|v| v.trim().eq_ignore_ascii_case("miss")))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// `rt_all_miss` for the translations of this test thread
+    pub(crate) static RT_ALL_MISS_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Loop iterations a lane of a ray-tracing program may run with `XCL_RT_GATE=miss`.
+pub const RT_LOOP_BUDGET: u32 = 1 << 9;
+
+thread_local! {
+    /// The translation on this thread is of a ray-tracing program (`with_rt_program`).
+    static RT_PROGRAM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// `f` with the translations it makes on this thread taken as of a ray-tracing program (`rt`).
+pub fn with_rt_program<R>(rt: bool, f: impl FnOnce() -> R) -> R {
+    let before = RT_PROGRAM.with(|c| c.replace(rt));
+    let r = f();
+    RT_PROGRAM.with(|c| c.set(before));
+    r
+}
+
+/// The loop budget a lane starts with in the program being translated.
+pub fn loop_budget() -> u32 {
+    if RT_PROGRAM.with(|c| c.get()) && rt_all_miss() {
+        RT_LOOP_BUDGET
+    } else {
+        super::lower::LOOP_BUDGET
+    }
+}
+
+fn has_bvh_inst(insts: &[Decoded]) -> bool {
+    insts.iter().any(|d| d.inst.name.contains("BVH"))
 }
 
 /// `XCL_DIRECT_COMPACT`: `1` forces the compact form, `0` forbids it, unset uses automatic selection.
@@ -210,7 +258,7 @@ fn translate_entry_with(
 fn mem_windows(s: &mut Shader, mem_windows: u32, coherent: bool) -> (Vec<RawUav>, Option<bool>) {
     let heap = mem_windows & crate::gpu::recomp::HEAP_WINDOWS != 0;
     let max = if heap { crate::gpu::uma::MAX_HEAP_WINDOWS as u32 } else { crate::gpu::uma::MAX_WINDOWS as u32 };
-    let n = (mem_windows & !crate::gpu::recomp::HEAP_WINDOWS).clamp(1, max);
+    let n = (mem_windows & !(crate::gpu::recomp::HEAP_WINDOWS | crate::gpu::recomp::HEAP_FLAT)).clamp(1, max);
     if heap && n > 1 {
         let z = s.m.i32c(0);
         return (vec![RawUav { handle: z, binding: None }; n as usize], Some(coherent));
@@ -235,11 +283,31 @@ fn translate_on_this_thread(
         None => Cfg::build(code)?,
     };
     let kernel = matches!(entry, Entry::Kernel);
-    let follow_loads = matches!(entry, Entry::Kernel | Entry::Compute(_));
+    let follow_loads = matches!(entry, Entry::Kernel | Entry::Compute(_) | Entry::Vertex(_) | Entry::Pixel(_));
     let gfx = matches!(entry, Entry::Vertex(_) | Entry::Pixel(_));
     let compute = matches!(entry, Entry::Compute(_));
     let split = o.wave64 && o.split && !gfx;
     let leaders: BTreeSet<u64> = cfg.blocks.iter().filter_map(|b| b.insts.first().map(|&i| cfg.insts[i].pc)).collect();
+    let rt_prog = compute && rt_all_miss() && has_bvh_inst(&cfg.insts);
+    with_rt_program(rt_prog, || translate_on_this_thread_inner(cfg, geo, o, entry, compact, nest, rodata, leaders, kernel, follow_loads, gfx, compute, split))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn translate_on_this_thread_inner(
+    cfg: Cfg,
+    geo: Option<GsInterface>,
+    o: KernelOptions,
+    entry: Entry,
+    compact: Option<bool>,
+    nest: Option<super::compact::Nest>,
+    rodata: Vec<(u32, Vec<u32>)>,
+    leaders: BTreeSet<u64>,
+    kernel: bool,
+    follow_loads: bool,
+    gfx: bool,
+    compute: bool,
+    split: bool,
+) -> Result<Kernel, String> {
     let mut lw = Lw::new(&cfg.insts, &leaders, o, &entry);
     lw.rodata = rodata;
     let uses_lds = lw.lds.is_some();
@@ -587,6 +655,7 @@ impl Lw {
             half: z,
             mems,
             heap_mem,
+            heap_flat: heap_mem.is_some() && o.mem_windows & crate::gpu::recomp::HEAP_FLAT != 0,
             res,
             fmt_table: None,
             rodata: Vec::new(),
@@ -605,6 +674,7 @@ impl Lw {
             track_frexp_denorm: crate::gpu::recomp::emit::tracks_frexp_f32_denorm(insts),
             has_f64_round_op: false,
             img_writes: crate::gpu::recomp::emit::image_write_srsrcs(insts),
+            barrier_uav_fence: crate::gpu::recomp::emit::has_uav_write_or_glc(insts),
             max_vgpr: insts
                 .iter()
                 .flat_map(|d| {
@@ -635,6 +705,7 @@ impl Lw {
             gfx: None,
             gfx_half: None,
             whole_live: Default::default(),
+            ps_masks: Default::default(),
             guard_override: None,
             mask_override: None,
             local_masks: false,
@@ -688,6 +759,9 @@ impl Lw {
         if split && std::env::var_os("XCL_X64_ALL_MASKS").is_none() {
             lw.whole_live = crate::gpu::recomp::x64_masks::by_pc(insts, kernel);
         }
+        if matches!(entry, Entry::Pixel(_)) && !split && std::env::var("XCL_PS_MASKS").map_or(true, |v| v.trim() != "0") {
+            lw.ps_masks = crate::gpu::recomp::ps_masks::forms(insts);
+        }
         // (before the storage: the spin exchange has its own slots and counters)
         if let (Some(t), true) = (group_threads, split) {
             lw.partner = match t {
@@ -720,9 +794,13 @@ impl Lw {
         let mut dispatch_chain = None;
         let c = if matches!(stage, Stage::Vertex | Stage::Pixel) {
             let g = self.gfx.take().ok_or("graphics entry without graphics I/O")?;
-            let info = if stage == Stage::Pixel { super::graphics::StageInfo::Pixel { early_depth_stencil: false } } else { super::graphics::StageInfo::Vertex };
+            let early_depth_stencil = g.ps.as_ref().is_some_and(|p| p.early_depth);
+            let info = if stage == Stage::Pixel { super::graphics::StageInfo::Pixel { early_depth_stencil } } else { super::graphics::StageInfo::Vertex };
             self.s.try_finish_graphics(g.io, info)
-        } else if limit > 0 && (numthreads == [32, 1, 1] || split_tid.is_some()) && hw == 32 {
+        } else if limit > 0
+            && (((numthreads == [32, 1, 1] || split_tid.is_some()) && hw == 32)
+                || (numthreads == [64, 1, 1] && hw == 64 && split_tid.is_none()))
+        {
             self.s.m.optimize();
             // A single split wave64 meets its other half through group-shared counters its entry
             // zeroes (`Partner::Spin`), and the exchange's running number counts from the
@@ -738,7 +816,7 @@ impl Lw {
                     }
                 }
             } else {
-                dispatch_chain = self.s.split_compute(numthreads, split_tid, limit).map(std::sync::Arc::new);
+                dispatch_chain = self.s.split_compute(numthreads, split_tid, hw, limit).map(std::sync::Arc::new);
             }
             self.s.finish_optimized(numthreads, Some(hw))
         } else {
@@ -783,10 +861,14 @@ fn dispatch_chain_native_wave64_builds_whole() {
     }
     lw.s.m.ret();
     lw.s.m.optimize();
-    // Exercise the native-wave admission gate with an otherwise partitionable CFG.
+    // Native Wave64 [64, 1, 1] without LDS/barriers splits into validated WaveSize(64) pieces.
     assert!(lw.s.m.dispatch_plan(64).is_some());
     let program = lw.finish_dispatch(threads, 64, 64, None).unwrap();
-    assert!(program.dispatch_chain.is_none());
+    let chain = program.dispatch_chain.as_ref().expect("native wave64 [64,1,1] splits into DispatchChain");
+    assert!(chain.pieces.len() >= 2);
+    for piece in &chain.pieces {
+        super::validate::validate(piece).expect("valid native wave64 split piece");
+    }
     super::validate::validate(&program.dxil).expect("valid native wave64 whole shader");
 
     if !runner::wave64_supported().unwrap_or(false) {
@@ -886,7 +968,7 @@ fn a_dispatch_chain_leaves_the_lanes_past_a_thread_limit_out() {
     lw.s.m.set_block(Block(0));
     lw.s.m.br(gate);
     lw.s.m.optimize();
-    let chain = lw.s.split_compute(threads, None, 64).expect("a chain of pieces");
+    let chain = lw.s.split_compute(threads, None, 32, 64).expect("a chain of pieces");
     assert!(chain.pieces.len() >= 2);
     // the limits are read once, by the first piece
     let load = format!("i32 {}, i32 undef, i8 7, i32 4)", IO_THREAD_LIMIT[0] * 4);
@@ -1182,7 +1264,7 @@ pub fn mesh_init(lw: &mut Lw, ms: &MsInterface, tid: Value, io: super::shader::R
     let mut vgpr = HashMap::new();
     vgpr.insert(5, v5);
     lw.init.compute = Some(ComputeInit { sgpr, vgpr, zero });
-    lw.mesh = Some(super::lower::MeshCtx { rec, vtx, prm, vok, pok, outputs: ms.outputs.clone() });
+    lw.mesh = Some(super::lower::MeshCtx { rec, vtx, prm, vok, pok, outputs: ms.outputs.clone(), params: ms.params.clone() });
 }
 
 /// EXEC at entry: the console wave's threads (static per wave in the split form: no

@@ -229,6 +229,7 @@ pub unsafe fn drain_known(seal_now: bool) {
         }
     }
     queues.extend(super::sparse::queue());
+    queues.extend(super::vram::queues());
     queues.extend(super::title_textures::upload_queues());
     let gone = match HELD.lock().unwrap().as_mut() {
         Some(h) => h.drain(&queues, seal_now),

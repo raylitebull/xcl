@@ -41,6 +41,8 @@ struct State {
     heap_bound: bool,
     res_buf: Option<TwoPassBuf>,
     res_retired: Vec<TwoPassBuf>,
+    /// this recording wrote into the device's shared two-pass record buffer (`SHARED_RECORDS`)
+    shared_records: bool,
     /// rewritten indirect arguments (`scratch_args`): the block (and its bytes), its bytes in
     /// use, and the bytes of blocks this recording took
     scratch: Option<(ID3D12Resource, u64)>,
@@ -68,6 +70,7 @@ struct State {
 /// A recording's blocks of rewritten indirect arguments, and most bytes of them (past it, its
 /// two-pass ExecuteIndirects are skipped)
 const SCRATCH_BLOCK: u64 = 1 << 20;
+const SCRATCH_FIRST_BLOCK: u64 = 128 << 10;
 const SCRATCH_CAP: u64 = 16 << 20;
 /// Most bytes of buffers kept for reuse (`FREE_RES`)
 const FREE_RES_CAP: u64 = 1 << 30;
@@ -214,7 +217,8 @@ fn hold_res_until_reset(allocator: usize, mut bufs: Vec<TwoPassBuf>) {
         return;
     }
     if allocator == 0 {
-        let over = UNKNOWN_RES.lock().unwrap().hold(std::time::Instant::now(), bufs.into_iter().map(|b| (b.bytes, b)).collect());
+        let marks = super::alloc_pool::pending_gpu_marks();
+        let over = UNKNOWN_RES.lock().unwrap().hold(std::time::Instant::now(), bufs.into_iter().map(|b| (b.bytes, (b, marks.clone()))).collect());
         if over > 0 {
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 4 {
@@ -227,14 +231,16 @@ fn hold_res_until_reset(allocator: usize, mut bufs: Vec<TwoPassBuf>) {
 }
 
 pub(super) fn release_allocator_res(allocator: usize) {
-    let aged = UNKNOWN_RES.lock().unwrap().take_older(std::time::Instant::now(), UNKNOWN_RES_AGE);
+    let aged = UNKNOWN_RES.lock().unwrap().take_ready(std::time::Instant::now(), UNKNOWN_RES_AGE, |(_, marks)| {
+        marks.iter().all(|(f, v)| unsafe { super::real::fence_completed(f) } >= *v)
+    });
     let bufs = ALLOC_RES.lock().unwrap().as_mut().and_then(|m| m.remove(&allocator));
     // (let go outside the lock)
     let _gone = {
         let mut free = FREE_RES.lock().unwrap();
         let now = std::time::Instant::now();
         let mut gone = free.take_idle(now, FREE_RES_IDLE);
-        for b in bufs.into_iter().flatten().chain(aged) {
+        for b in bufs.into_iter().flatten().chain(aged.into_iter().map(|(b, _)| b)) {
             gone.extend(free.put(now, b.bytes, b.dev, b));
         }
         gone
@@ -290,9 +296,15 @@ impl<T> Aging<T> {
     }
 
     /// What has been kept `age` or longer at `now`.
+    #[cfg(test)]
     fn take_older(&mut self, now: std::time::Instant, age: std::time::Duration) -> Vec<T> {
+        self.take_ready(now, age, |_| true)
+    }
+
+    /// What has been kept `age` or longer at `now` and satisfies `ready` (GPU fences completed).
+    fn take_ready(&mut self, now: std::time::Instant, age: std::time::Duration, mut ready: impl FnMut(&T) -> bool) -> Vec<T> {
         let mut out = Vec::new();
-        while self.held.front().is_some_and(|&(at, _, _)| now.saturating_duration_since(at) >= age) {
+        while self.held.front().is_some_and(|(at, _, item)| now.saturating_duration_since(*at) >= age && ready(item)) {
             let (_, b, t) = self.held.pop_front().unwrap();
             self.bytes -= b;
             out.push(t);
@@ -301,8 +313,9 @@ impl<T> Aging<T> {
     }
 }
 
-/// the two-pass buffers of recordings with no known allocator (`hold_res_until_reset`)
-static UNKNOWN_RES: Mutex<Aging<TwoPassBuf>> = Mutex::new(Aging::new(UNKNOWN_RES_CAP));
+/// the two-pass buffers of recordings with no known allocator (`hold_res_until_reset`),
+/// paired with the GPU fences active when they were held so long stalls never free in-flight buffers.
+static UNKNOWN_RES: Mutex<Aging<(TwoPassBuf, Vec<(ID3D12Fence, u64)>)>> = Mutex::new(Aging::new(UNKNOWN_RES_CAP));
 
 /// Buffers the GPU is done with, kept for the recordings that need one next (`FREE_RES`): each
 /// with when it was handed back, its bytes and its device, oldest first. What it keeps is what
@@ -444,7 +457,7 @@ pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
         s.rs_gfx = 0;
         s.heaps = [0; 2];
         // (the scratch blocks are in `res_retired` already)
-        (s.scratch, s.scratch_used, s.scratch_taken, s.scratch_in_args, s.record_open) = (None, 0, 0, false, None);
+        (s.scratch, s.scratch_used, s.scratch_taken, s.scratch_in_args, s.record_open, s.shared_records) = (None, 0, 0, false, None, false);
         let mut res_bufs = std::mem::take(&mut s.res_retired);
         if let Some(b) = s.res_buf.take() {
             res_bufs.push(b);
@@ -502,7 +515,7 @@ pub(super) fn inherit_for_split(from: *mut c_void, to: *mut c_void, allocator: u
         s.heaps = heaps;
         // the two-pass record buffers and argument scratch of `to`'s previous recording, as in
         // `reset`: the GPU may still read them, so the new one takes fresh ones
-        (s.scratch, s.scratch_used, s.scratch_taken, s.scratch_in_args, s.record_open) = (None, 0, 0, false, None);
+        (s.scratch, s.scratch_used, s.scratch_taken, s.scratch_in_args, s.record_open, s.shared_records) = (None, 0, 0, false, None, false);
         let mut res_bufs = std::mem::take(&mut s.res_retired);
         if let Some(b) = s.res_buf.take() {
             res_bufs.push(b);
@@ -1669,15 +1682,91 @@ fn record_buffer_bytes(need: u64) -> u64 {
     need.clamp(RECORD_MIN, RECORD_MAX).next_power_of_two()
 }
 
-/// Record bytes a two-pass ExecuteIndirect asks for: `INDIRECT_RECORDS`, or less when a command's
-/// groups (at most 65 535 / `split` in X, `record_groups`) need less – the same groups fit.
+/// The record buffers all recordings of a device share (`XCL_TWO_PASS_SHARED=0`: one of each list,
+/// kept until its allocator is reset). A retail title's world frame has more than a hundred lists
+/// with two-pass draws: at 32 MiB a list the first frames made 68 of them in 4 s. A queue runs
+/// its lists in order and every pass over the records ends with a UAV barrier (`emit_uav_barrier`),
+/// so the next list's passes see none of it as long as all of them go to one queue
+/// (`note_records_queue`).
+static SHARED_RECORDS: Mutex<Vec<(ID3D12Resource, u64, usize)>> = Mutex::new(Vec::new());
+const SHARED_LEAST: u64 = 32 << 20;
+
+fn shared_records_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_TWO_PASS_SHARED").map_or(true, |v| v.trim() != "0"))
+}
+
+static RECORDS_QUEUE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static RECORDS_QUEUES_DIFFER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// `lists` go to `queue` now (`present::note_execute`): the ones that used the shared record
+/// buffer must all go to one queue.
+pub(super) fn note_records_queue(queue: usize, lists: &[*mut c_void]) {
+    if RECORDS_QUEUES_DIFFER.load(Ordering::Relaxed) {
+        return;
+    }
+    let used = lists.iter().any(|&l| STATES.contains(l as usize) && with(l, |s| s.shared_records));
+    if used && !same_records_queue(&RECORDS_QUEUE, queue) {
+        RECORDS_QUEUES_DIFFER.store(true, Ordering::Relaxed);
+        crate::xlog_warn!("D3D12.X: two-pass draws go to a second queue ({queue:#x}): the record buffers are the lists' own from here");
+    }
+}
+
+fn same_records_queue(seen: &std::sync::atomic::AtomicUsize, queue: usize) -> bool {
+    match seen.compare_exchange(0, queue, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => true,
+        Err(first) => first == queue,
+    }
+}
+
+unsafe fn shared_record_buffer(dev: &ID3D12Device, need: u64) -> Result<(ID3D12Resource, u64), String> {
+    let key = dev.as_raw() as usize;
+    let mut all = SHARED_RECORDS.lock().unwrap();
+    if let Some((buf, cap, _)) = all.iter().find(|(_, cap, d)| *d == key && *cap >= need) {
+        return Ok((buf.clone(), *cap));
+    }
+    let bytes = need.max(SHARED_LEAST);
+    let buf = default_uav_buffer(dev, bytes, "shared two-pass record buffer")?;
+    all.push((buf.clone(), bytes, key));
+    Ok((buf, bytes))
+}
+
+fn two_pass_indirect_bytes() -> u64 {
+    static MB: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MB.get_or_init(|| two_pass_list_mb(std::env::var("XCL_TWO_PASS_LIST_MB").ok().as_deref())) << 20
+}
+
+fn two_pass_list_mb(v: Option<&str>) -> u64 {
+    v.and_then(|v| v.trim().parse::<u64>().ok()).filter(|&mb| mb > 0).map_or(32, |mb| mb.min(128))
+}
+
+/// Record bytes a two-pass ExecuteIndirect asks for: `XCL_TWO_PASS_LIST_MB` (default 32 MiB), or
+/// less when a command's groups (at most 65 535 / `split` in X, `record_groups`) need less.
 fn indirect_record_need(record_bytes: u64, split: u32) -> u64 {
-    INDIRECT_RECORDS.min(record_bytes.saturating_mul(65_535 / split.max(1) as u64))
+    two_pass_indirect_bytes().min(record_bytes.saturating_mul(65_535 / split.max(1) as u64))
 }
 
 /// The record buffer of this list for `need_bytes` (at most `RECORD_MAX`): buffer, address, bytes.
 unsafe fn ensure_res_buffer(this: *mut c_void, need_bytes: u64) -> Result<(ID3D12Resource, u64, u64), String> {
     let need = record_buffer_bytes(need_bytes);
+    {
+        static SAID: [std::sync::Once; 2] = [std::sync::Once::new(), std::sync::Once::new()];
+        let one = !RECORDS_QUEUES_DIFFER.load(Ordering::Relaxed);
+        let on = shared_records_on();
+        SAID[(on && one) as usize].call_once(|| {
+            crate::xlog_info!("D3D12.X: two-pass records: {} (switch {on}, one queue so far {one})", if on && one { "shared" } else { "a buffer of each list" });
+        });
+    }
+    if shared_records_on() && !RECORDS_QUEUES_DIFFER.load(Ordering::Relaxed) {
+        let dev = super::real::list_device(this).ok_or("no device for two-pass buffer")?;
+        let (buf, cap) = shared_record_buffer(&dev, need)?;
+        let first = with(this, |s| !std::mem::replace(&mut s.shared_records, true));
+        if let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this).filter(|_| first) {
+            emit_uav_barrier(list, None);
+        }
+        let va = buf.GetGPUVirtualAddress();
+        return Ok((buf, va, cap));
+    }
     if let Some((buf, cap)) = with(this, |s| s.res_buf.as_ref().filter(|b| b.bytes >= need).map(|b| (b.res.clone(), b.bytes))) {
         let va = buf.GetGPUVirtualAddress();
         return Ok((buf, va, cap));
@@ -1794,7 +1883,7 @@ unsafe fn prepare_two_pass_stage(this: *mut c_void, real_mesh_pso: usize, tp: &s
     if pso == 0 {
         return Err(if compute_pass { "two-pass compute pipeline" } else { "two-pass mesh pipeline" }.into());
     }
-    let w = |k: usize| super::real::uma_window_va(k).unwrap_or(first);
+    let w = |k: usize| super::real::uma_window_va(k).filter(|&v| v != 0).unwrap_or(first);
     Ok(StageBind { rs, pso, views: [va(io_at), res_va, w(0), w(1), w(2), w(3)] })
 }
 
@@ -1813,7 +1902,10 @@ RWByteAddressBuffer cnt : register(u4);
 void main(uint tid : SV_DispatchThreadID) {
     uint count = io.Load(0), stride = io.Load(4), offset = io.Load(8), split = io.Load(12), cap = io.Load(16);
     if (tid >= count) return;
-    uint live = io.Load(28) != 0u ? min(count, cnt.Load(io.Load(32))) : count;
+    uint live = count;
+    if (io.Load(28) != 0u) {
+        live = min(count, cnt.Load(io.Load(32)));
+    }
     uint s = io.Load(20) + tid * stride, d = io.Load(24) + tid * stride, m = d + count * stride;
     for (uint i = 0u; i < stride; i += 4u) {
         uint w = src.Load(s + i);
@@ -1832,6 +1924,68 @@ void main(uint tid : SV_DispatchThreadID) {
 }
 "#;
 
+const SCALE_ARGS_DRED_LABEL: &str = "xcl make_scaled_args_buffer";
+
+/// Align a GPU virtual address down to a 256-byte root UAV base and its 4-byte-aligned shader
+/// byte offset (`RWByteAddressBuffer::Load` requires 4-byte alignment, and D3D12 root raw UAVs
+/// require >= 16-byte alignment; UMA window buffers are 64 KiB-aligned so `va & !255` stays in
+/// the same buffer and sparse tile).
+fn align_root_uav(va: u64) -> Result<(u64, u32), String> {
+    if va % 4 != 0 {
+        return Err(format!("indirect buffer address {va:#x} is not 4-byte aligned"));
+    }
+    Ok((va & !255, (va & 255) as u32))
+}
+
+/// Validate `SCALE_ARGS_HLSL`'s command-buffer layout and return the source command byte span.
+fn validate_scale_args_layout(max: u32, stride: u32, mesh_offset: u32) -> Result<u64, String> {
+    if max == 0 || stride == 0 || stride % 4 != 0 || mesh_offset % 4 != 0 || mesh_offset.checked_add(12).is_none_or(|end| end > stride) {
+        return Err(format!("invalid indirect layout (max={max}, stride={stride}, mesh_offset={mesh_offset})"));
+    }
+    let commands = (max as u64).checked_mul(stride as u64).ok_or("indirect command span overflow")?;
+    let total_dst = commands.checked_mul(2).ok_or("scaled indirect buffer size overflow")?;
+    if total_dst > u32::MAX as u64 {
+        return Err(format!("scaled indirect buffer ({total_dst:#x} B) exceeds 32-bit shader offsets"));
+    }
+    Ok(commands)
+}
+
+/// Minimal compute root signature for `SCALE_ARGS_HLSL`: only the 4 root UAVs (`u0, u2, u3, u4`)
+/// and no heap flags, so every root parameter is unconditionally bound before Dispatch.
+unsafe fn scale_args_root_signature(dev: &ID3D12Device) -> Result<ID3D12RootSignature, String> {
+    let params: Vec<D3D12_ROOT_PARAMETER1> = [0u32, 2, 3, 4]
+        .iter()
+        .map(|&reg| D3D12_ROOT_PARAMETER1 {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_UAV,
+            Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                    ShaderRegister: reg,
+                    RegisterSpace: 0,
+                    Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+                },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+        })
+        .collect();
+    let desc = D3D12_VERSIONED_ROOT_SIGNATURE_DESC {
+        Version: D3D_ROOT_SIGNATURE_VERSION_1_1,
+        Anonymous: D3D12_VERSIONED_ROOT_SIGNATURE_DESC_0 {
+            Desc_1_1: D3D12_ROOT_SIGNATURE_DESC1 {
+                NumParameters: params.len() as u32,
+                pParameters: params.as_ptr(),
+                NumStaticSamplers: 0,
+                pStaticSamplers: std::ptr::null(),
+                Flags: D3D12_ROOT_SIGNATURE_FLAG_NONE,
+            },
+        },
+    };
+    let mut blob: Option<windows::Win32::Graphics::Direct3D::ID3DBlob> = None;
+    D3D12SerializeVersionedRootSignature(&desc, &mut blob, None).map_err(|e| format!("scale args root signature serialize: {e}"))?;
+    let blob = blob.ok_or("scale args root signature blob")?;
+    dev.CreateRootSignature(0, std::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize()))
+        .map_err(|e| format!("scale args root signature create: {e}"))
+}
+
 unsafe fn scale_indirect_pipeline(dev: &ID3D12Device) -> Result<(ID3D12RootSignature, ID3D12PipelineState), String> {
     static CACHE: Mutex<Option<HashMap<usize, (ID3D12RootSignature, ID3D12PipelineState)>>> = Mutex::new(None);
     let key = dev.as_raw() as usize;
@@ -1839,7 +1993,7 @@ unsafe fn scale_indirect_pipeline(dev: &ID3D12Device) -> Result<(ID3D12RootSigna
         return Ok(pair);
     }
     let dxil = crate::gpu::recomp::dxc::compile_cached(SCALE_ARGS_HLSL, "main", "cs_6_6")?.0;
-    let rs = crate::gpu::recomp::pso::abi_root_signature(dev, false)?;
+    let rs = scale_args_root_signature(dev)?;
     let mut cdesc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
         pRootSignature: std::mem::ManuallyDrop::new(Some(rs.clone())),
         CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr() as *const c_void, BytecodeLength: dxil.len() },
@@ -1847,7 +2001,9 @@ unsafe fn scale_indirect_pipeline(dev: &ID3D12Device) -> Result<(ID3D12RootSigna
     };
     let res_pso: Result<ID3D12PipelineState, _> = dev.CreateComputePipelineState(&cdesc);
     std::mem::ManuallyDrop::drop(&mut cdesc.pRootSignature);
-    let pso = res_pso.map_err(|e| format!("scale pso create: {e}"))?;
+    let pso = res_pso.map_err(|e| format!("{SCALE_ARGS_DRED_LABEL} pso create: {e}"))?;
+    let _ = pso.SetName(&windows::core::HSTRING::from(SCALE_ARGS_DRED_LABEL));
+    super::dred::label_text(pso.as_raw() as usize, || SCALE_ARGS_DRED_LABEL.to_string());
     CACHE.lock().unwrap().get_or_insert_with(HashMap::new).insert(key, (rs.clone(), pso.clone()));
     Ok((rs, pso))
 }
@@ -1865,7 +2021,8 @@ unsafe fn scratch_args(this: *mut c_void, dev: &ID3D12Device, bytes: u64) -> Res
     }) {
         return Ok(r);
     }
-    let size = bytes.max(SCRATCH_BLOCK);
+    let first = with(this, |s| s.scratch.is_none());
+    let size = bytes.max(if first { SCRATCH_FIRST_BLOCK } else { SCRATCH_BLOCK });
     let remaining = SCRATCH_CAP.saturating_sub(with(this, |s| s.scratch_taken));
     if size > remaining {
         return Err(format!("its rewritten arguments are past {} MiB this recording", SCRATCH_CAP >> 20));
@@ -1897,7 +2054,7 @@ unsafe fn scratch_args(this: *mut c_void, dev: &ID3D12Device, bytes: u64) -> Res
 /// title's world, three times, each at the first such draw of a list). Without a count buffer
 /// u4 names the constants, which are always there.
 fn scale_views(consts: u64, src: u64, dst: u64, count: Option<u64>) -> [(u32, u64); 4] {
-    [(0, consts), (2, src), (3, dst), (4, count.unwrap_or(consts))]
+    [(0, consts), (1, src), (2, dst), (3, count.unwrap_or(consts))]
 }
 
 /// The arguments of `max` commands at UMA address `src`, rewritten for the two passes
@@ -1947,28 +2104,39 @@ struct Rewrite {
 /// its place in a scratch block, the block and the offset.
 #[allow(clippy::too_many_arguments)]
 unsafe fn prepare_scaled_args(this: *mut c_void, src: usize, count: Option<usize>, max: u32, stride: u32, mesh_offset: u32, split: u32, cap: u32) -> Result<(Rewrite, ID3D12Resource, u64), String> {
+    if super::list_x::tracked_list_type(this) == Some(D3D12_COMMAND_LIST_TYPE_BUNDLE) {
+        return Err("command bundles cannot record indirect argument barriers".into());
+    }
+    let commands = validate_scale_args_layout(max, stride, mesh_offset)?;
     let dev = super::real::list_device(this).ok_or("no device")?;
     let (rs, pso) = scale_indirect_pipeline(&dev)?;
     let u = crate::gpu::uma::get().ok_or("no unified memory")?;
-    let commands = (max as u64).saturating_mul(stride as u64);
     // only the GPU reads them: in a GPU view too, once its tiles are asked for
     want_view(super::view_want::Path::MemoryOp, src as u64, commands);
     super::real::uma_window_buffer_gpu(src, commands as usize).ok_or("the indirect arguments are not in one memory window")?;
     let src_va = super::real::uma_va_of(src).ok_or("unified memory is not open on the GPU")?;
-    let count_va = match count {
+    let (src_base, src_off) = align_root_uav(src_va)?;
+    if (src_off as u64).checked_add(commands).is_none_or(|end| end > u32::MAX as u64) {
+        return Err("indirect command range exceeds 32-bit shader offsets".into());
+    }
+    let count_bound = match count {
         Some(p) => {
             want_view(super::view_want::Path::MemoryOp, p as u64, 4);
             super::real::uma_window_buffer_gpu(p, 4).ok_or("the indirect count is not in a memory window")?;
-            Some(super::real::uma_va_of(p).ok_or("unified memory is not open on the GPU")?)
+            let va = super::real::uma_va_of(p).ok_or("unified memory is not open on the GPU")?;
+            Some(align_root_uav(va)?)
         }
         None => None,
     };
     let (dst, dst_off) = scratch_args(this, &dev, commands.saturating_mul(2))?;
-    let consts: Vec<u8> = [max, stride, mesh_offset, split, cap, 0, 0, count_va.is_some() as u32, 0].iter().flat_map(|w| w.to_le_bytes()).collect();
+    let consts: Vec<u8> = [max, stride, mesh_offset, split, cap, src_off, 0, count_bound.is_some() as u32, count_bound.map_or(0, |(_, off)| off)]
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
     let p = with(this, |s| s.arena.take(u, consts.len(), 256, &mut s.uma)).ok_or("unified memory is full")?;
     std::ptr::copy_nonoverlapping(consts.as_ptr(), p, consts.len());
     let consts_va = super::real::uma_va_of(p as usize).ok_or("unified memory is not open on the GPU")?;
-    let views = scale_views(consts_va, src_va, dst.GetGPUVirtualAddress() + dst_off, count_va);
+    let views = scale_views(consts_va, src_base, dst.GetGPUVirtualAddress() + dst_off, count_bound.map(|(base, _)| base));
     // (the pair is the device's for good: `scale_indirect_pipeline` keeps it)
     Ok((Rewrite { rs: rs.as_raw() as usize, pso: pso.as_raw() as usize, views, groups: max.div_ceil(64) }, dst, dst_off))
 }
@@ -2404,6 +2572,10 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                 (None, None) => fresh_indirect_arguments(this, || pc(this, sig, max, args, args_off, count_buf, count_off)),
             }
             super::gpu_profile::end(this, t);
+            if compute && super::ambient::has_compute_psos() {
+                let (layout, args, view_heap) = with(this, |s| (s.layout.clone(), s.args.clone(), s.heaps[0]));
+                super::ambient::after_compute_dispatch(this, pso, [0, 0, 0], layout.as_deref(), &args, view_heap);
+            }
         }
         Err(e) => {
             ei_work(this, sig, super::targets::SKIPPED);
@@ -2569,12 +2741,17 @@ pub(super) unsafe extern "system" fn draw_instanced(this: *mut c_void, vertices:
     let _c = capture_work(this, || super::capture::WorkKind::Draw { vertices, instances, first_vertex, first_instance }, true);
     DRAW_ARGS.with(|d| d.set((false, vertices, instances, first_vertex, 0)));
     if let Some(list) = graphics_bound(this) {
-        let t = super::gpu_profile::begin(this, with(this, |s| s.pso), super::gpu_profile::Kind::Draw, [vertices, instances, 0]);
+        let bound_pso = with(this, |s| s.pso);
+        let t = super::gpu_profile::begin(this, bound_pso, super::gpu_profile::Kind::Draw, [vertices, instances, 0]);
         if !draw_rects(this, &list, vertices, instances, first_vertex, first_instance) {
             super::list_x::sync_title_buffers(this, None, first_vertex, vertices, if first_instance != 0 { instances.max(2) } else { instances });
             list.DrawInstanced(vertices, instances, first_vertex, first_instance);
         }
         super::gpu_profile::end(this, t);
+        if super::ambient::has_sky_psos() {
+            let pso = super::pso_async::resolve(bound_pso);
+            super::ambient::after_draw(this, pso);
+        }
     }
 }
 
@@ -2589,6 +2766,10 @@ pub(super) unsafe extern "system" fn draw_indexed_instanced(this: *mut c_void, i
     if let Some(list) = prepare_indexed_draw(this, indices, instances, first_index, base_vertex) {
         super::list_x::sync_title_buffers(this, Some((first_index, indices, base_vertex)), 0, 0, if first_instance != 0 { instances.max(2) } else { instances });
         emit_prepared_indexed_draw(&list, indices, instances, first_index, base_vertex, first_instance);
+        if super::ambient::has_sky_psos() {
+            let pso = super::pso_async::resolve(with(this, |s| s.pso));
+            super::ambient::after_draw(this, pso);
+        }
     }
 }
 
@@ -3094,8 +3275,28 @@ fn note_thread_dimensions(threads: [u32; 3], groups: [u32; 3], shape: [u32; 3]) 
     }
 }
 
+/// Whether the BVH builder's passes (`DispatchX` with `DISPATCH_THREAD_DIMENSIONS`, the title's
+/// `XboxBvhBuilder.dll`) run: off unless `XCL_BVH_BUILDER=1`. While its 52 pipelines compile one
+/// by one, partial runs write garbage bounds/pointers into title memory and crash or hang world load.
+fn bvh_builder_runs(flags: u32, enabled: bool) -> bool {
+    flags & DISPATCH_THREAD_DIMENSIONS == 0 || enabled
+}
+
+fn bvh_builder_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_BVH_BUILDER").is_ok_and(|v| v.trim() == "1"))
+}
+
 /// `Dispatch` / `DispatchX(x, y, z, flags)`.
 pub(super) unsafe fn dispatch_flags(this: *mut c_void, x: u32, y: u32, z: u32, flags: u32) {
+    if !bvh_builder_runs(flags, bvh_builder_enabled()) {
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if n == 1 || n.is_power_of_two() {
+            crate::xlog_info!("D3D12.X: BVH builder pass left out ({n} so far; XCL_BVH_BUILDER=1 runs them)");
+        }
+        return;
+    }
     let pso = with(this, |s| s.pso);
     let _c = capture_work(this, || captured_dispatch(pso, [x, y, z], flags), false);
     // (recorded at the submit through this call, with everything below: counted there)
@@ -3145,7 +3346,13 @@ pub(super) unsafe fn dispatch_flags(this: *mut c_void, x: u32, y: u32, z: u32, f
     let done = translated_dispatch(this, list, pso, groups[0], groups[1], groups[2]);
     with(this, |s| s.limits = [0; 3]);
     match done {
-        Ok(()) => count(DISPATCHES),
+        Ok(()) => {
+            count(DISPATCHES);
+            if super::ambient::has_compute_psos() {
+                let (layout, args, view_heap) = with(this, |s| (s.layout.clone(), s.args.clone(), s.heaps[0]));
+                super::ambient::after_compute_dispatch(this, pso, groups, layout.as_deref(), &args, view_heap);
+            }
+        }
         Err(e) => {
             count(DISPATCHES_SKIPPED);
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -3486,6 +3693,19 @@ pub(super) fn last_draw_args() -> (bool, u32, u32, u32, i32) {
 #[cfg(test)]
 pub(super) fn counts_snapshot() -> [u64; 5] {
     std::array::from_fn(|k| COUNTS[k].load(Ordering::Relaxed))
+}
+
+/// Tracked console `(graphics_root_signature, compute_root_signature)` on `list` for restoring
+/// PC root signatures after an internal graphics/compute sync pass (invalidating cached view heap
+/// binding state since the internal pass clobbered descriptor heaps / root signatures).
+pub(super) fn tracked_root_sigs(list: *mut c_void) -> (usize, usize) {
+    if !STATES.contains(list as usize) {
+        return (0, 0);
+    }
+    with(list, |s| {
+        s.heap_bound = false;
+        (s.rs_gfx, 0)
+    })
 }
 
 #[cfg(test)]
@@ -4120,7 +4340,7 @@ void main(uint t : SV_GroupIndex) {
             }
             let buf = TwoPassBuf::make(&dev.unwrap(), 1 << 16, "test").unwrap();
             let raw = buf.res.as_raw() as usize;
-            let kept = |r: usize| UNKNOWN_RES.lock().unwrap().held.iter().any(|h| h.2.res.as_raw() as usize == r);
+            let kept = |r: usize| UNKNOWN_RES.lock().unwrap().held.iter().any(|h| h.2.0.res.as_raw() as usize == r);
             hold_res_until_reset(0, vec![buf]);
             assert!(kept(raw), "a buffer of a recording with no allocator is kept");
         }
@@ -4757,10 +4977,14 @@ void main(uint t : SV_GroupIndex) {
         }
         assert!(!SCALE_ARGS_HLSL.contains("register(u1)") && !SCALE_ARGS_HLSL.contains("register(u5)"));
         let with_count = scale_views(0x1000, 0x2000, 0x3000, Some(0x4000));
-        assert_eq!(with_count, [(0, 0x1000), (2, 0x2000), (3, 0x3000), (4, 0x4000)]);
+        assert_eq!(with_count, [(0, 0x1000), (1, 0x2000), (2, 0x3000), (3, 0x4000)]);
         let without = scale_views(0x1000, 0x2000, 0x3000, None);
-        assert_eq!(without, [(0, 0x1000), (2, 0x2000), (3, 0x3000), (4, 0x1000)]);
+        assert_eq!(without, [(0, 0x1000), (1, 0x2000), (2, 0x3000), (3, 0x1000)]);
         assert!(without.iter().all(|&(_, va)| va != 0));
+        assert_eq!(align_root_uav(0x1_0000_000c).unwrap(), (0x1_0000_0000, 12));
+        assert!(align_root_uav(0x1_0000_0002).is_err());
+        assert_eq!(validate_scale_args_layout(4, 16, 4).unwrap(), 64);
+        assert!(validate_scale_args_layout(1, 16, 8).is_err());
     }
 
     /// `SCALE_ARGS_HLSL` on `commands` (dwords each, the DispatchMesh argument at dword 1):

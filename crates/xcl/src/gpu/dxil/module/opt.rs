@@ -104,16 +104,18 @@ impl Module {
                 let name = &self.funcs[*f as usize].name;
                 // AMD RDNA4 (`amdxc64.dll`) crashes on null deref if a raw `createHandleFromHeap`
                 // handle is shared across distinct `annotateHandle` resource kinds or across basic
-                // blocks, or if `annotateHandle` / `getDimensions` crosses basic blocks.
-                if name.starts_with("dx.op.createHandleFromHeap") {
+                // blocks, if `annotateHandle` crosses basic blocks, or if `getDimensions` is reused
+                // at all (29 `CS_RaytracingResolve` pipelines crash on RDNA4 when CSE merges
+                // `dx.op.getDimensions` calls, even within the same basic block).
+                if name.starts_with("dx.op.createHandleFromHeap") || name.starts_with("dx.op.getDimensions") {
                     Cse::No
-                } else if name.starts_with("dx.op.annotateHandle") || name.starts_with("dx.op.getDimensions") {
+                } else if name.starts_with("dx.op.annotateHandle") {
                     Cse::Block
                 } else {
                     Cse::Dom
                 }
             }
-            Op::Call(f, _) if self.funcs[*f as usize].name.starts_with("dx.op.getDimensions") => Cse::Block,
+            Op::Call(f, _) if self.funcs[*f as usize].name.starts_with("dx.op.getDimensions") => Cse::No,
             Op::Call(f, _) if self.wave_call(*f) && !self.funcs[*f as usize].name.starts_with("dx.op.waveIsFirstLane") => Cse::Block,
             _ => Cse::No,
         }
@@ -792,6 +794,56 @@ impl Module {
         changed
     }
 
+    /// Post-DCE narrowing of `dx.op.rawBufferLoad.*` component masks: if all surviving uses of a
+    /// load are `ExtractValue` on components `0..=max_c` (never residency status index `4` and
+    /// never passed whole), narrow its contiguous DXIL mask (`15`/`7`/`3`) to `(1 << (max_c + 1)) - 1`.
+    fn narrow_raw_buffer_loads(&mut self, order: &[u32]) -> bool {
+        let mut max_comp = vec![-1i8; self.insts.len()];
+        for &b in order {
+            for &i in &self.blocks[b as usize] {
+                match &self.insts[i as usize].op {
+                    Op::Extract(Value::Inst(j), idx) if *idx < 4 => {
+                        let slot = &mut max_comp[*j as usize];
+                        if *slot < 99 {
+                            *slot = (*slot).max(*idx as i8);
+                        }
+                    }
+                    other => other.for_each_operand(|v| {
+                        if let Value::Inst(j) = v {
+                            max_comp[j as usize] = 99;
+                        }
+                    }),
+                }
+            }
+        }
+        let mut changed = false;
+        for &b in order {
+            for k in 0..self.blocks[b as usize].len() {
+                let i = self.blocks[b as usize][k] as usize;
+                let mc = max_comp[i];
+                if !(0..4).contains(&mc) {
+                    continue;
+                }
+                let (mask_ty, cur_mask) = match &self.insts[i].op {
+                    Op::Call(f, args) if args.len() == 6 && self.funcs[*f as usize].name.starts_with("dx.op.rawBufferLoad.") => {
+                        let Some(m) = self.const_u64(args[4]) else { continue };
+                        (self.value_ty(args[4]), m)
+                    }
+                    _ => continue,
+                };
+                let new_mask = (1u64 << (mc as u32 + 1)) - 1;
+                if matches!(cur_mask, 3 | 7 | 15) && new_mask < cur_mask {
+                    let c = self.const_int(mask_ty, new_mask);
+                    if let Op::Call(_, args) = &mut self.insts[i].op {
+                        args[4] = c;
+                        changed = true;
+                    }
+                }
+            }
+        }
+        changed
+    }
+
     /// Removes immediately redundant `dx.op.barrier` calls within a basic block when no
     /// memory-visible side effect occurred since an equally-strong or stronger barrier.
     fn elim_redundant_barriers(&mut self, order: &[u32]) -> bool {
@@ -1226,6 +1278,10 @@ impl Module {
             }
             for b in &mut self.blocks {
                 b.retain(|&i| live[i as usize]);
+            }
+
+            if !skip("mask") && self.narrow_raw_buffer_loads(&order) {
+                iter_changed = true;
             }
 
             if !skip("merge") && self.simplify_cfg() {
@@ -2215,5 +2271,29 @@ mod tests {
             .filter(|&&i| matches!(s.m.insts[i as usize].op, Op::Call(f, _) if s.m.funcs[f as usize].name == "dx.op.barrier"))
             .count();
         assert_eq!(barriers, 1, "adjacent covered barriers must collapse to one");
+    }
+
+    #[test]
+    fn raw_buffer_load_mask_narrowed_to_highest_extracted_component() {
+        use crate::gpu::dxil::container::Stage;
+        use crate::gpu::dxil::shader::Shader;
+        let mut s = Shader::new(Stage::Compute, (6, 6));
+        let z = s.m.i32c(0);
+        let uav = s.heap_raw_buffer_uav(z, false);
+        let vals = s.raw_load(uav, z, 15);
+        // Only component 0 is used; components 1..3 are dead -> mask must narrow from 15 to 1.
+        s.raw_store(uav, z, &[vals[0]]);
+        s.m.ret();
+
+        s.m.optimize();
+
+        let load_masks: Vec<u64> = s.m.blocks[0]
+            .iter()
+            .filter_map(|&i| match &s.m.insts[i as usize].op {
+                Op::Call(f, args) if s.m.funcs[*f as usize].name.starts_with("dx.op.rawBufferLoad.") => s.m.const_u64(args[4]),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(load_masks, vec![1], "rawBufferLoad mask 15 must narrow to 1 when only x is live");
     }
 }

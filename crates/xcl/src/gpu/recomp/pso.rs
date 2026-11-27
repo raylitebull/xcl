@@ -82,7 +82,10 @@ pub fn fspx(blob: &[u8]) -> Option<Fspx<'_>> {
 pub fn mem_windows() -> u32 {
     let title = TITLE_WINDOWS.load(std::sync::atomic::Ordering::Relaxed);
     if title != 0 {
-        return windows_for(title & !super::HEAP_WINDOWS, title & super::HEAP_WINDOWS != 0 && !SWITCH_FORM.with(|s| s.get()));
+        return windows_for(
+            title & !(super::HEAP_WINDOWS | super::HEAP_FLAT),
+            title & super::HEAP_WINDOWS != 0 && !SWITCH_FORM.with(|s| s.get()),
+        );
     }
     let n = crate::gpu::uma::get().map_or(1, |u| u.shader_windows() as u32);
     windows_for(n, heap_windows() && !SWITCH_FORM.with(|s| s.get()))
@@ -103,10 +106,17 @@ pub fn set_title_windows(windows: u32) {
 /// not be made, or a pipeline the driver refused with them, lost every shader on HLSL).
 fn windows_for(n: u32, heap: bool) -> u32 {
     if n > 1 && heap {
-        n | super::HEAP_WINDOWS
+        n | super::HEAP_WINDOWS | if heap_flat() { super::HEAP_FLAT } else { 0 }
     } else {
         n.min(crate::gpu::uma::MAX_WINDOWS as u32)
     }
+}
+
+/// `XCL_HEAP_FLAT` (default on with heap windows; `=0` to disable): the direct DXIL translator
+/// reads heap windows without a branch per access (`HEAP_FLAT`).
+pub fn heap_flat() -> bool {
+    static ENV: OnceLock<bool> = OnceLock::new();
+    *ENV.get_or_init(|| std::env::var("XCL_HEAP_FLAT").map_or(true, |v| v.trim() != "0"))
 }
 
 thread_local! {
@@ -292,6 +302,14 @@ mod translated {
             };
             let id = if Backend::current() != Backend::Hlsl {
                 identity_for(&id.to_string(), &format!("dispatch-split-{}", crate::gpu::dxil::kernel::dispatch_piece_limit()))
+            } else { id };
+            // `XCL_RT_GATE=miss`: ray-tracing programs are another output
+            let id = if Backend::current() != Backend::Hlsl && crate::gpu::dxil::kernel::rt_all_miss() {
+                identity_for(&id.to_string(), "xcl-rt-all-miss")
+            } else { id };
+            // `XCL_NAN_GUARD=0`: disabling PS float NaN/Inf sanitization changes pixel DXIL
+            let id = if Backend::current() != Backend::Hlsl && !crate::gpu::dxil::kernel::nan_guard_enabled() {
+                identity_for(&id.to_string(), "xcl-nan-guard-0")
             } else { id };
             // `XCL_X_LDS_ORDER=0`: the split wave64 form without its LDS order, in both translators
             let id = if crate::gpu::recomp::emit::lds_order_wanted() { id } else { identity_for(&id.to_string(), "xcl-x-lds-order-0") };
@@ -1544,15 +1562,17 @@ mod shader_cache_tests {
     #[test]
     fn the_switch_form_never_asks_for_more_windows_than_root_uavs() {
         let heap = super::super::HEAP_WINDOWS;
+        let flat = if heap_flat() { super::super::HEAP_FLAT } else { 0 };
+        let flags = super::super::HEAP_WINDOWS | super::super::HEAP_FLAT;
         assert_eq!(windows_for(16, false), 4);
         assert_eq!(windows_for(8, false), 4);
-        assert_eq!(windows_for(16, true), 16 | heap);
-        assert_eq!((windows_for(4, false), windows_for(4, true)), (4, 4 | heap));
+        assert_eq!(windows_for(16, true), 16 | heap | flat);
+        assert_eq!((windows_for(4, false), windows_for(4, true)), (4, 4 | heap | flat));
         assert_eq!((windows_for(1, false), windows_for(1, true)), (1, 1));
         for n in [1u32, 2, 4, 8, 16] {
             for h in [false, true] {
                 let w = windows_for(n, h);
-                assert!(super::super::valid_window_count((w & !heap) as usize, w & heap != 0), "{n} windows, heap {h}: {w:#x}");
+                assert!(super::super::valid_window_count((w & !flags) as usize, w & heap != 0), "{n} windows, heap {h}: {w:#x}");
             }
         }
     }

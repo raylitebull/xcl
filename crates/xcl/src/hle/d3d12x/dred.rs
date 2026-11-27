@@ -46,6 +46,14 @@ pub fn label(pso: usize, shaders: &[(&str, Option<&[u8]>)]) {
     LABELS.lock().unwrap().get_or_insert_with(HashMap::new).insert(pso, text);
 }
 
+/// Name an internal pipeline (`SCALE_ARGS_HLSL`, `indirect_guard`, etc.) for DRED breadcrumbs.
+pub fn label_text(pso: usize, make: impl FnOnce() -> String) {
+    if !on() || pso == 0 {
+        return;
+    }
+    LABELS.lock().unwrap().get_or_insert_with(HashMap::new).insert(pso, make());
+}
+
 pub(super) fn label_of(pso: usize) -> Option<String> {
     LABELS.lock().unwrap().as_ref()?.get(&pso).cloned()
 }

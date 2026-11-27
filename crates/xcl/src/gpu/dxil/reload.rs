@@ -365,6 +365,44 @@ mod tests {
         assert_eq!(buffer_loads(&[LOAD, ADD, store, LOAD, sum, END]), buffer_loads(&[LOAD, ADD, store, sum, END]) + 1, "a store in between: loaded again");
     }
 
+    #[test]
+    fn graphics_stages_emit_a_repeated_load_once() {
+        use super::super::kernel::{translate_pixel, translate_vertex, KernelOptions};
+        use crate::gpu::recomp::{PsInterface, VsInterface};
+
+        let encode = |insts: &[I]| -> Vec<u8> {
+            insts.iter().flat_map(|(n, e, f)| rdna2::encode(n, e, f, None).unwrap()).collect()
+        };
+        let count_loads = |dxil: &[u8]| -> usize {
+            super::super::validate::validate(dxil).expect("valid DXIL");
+            let dis = super::super::validate::disassemble(dxil).expect("disassemble");
+            dis.lines().filter(|l| l.contains("@dx.op.rawBufferLoad") && l.contains(" = call ")).count()
+        };
+        let opts = KernelOptions { wave64: false, split: false, mem_windows: 4, sampler_base: 0 };
+        let sum: I = ("S_ADD_U32", "ENC_SOP2", &[("SDST", 21), ("SSRC0", 20), ("SSRC1", 12)]);
+        let store: I = ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 0), ("DATA", 2), ("SADDR", 125)]);
+        let once_code = encode(&[LOAD, ADD, END]);
+        let repeat_code = encode(&[LOAD, ADD, LOAD, sum, END]);
+        let store_once_code = encode(&[LOAD, ADD, store, sum, END]);
+        let store_repeat_code = encode(&[LOAD, ADD, store, LOAD, sum, END]);
+
+        let vs = VsInterface::default();
+        let vs_once = count_loads(&translate_vertex(&once_code, opts, &vs).expect("VS once").dxil);
+        let vs_repeat = count_loads(&translate_vertex(&repeat_code, opts, &vs).expect("VS repeat").dxil);
+        assert_eq!(vs_repeat, vs_once, "VS repeated s_load_dwordx4 should reuse cached values");
+        let vs_store_once = count_loads(&translate_vertex(&store_once_code, opts, &vs).expect("VS store once").dxil);
+        let vs_store_repeat = count_loads(&translate_vertex(&store_repeat_code, opts, &vs).expect("VS store repeat").dxil);
+        assert_eq!(vs_store_repeat, vs_store_once + 4, "VS store should invalidate reload across 4 windows");
+
+        let ps = PsInterface::default();
+        let ps_once = count_loads(&translate_pixel(&once_code, opts, &ps).expect("PS once").dxil);
+        let ps_repeat = count_loads(&translate_pixel(&repeat_code, opts, &ps).expect("PS repeat").dxil);
+        assert_eq!(ps_repeat, ps_once, "PS repeated s_load_dwordx4 should reuse cached values");
+        let ps_store_once = count_loads(&translate_pixel(&store_once_code, opts, &ps).expect("PS store once").dxil);
+        let ps_store_repeat = count_loads(&translate_pixel(&store_repeat_code, opts, &ps).expect("PS store repeat").dxil);
+        assert_eq!(ps_store_repeat, ps_store_once + 4, "PS store should invalidate reload across 4 windows");
+    }
+
     /// Every output operand type of the instruction tables is one `changes` knows: a new one
     /// must be looked at here, not passed over.
     #[test]

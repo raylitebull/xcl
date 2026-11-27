@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
-use super::{elements_at, param_registers, ps_attribute_slot, ps_input_vgpr, ps_slot_attribute, ranked, vs_param_register, Mode, MsInterface, Options, KERNEL_EXPORTS, KERNEL_LANES, KERNEL_SCC_SLOT, KERNEL_SGPRS, KERNEL_SPLIT_MAGIC, KERNEL_SPLIT_SGPRS, KERNEL_VGPRS, MESH_HEADER};
+use super::{out_param_elements, ps_attribute_f16, ps_attribute_slot, ps_f16_slot, ps_input_vgpr, ps_slot_attribute, ranked, Mode, MsInterface, Options, KERNEL_EXPORTS, KERNEL_LANES, KERNEL_SCC_SLOT, KERNEL_SGPRS, KERNEL_SPLIT_MAGIC, KERNEL_SPLIT_SGPRS, KERNEL_VGPRS, MESH_HEADER};
 use super::upper_lanes::Read;
 use crate::gpu::dxbc::SigElement;
 use crate::gpu::rdna2::{self, Decoded, Encoding, Operand, Variant};
@@ -73,6 +73,9 @@ pub(super) struct Em {
     /// LDS arrival barrier (`xcl_s_barrier`) so RDNA2 early `s_endpgm`, `LOOP_GUARD` exits,
     /// or split-wave64 desyncs cannot permanently hang an NVIDIA SM at `bar.sync`.
     safe_barrier: bool,
+    /// program writes/atomics global or image UAVs or uses `GLC=1`: `s_barrier` must also flush
+    /// global device memory (`AllMemoryBarrierWithGroupSync` / `AllMemoryBarrier`) on RDNA4.
+    barrier_uav_fence: bool,
     /// the T# SGPRs of the program's image stores and atomics (`image_write_srsrcs`)
     img_writes: Vec<u64>,
     /// compute program needs `globallycoherent` on flat memory windows (`needs_coherent_mem`)
@@ -80,6 +83,23 @@ pub(super) struct Em {
     /// the program writes LDS (`writes_lds`): in the split wave64 form its LDS reads and
     /// atomics keep the console wave's order (`xcl_x_lw`)
     pub writes_lds: bool,
+}
+
+/// True when the program writes or atomically updates global/image memory or performs a
+/// globally-coherent (`GLC=1`) memory access. On RDNA4, `s_barrier` in such shaders must emit
+/// a global UAV fence (`AllMemoryBarrierWithGroupSync` / `barrier::ALL_SYNC`) so L0/L1 caches
+/// become visible across waves/workgroups alongside LDS/TGSM.
+pub fn has_uav_write_or_glc(insts: &[Decoded]) -> bool {
+    insts.iter().any(|d| {
+        if !matches!(d.enc.name, "ENC_MUBUF" | "ENC_MTBUF" | "ENC_MIMG" | "ENC_FLAT" | "ENC_FLAT_GLBL" | "ENC_SMEM") {
+            return false;
+        }
+        if rdna2::field_value(d.enc, &d.words, "GLC") == Some(1) {
+            return true;
+        }
+        let n = d.inst.name;
+        n.contains("STORE") || n.contains("ATOMIC")
+    })
 }
 
 /// The T# SGPRs (SRSRC) of a program's image stores and atomics, at most 16, sorted. An
@@ -629,6 +649,7 @@ impl Em {
             dynamic_f16_rm: false,
             track_frexp_denorm: false,
             safe_barrier: false,
+            barrier_uav_fence: false,
             img_writes: Vec::new(),
             coherent_mem: false,
             writes_lds: false,
@@ -651,6 +672,7 @@ impl Em {
     pub fn configure_round_modes(&mut self, insts: &[Decoded], stop_at_endpgm: bool) {
         self.track_frexp_denorm = tracks_frexp_f32_denorm(insts);
         self.img_writes = image_write_srsrcs(insts);
+        self.barrier_uav_fence = has_uav_write_or_glc(insts);
         let mut writes_nonzero_dp = false;
         let mut has_s_barrier = false;
         for d in insts {
@@ -1306,20 +1328,26 @@ impl Em {
         match name {
             "s_endpgm" | "s_endpgm_saved" | "s_endpgm_ordered_ps_done" => Flow::End,
             "s_barrier" => {
+                let sync_fn = if self.barrier_uav_fence { "AllMemoryBarrierWithGroupSync" } else { "GroupMemoryBarrierWithGroupSync" };
+                let mem_fn = if self.barrier_uav_fence { "AllMemoryBarrier" } else { "GroupMemoryBarrier" };
                 if self.x64() && matches!(self.opt.mode, Mode::Geometry(_)) {
                     // split ES+GS: the GS phase runs in the lower hardware wave alone (one console
                     // wave: nothing to wait for), a group barrier there would wait for the other
-                    self.line("if (xcl_es_phase) GroupMemoryBarrierWithGroupSync();");
+                    self.line(&format!("if (xcl_es_phase) {sync_fn}();"));
                 } else if matches!(self.opt.mode, Mode::Compute(_) | Mode::Mesh(_)) {
                     if self.safe_barrier {
-                        self.line("xcl_s_barrier();");
+                        if self.barrier_uav_fence {
+                            self.line("AllMemoryBarrier(); xcl_s_barrier(); AllMemoryBarrier();");
+                        } else {
+                            self.line("xcl_s_barrier();");
+                        }
                     } else if self.compute_or_mesh_hw_waves() == Some(1) {
-                        self.line("GroupMemoryBarrier();");
+                        self.line(&format!("{mem_fn}();"));
                     } else {
-                        self.line("GroupMemoryBarrierWithGroupSync();");
+                        self.line(&format!("{sync_fn}();"));
                     }
                 } else if matches!(self.opt.mode, Mode::Kernel | Mode::Geometry(_)) {
-                    self.line("GroupMemoryBarrierWithGroupSync();");
+                    self.line(&format!("{sync_fn}();"));
                 }
                 // split wave64: both halves made their LDS writes before the barrier (a half
                 // without a partner has nothing to wait for)
@@ -1329,10 +1357,13 @@ impl Em {
                 Flow::Next
             }
             "s_sendmsg" if matches!(self.opt.mode, Mode::Geometry(_)) => {
-                // MSG_GS (2): op 1 cut, 2 emit, 3 emit + cut (stream 0); GS_DONE (3) – nothing to do
+                // MSG_GS (2) and MSG_GS_DONE (3): op 1 cut, 2 emit, 3 emit + cut (stream 0)
                 let simm = rdna2::field_value(d.enc, &d.words, "SIMM16").unwrap_or(0);
                 let (msg, op, stream) = (simm & 0xF, (simm >> 4) & 3, (simm >> 8) & 3);
-                if let (2, 0, Mode::Geometry(g)) = (msg, stream, &self.opt.mode) {
+                if let (2 | 3, 0, Mode::Geometry(g)) = (msg, stream, &self.opt.mode) {
+                    if op == 0 {
+                        return Flow::Next;
+                    }
                     let maxt = g.max_vertex_count.saturating_sub(2).max(1);
                     let act = self.act();
                     if op & 2 != 0 {
@@ -2348,18 +2379,26 @@ impl Em {
                 // param N is a register: channel c goes to component c of every element there
                 let k = (tgt - 32) as usize;
                 let params = ranked(&vs.outputs, true);
-                let at = vs_param_register(vs, k).map(|r| elements_at(&vs.outputs, true, r)).unwrap_or_default();
+                let (at, f16) = out_param_elements(&vs.outputs, vs.params.as_deref(), k);
                 if at.is_empty() {
                     self.line("/* param without an OSG1 element (dummy) */");
                     return Ok(());
                 }
-                for j in at {
+                for (j, first) in at {
                     let e = params[j];
                     let n = out_comps(e);
                     for c in 0..n {
-                        if enabled(c) {
-                            let v = Self::exp_comp(srcs, compr, c);
-                            let v = if e.component_type == 3 { format!("asfloat({v})") } else { format!("{v}") };
+                        // packed float16: component c is half c & 1 of dword first + c / 2
+                        let dw = if f16 { first + c / 2 } else { c };
+                        if dw < 4 && enabled(dw) {
+                            let v = Self::exp_comp(srcs, compr, dw);
+                            let v = if f16 {
+                                format!("f16tof32({v} >> {}u)", 16 * (c & 1))
+                            } else if e.component_type == 3 {
+                                format!("asfloat({v})")
+                            } else {
+                                format!("{v}")
+                            };
                             let comp = if n == 1 { String::new() } else { format!("[{c}]") };
                             st.push(format!("xo.p{j}{comp} = {v};"));
                         }
@@ -2379,6 +2418,11 @@ impl Em {
                             (2, true) => format!("(((int)({raw} << 16)) >> 16)"),
                             (2, false) => format!("(int){raw}"),
                             (_, _) => raw,
+                        };
+                        let v = if e.component_type == 3 && crate::gpu::dxil::kernel::nan_guard_enabled() {
+                            format!("((asuint({v}) & 0x7FFFFFFFu) > 0x7F800000u ? 0.0f : clamp({v}, -65504.0f, 65504.0f))")
+                        } else {
+                            v
                         };
                         st.push(format!("xo.t{tgt}[{c}] = {v};"));
                     }
@@ -2410,15 +2454,19 @@ impl Em {
                 // param N is a register: its record slot is that of every element there (the
                 // pass-through reads an element's slot as the whole register, as for the GS)
                 let k = (tgt - 32) as usize;
-                let at = param_registers(&ms.outputs, true).get(k).map(|&r| elements_at(&ms.outputs, true, r)).unwrap_or_default();
+                let (at, f16) = out_param_elements(&ms.outputs, ms.params.as_deref(), k);
                 if at.is_empty() {
                     self.line("/* param without an OSG1 element (dummy) */");
                     return Ok(());
                 }
-                for j in at {
+                for (j, first) in at {
                     for c in 0..4 {
-                        if enabled(c) {
-                            st.push(format!("if (xcl_vok) res.Store((xcl_vtx + {}u) * 4u, {});", 4 * (j + 1) + c, Self::exp_comp(srcs, compr, c)));
+                        // packed float16 (as in the VS): the record keeps each half as a float
+                        let dw = if f16 { first + c / 2 } else { c };
+                        if dw < 4 && enabled(dw) {
+                            let v = Self::exp_comp(srcs, compr, dw);
+                            let v = if f16 { format!("asuint(f16tof32({v} >> {}u))", 16 * (c & 1)) } else { v };
+                            st.push(format!("if (xcl_vok) res.Store((xcl_vtx + {}u) * 4u, {v});", 4 * (j + 1) + c));
                         }
                     }
                 }
@@ -2459,10 +2507,21 @@ impl Em {
     fn interp(&mut self, d: &Decoded, name: &str) -> Result<(), &'static str> {
         let Mode::Pixel(ps) = &self.opt.mode else { return Err("interpolation outside PS") };
         let (vdst, ij, attr, chan) = Self::interp_fields(d);
-        let Some(slot) = ps_attribute_slot(ps, attr as usize, chan as usize) else {
-            return Err("attribute outside ISG1");
+        // a float16-packed attribute (two registers, two components per dword): the PC input
+        // is the component itself, interpolated as a float – SRC0 bit 8 picks the high half
+        let high = d.enc.name != "ENC_VINTRP" && rdna2::field_value(d.enc, &d.words, "SRC0").unwrap_or(0) >> 8 & 1 == 1;
+        let src = match ps_attribute_f16(ps, attr as usize).filter(|_| name.ends_with("_f16")) {
+            Some(regs) => match ps_f16_slot(ps, &regs, chan as usize, high) {
+                Some((slot, comp)) => format!("xi.a{slot}[{comp}]"),
+                None => "0.0f".to_string(),
+            },
+            None => {
+                let Some(slot) = ps_attribute_slot(ps, attr as usize, chan as usize) else {
+                    return Err("attribute outside ISG1");
+                };
+                format!("xi.a{slot}[{chan}]")
+            }
         };
-        let src = format!("xi.a{slot}[{chan}]");
         let act = self.act();
         match name {
             "v_interp_p1_f32" | "v_interp_p1ll_f16" | "v_interp_p1lv_f16" => {
@@ -4460,12 +4519,17 @@ impl Em {
         Ok(())
     }
 
-    /// scratch_*: per-lane private memory (`xcl_scratch`); address = SADDR or VADDR + offset.
+    /// scratch_*: per-lane private memory (`xcl_scratch`); address = SADDR, VADDR or 0, + offset.
     fn scratch(&mut self, d: &Decoded, op: &str) -> Result<(), &'static str> {
         let f = |n: &str| rdna2::field_value(d.enc, &d.words, n).unwrap_or(0);
         self.uses_scratch = true;
-        let saddr = f("SADDR");
-        let base = if saddr != 0x7D && saddr != 0x7F { self.sreg(saddr) } else { self.vreg(f("ADDR")) };
+        // RDNA2 has no SGPR + VGPR form (no SVE bit): SADDR 0x7F (EXEC_HI) is the ST form,
+        // the offset alone; NULL (0x7D) is SV, VADDR + offset; an SGPR is SS, SGPR + offset
+        let base = match f("SADDR") {
+            0x7F => "0u".to_string(),
+            0x7D => self.vreg(f("ADDR")),
+            s => self.sreg(s),
+        };
         let raw = f("OFFSET") as u32;
         let off = (((raw << 20) as i32) >> 20) as u32;
         let t = self.t();
@@ -5350,7 +5414,9 @@ static uint xcl_cap = 1u << 16;
                     // the mode of the attribute this input is read through (none: never read)
                     let attr = ps_slot_attribute(ps, k);
                     let mut m = attr.and_then(|a| self.ps_modes.get(&(a as u32))).cloned().unwrap_or_default();
-                    if e.component_type != 3 {
+                    // float16 read through a packed attribute interpolates like a float
+                    let f16 = e.component_type == 6 && attr.is_some_and(|a| ps_attribute_f16(ps, a).is_some());
+                    if e.component_type != 3 && !f16 {
                         m = "nointerpolation".into();
                     }
                     let _ = writeln!(h, "    {m} {}4 a{k} : {};", hlsl_type(e), e.semantic());
@@ -5377,7 +5443,13 @@ static uint xcl_cap = 1u << 16;
                 if !self.ps_writes_mask && !ps.outputs.iter().any(|e| matches!(e.system_value, 64 | 65 | 67 | 68)) {
                     h.push_str("    float4 xcl_unused : SV_Target7;\n");
                 }
-                h.push_str("};\nXclOut main(XclIn xi)\n{\n    XclOut xo = (XclOut)0;\n");
+                h.push_str("};\n");
+                // the console tests depth first: without it the PC runs (and keeps the memory
+                // writes of) hidden pixels too
+                if ps.early_depth {
+                    h.push_str("[earlydepthstencil]\n");
+                }
+                h.push_str("XclOut main(XclIn xi)\n{\n    XclOut xo = (XclOut)0;\n");
                 if self.ps_writes_mask {
                     h.push_str("    xo.xcl_mask = 0xFFFFFFFFu;\n");
                 }

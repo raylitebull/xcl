@@ -1008,10 +1008,46 @@ impl Shader {
             sfi0 |= 0x10;
         }
         // Bound UAVs outside pixel/compute shaders (DXC: not for mesh shaders,
-        // nor for heap-indexed UAVs).
-        if self.stage == Stage::Vertex && self.bindings.iter().any(|b| b.class == ResClass::Uav) {
+        // nor for heap-indexed UAVs); >8 static UAVs require the 64-UAVs flag on every stage.
+        let uav_count = self.bindings.iter().filter(|b| b.class == ResClass::Uav).count();
+        if self.stage == Stage::Vertex && uav_count > 0 {
             flags |= 1 << 16;
             sfi0 |= 0x4;
+        }
+        if uav_count > 8 {
+            flags |= 1 << 15;
+            sfi0 |= 0x8;
+        }
+        if match self.stage {
+            Stage::Vertex => outs.iter().any(|e| e.e.kind == SemKind::ShadingRate),
+            Stage::Pixel => ins.iter().any(|e| e.e.kind == SemKind::ShadingRate),
+            _ => false,
+        } {
+            flags |= 1 << 24;
+            sfi0 |= 0x8_0000;
+        }
+        if matches!(self.stage, Stage::Pixel | Stage::Mesh) {
+            let (mut inner_cov, mut mesh_deriv) = (false, false);
+            for b in 0..self.m.block_count() {
+                for &inst in self.m.block_insts(Block(b as u32)) {
+                    let InstInfo::Call(name, args) = self.m.inst_info(inst) else { continue };
+                    let op = args.first().and_then(|&v| self.m.const_u64(v));
+                    inner_cov |= name.starts_with("dx.op.innerCoverage.") && op == Some(92);
+                    mesh_deriv |= (name.starts_with("dx.op.unary.") && op.is_some_and(|o| (83..=86).contains(&o)))
+                        || (name.starts_with("dx.op.sample.") && op == Some(60))
+                        || (name.starts_with("dx.op.sampleBias.") && op == Some(61))
+                        || (name.starts_with("dx.op.sampleCmp.") && op == Some(64))
+                        || (name.starts_with("dx.op.calculateLOD.") && op == Some(81));
+                }
+            }
+            if self.stage == Stage::Mesh && mesh_deriv {
+                flags |= 1 << 29;
+                sfi0 |= 0x100_0000;
+            }
+            if self.stage == Stage::Pixel && inner_cov {
+                flags |= 1 << 10;
+                sfi0 |= 0x400;
+            }
         }
         if self.stage == Stage::Pixel {
             if outs.iter().any(|e| e.e.kind == SemKind::StencilRef) {

@@ -146,7 +146,26 @@ impl Lw {
                     let b = lw.fmin(hi[0], hi[1]);
                     let b = lw.fmin(b, hi[2]);
                     let cv = lw.cmpc(Pred::Ne, child[k], u32::MAX);
-                    let mut all = cv;
+                    // Reject all-zero unmapped-page / Box32 page-straddle entries where
+                    // `child == 0` AND all box bounds are 0 (prevents infinite BVH traversal
+                    // loops on unmapped sparse tiles while preserving synthetic tests that use
+                    // child index 0 with real non-zero box bounds).
+                    let nonzero = if box32 {
+                        let b = 4 + 6 * k;
+                        let mut m = child[k];
+                        for j in 0..6 {
+                            m = lw.or(m, words[b + j]);
+                        }
+                        lw.nz(m)
+                    } else {
+                        let b = 4 + 3 * k;
+                        let mut m = child[k];
+                        for j in 0..3 {
+                            m = lw.or(m, words[b + j]);
+                        }
+                        lw.nz(m)
+                    };
+                    let mut all = lw.land(cv, nonzero);
                     for c in 0..3 {
                         let le = lw.fcmp(Pred::FOLe, mn[c], mx[c]);
                         all = lw.land(all, le);
@@ -889,6 +908,14 @@ impl Lw {
         };
         let base = name.trim_start_matches("image_");
         if base == "bvh_intersect_ray" || base == "bvh64_intersect_ray" {
+            // `XCL_RT_GATE=miss`: no node is read, every ray misses
+            if super::kernel::rt_all_miss() {
+                let ones = self.c(u32::MAX);
+                for c in 0..4u64 {
+                    self.write32(&super::lower::Dst::V(vdata + c), ones);
+                }
+                return Ok(());
+            }
             let wide = base == "bvh64_intersect_ray";
             let r = |lw: &mut Lw, j: u64| lw.vreg(addr_reg(j));
             let node = r(self, 0);
@@ -918,7 +945,10 @@ impl Lw {
             let base_lo = self.shlc(d0, 8);
             let off_lo = self.shlc(nlo, 3);
             let a = self.add(base_lo, off_lo);
-            // the window: bits 32.. of the 64-bit address
+            // the window: bits 32.. of the 64-bit address; also verify the node is non-null
+            // (`full >= 0x10000`, `hi != 0`) and that both the start and end of a 112 B Box32
+            // node (`full + 111`) fall within the same UMA window.
+            let mut bvh_valid = self.b(true);
             if self.mems.len() > 1 {
                 let d1lo = self.andc(d1, 0xFF);
                 let b64 = self.pack64(d0, d1lo);
@@ -939,6 +969,15 @@ impl Lw {
                 let full = self.add(b64, off);
                 let (_, hi) = self.unpack64(full);
                 self.window_hi(hi, false);
+                let hi_nz = self.nz(hi);
+                let k111 = self.c64(111);
+                let full_end = self.add(full, k111);
+                let (_, hi_end) = self.unpack64(full_end);
+                let same_hi = self.cmp(Pred::Eq, hi_end, hi);
+                let k64k = self.c64(0x1_0000);
+                let non_null = self.cmp(Pred::UGe, full, k64k);
+                let ok1 = self.land(hi_nz, same_hi);
+                bvh_valid = self.land(ok1, non_null);
             }
             let ty = self.andc(node, 7);
             let sort = {
@@ -952,7 +991,8 @@ impl Lw {
                     // The raw memory accessor returns zeros for a missing
                     // window. Those zeros are not a box with four child IDs.
                     let window = lw.rd(VAR_WIN);
-                    let valid = lw.cmpc(Pred::ULt, window, lw.mems.len() as u32);
+                    let w_ok = lw.cmpc(Pred::ULt, window, lw.mems.len() as u32);
+                    let valid = lw.land(w_ok, bvh_valid);
                     let tri = lw.cmpc(Pred::ULt, ty, 4);
                     for (&t, bits) in out.iter().zip([0x7f80_0000, 0x3f80_0000, 0, 0]) {
                         let triangle = lw.c(bits);
@@ -1575,7 +1615,15 @@ impl Lw {
                     let c = self.land(run, is);
                     self.guarded(c, &mut |lw| {
                         let tex = lw.s.heap_texture(ui, lkind, true, ct, 4, true);
-                        let v4 = if ct == CompType::F32 { vals.map(|v| lw.f(v)) } else { vals };
+                        let v4 = if ct == CompType::F32 {
+                            let guard = super::lower_gfx::nan_guard_enabled();
+                            vals.map(|v| {
+                                let v = if guard { lw.nan_guard_bits(v) } else { v };
+                                lw.f(v)
+                            })
+                        } else {
+                            vals
+                        };
                         lw.s.texture_store(tex, &ic, v4);
                         Ok(())
                     })?;

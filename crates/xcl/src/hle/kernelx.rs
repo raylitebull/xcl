@@ -495,6 +495,17 @@ pub mod mirrors {
         PAGES.write().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// The mapped backing CPU address for a GPU-view address `va`: `Some(Some(addr))` if mapped,
+    /// `Some(None)` if explicitly unmapped, `None` if `CopyPageMappingsBatchX` never touched it.
+    pub fn mapped_source(va: usize) -> Option<Option<usize>> {
+        if MAPPED.load(Ordering::Acquire) == 0 {
+            return None;
+        }
+        let off = va & (PAGE - 1);
+        let e = *read_pages().shown.get(&(va - off))?;
+        Some((e.at != 0).then(|| e.at + off))
+    }
+
     /// What one `apply_batches` call did, in 64 KiB pages.
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
     pub struct Mapped {
@@ -1819,6 +1830,16 @@ fn forget_title_mappings(base: usize, len: usize) {
 /// or not yet (`lazy`: a page never used is committed at its first access).
 pub fn physical_page_at(va: usize) -> bool {
     AWAY.lock().unwrap().as_ref().is_some_and(|a| a.at.contains_key(&(va & !(PHYS_PAGE - 1))))
+}
+
+/// The physical page mapped away from home at each of the `n` 64 KiB pages from `va` (None: none
+/// there, or a page at its home). The console maps one page at several addresses at once; here it
+/// is at one (`map_pages` moves it), so `d3d12x::vram` asks which page an address had to let
+/// textures at two addresses of one page share its video memory.
+pub fn physical_pages(va: usize, n: usize) -> Vec<Option<usize>> {
+    let g = AWAY.lock().unwrap();
+    let Some(a) = g.as_ref() else { return vec![None; n] };
+    (0..n).map(|i| va.checked_add(i * PHYS_PAGE).and_then(|at| a.at.get(&at).copied())).collect()
 }
 
 /// Counts the calls that map or unmap physical pages in a GPU view (`mirrors`): what

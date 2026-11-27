@@ -61,6 +61,7 @@ pub(crate) mod emit;
 pub mod mesh_dispatch;
 pub mod mesh_wave;
 pub mod partition;
+pub mod ps_masks;
 pub mod x64_masks;
 pub mod pso;
 pub use emit::mesh_passthrough;
@@ -84,6 +85,11 @@ pub const MEM_HEAP_BASE: u32 = 4;
 /// Flag in a memory-windows count (`pso::mem_windows`, the translation caches' keys):
 /// `Options::heap_windows`. `translate` takes it out of `mem_windows`.
 pub const HEAP_WINDOWS: u32 = 0x100;
+
+/// Flag in a memory-windows count next to `HEAP_WINDOWS` (`pso::mem_windows`, the caches' keys):
+/// the direct DXIL translator reads heap windows without a branch (`Lw::with_mem_i32s`). The
+/// HLSL path ignores it.
+pub const HEAP_FLAT: u32 = 0x200;
 
 pub(crate) fn valid_window_count(windows: usize, heap: bool) -> bool {
     windows <= crate::gpu::uma::MAX_WINDOWS
@@ -119,7 +125,7 @@ pub struct VsInterface {
     pub attr_base: u64,
     /// the OSG1 register of each `exp param N` from the console's table (`vs_output_table`;
     /// None: the N-th distinct register)
-    pub params: Option<Vec<u32>>,
+    pub params: Option<Vec<OutParam>>,
 }
 
 impl VsInterface {
@@ -153,6 +159,9 @@ pub struct PsInterface {
     pub input_ena: u32,
     /// the console's PS input table (`ps_input_table`; None: attributes in register order)
     pub attrs: Option<Vec<PsAttr>>,
+    /// DB_SHADER_CONTROL.DEPTH_BEFORE_SHADER (`ps_shader_control`): depth and stencil are tested
+    /// before the program runs (`[earlydepthstencil]`), so it runs only for pixels that pass
+    pub early_depth: bool,
 }
 
 /// Mesh (NGG) shader interface.
@@ -164,6 +173,8 @@ pub struct MsInterface {
     pub threads: u32,
     pub max_vertices: u32,
     pub max_primitives: u32,
+    /// the console's output table, as `VsInterface::params`
+    pub params: Option<Vec<OutParam>>,
 }
 
 /// dwords before the vertices of a mesh record: vertex count, primitive count, 2 spare
@@ -255,6 +266,7 @@ impl GsInterface {
             threads: 64,
             max_vertices: (GS_PRIMS_PER_GROUP * mvc).clamp(1, 256),
             max_primitives: (GS_PRIMS_PER_GROUP * mvc.saturating_sub(2).max(1)).clamp(1, 256),
+            params: None,
         }
     }
 }
@@ -392,6 +404,19 @@ pub struct PsAttr {
     pub register: u8,
     pub mask: u8,
     pub flat: bool,
+    /// float16 values, two per dword (record flag 8) – see `f16_registers`
+    pub f16: bool,
+    /// the record names a second register (flag 16; the same register again: not named)
+    pub pair: Option<u8>,
+}
+
+/// One `exp param N` of the console's output table: its first OSG1 register; `f16`: float16
+/// values, two per dword (`pair`: more than one dword – a second register may follow).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutParam {
+    pub register: u32,
+    pub f16: bool,
+    pub pair: bool,
 }
 
 /// The PS input table of an FSSM: SPI_PS_INPUT_ENA and, per `v_interp attrN`, the register it
@@ -399,6 +424,11 @@ pub struct PsAttr {
 /// mask, attribute number, 0, 0, register again, 1 flat / 2 interpolated; then the record count
 /// (+0x100) and SPI_PS_INPUT_ENA (+0x110). Checked on every cached PS of three titles (472, 34,
 /// 1): consistent, and covering every attribute the code reads.
+///
+/// A title that packs its float16 interpolants (378 such records in 362 PS of one): byte 7 also
+/// has 8 (float16, two per dword) and 16 (byte 5 = the second register of the attribute), and
+/// byte 6 is the register counted after that packing (below the DXIL register from the first
+/// pair on).
 pub fn ps_input_table(fssm: &[u8]) -> Option<(u32, Vec<PsAttr>)> {
     let base = 0x130 + fssm_shift(fssm)?;
     let rd = |o: usize| fssm.get(o..o + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
@@ -409,20 +439,35 @@ pub fn ps_input_table(fssm: &[u8]) -> Option<(u32, Vec<PsAttr>)> {
     let mut out = Vec::with_capacity(n);
     for k in 0..n {
         let r = fssm.get(base + 8 * k..base + 8 * k + 8)?;
-        if r[3] as usize != k || r[4] != 0 || r[5] != 0 || r[6] != r[1] {
+        let (f16, pair) = (r[7] & 8 != 0, r[7] & 16 != 0);
+        if r[3] as usize != k || r[4] != 0 || (!pair && r[5] != 0) || (pair && !f16) || r[6] > r[1] {
             return None;
         }
-        out.push(PsAttr { kind: r[0], register: r[1], mask: r[2], flat: r[7] == 1 });
+        out.push(PsAttr { kind: r[0], register: r[1], mask: r[2], flat: r[7] & 3 == 1, f16, pair: pair.then_some(r[5]) });
     }
     Some((ena, out))
+}
+
+/// DB_SHADER_CONTROL bit 12 (DEPTH_BEFORE_SHADER, as AMD's GFX10.3 register headers name it):
+/// the compiler sets it for `[earlydepthstencil]`.
+pub const DEPTH_BEFORE_SHADER: u32 = 1 << 12;
+
+/// DB_SHADER_CONTROL of an FSSM: the dword after SPI_PS_INPUT_ENA in the PS input table
+/// (`ps_input_table`, +0x114; the same layout VIctory's `native.rs` reads it from).
+pub fn ps_shader_control(fssm: &[u8]) -> Option<u32> {
+    let o = 0x130 + fssm_shift(fssm)? + 0x114;
+    fssm.get(o..o + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()))
 }
 
 /// The VS output table of an FSSM: per `exp param N`, the OSG1 register it writes. 32 records
 /// of 6 bytes at +0x1D4 (+ the sub-version shift): kind (6 user, 0 position), register, param
 /// number, 0, 0, 0; the record count after them (+0xC0). Usually param N = the N-th output
 /// register, but not always (a Fortnite VS exports its SV_Position register as a param).
-/// Checked on every cached VS of three titles (984, 13, 1).
-pub fn vs_output_table(fssm: &[u8]) -> Option<Vec<u32>> {
+/// Checked on every cached VS of three titles (984, 13, 1). The same table describes a mesh
+/// (NGG) program's params. A float16 param (two values per dword) has 1 in the last byte, 3
+/// when it takes more than one dword, and then repeats its register in byte 3 (442 MS of one
+/// title); the table does not name the second register of a pair (`f16_registers`).
+pub fn vs_output_table(fssm: &[u8]) -> Option<Vec<OutParam>> {
     let base = 0x1D4 + fssm_shift(fssm)?;
     let n = fssm.get(base + 0xC0..base + 0xC4).map(|b| u32::from_le_bytes(b.try_into().unwrap()))? as usize;
     if n > 32 {
@@ -431,12 +476,76 @@ pub fn vs_output_table(fssm: &[u8]) -> Option<Vec<u32>> {
     let mut out = Vec::with_capacity(n);
     for k in 0..n {
         let r = fssm.get(base + 6 * k..base + 6 * k + 6)?;
-        if r[2] as usize != k || r[3..6] != [0, 0, 0] {
+        let f16 = r[5] & 1 == 1;
+        if r[2] as usize != k || r[4] != 0 || !matches!(r[5], 0 | 1 | 3) || (r[3] != 0 && !(f16 && r[3] == r[1])) {
             return None;
         }
-        out.push(r[1] as u32);
+        out.push(OutParam { register: r[1] as u32, f16, pair: r[5] == 3 });
     }
     Some(out)
+}
+
+/// Where a float16-packed param / attribute keeps its registers: (register, first dword).
+/// The console's compiler puts two float16 components in a dword – component c of a register
+/// in dword c / 2, the even one in the low half – and up to two registers in one param: the
+/// second follows the dwords the first one's components take (2 for .xyz / .xyzw, 1 for .xy).
+/// The registers pair up in order, so where a table does not name the second one it is the
+/// next float16 register that starts no param of its own (`claimed`). Checked against the
+/// code of a retail title: every `v_interp_p2_f16` channel / half of 376 packed attributes
+/// (362 PS) is a declared component (2 more read one past a .xy register), and the enable
+/// mask of every `exp param` of 383 packed params (442 MS) is exactly these dwords.
+pub fn f16_registers(sig: &[SigElement], first: u32, second: Option<u32>, pair: bool, claimed: &dyn Fn(u32) -> bool) -> Vec<(u32, usize)> {
+    let second = match second {
+        Some(r) if r != first => Some(r),
+        _ if !pair => None,
+        _ => sig.iter().filter(|e| e.component_type == 6 && e.system_value == 0 && e.register > first && !claimed(e.register)).map(|e| e.register).min(),
+    };
+    let width = sig.iter().filter(|e| e.system_value == 0 && e.register == first).map(|e| 8 - e.mask.leading_zeros() as usize).max().unwrap_or(4);
+    std::iter::once((first, 0)).chain(second.map(|r| (r, width.div_ceil(2)))).collect()
+}
+
+/// The registers of `exp param N` with the first dword of each (`f16_registers`), and whether
+/// they hold packed float16: the console's table, else the N-th distinct register.
+pub fn out_param_registers(outputs: &[SigElement], params: Option<&[OutParam]>, n: usize) -> Option<(Vec<(u32, usize)>, bool)> {
+    match params {
+        Some(t) => {
+            let p = t.get(n)?;
+            if !p.f16 {
+                return Some((vec![(p.register, 0)], false));
+            }
+            Some((f16_registers(outputs, p.register, None, p.pair, &|r| t.iter().any(|q| q.register == r)), true))
+        }
+        None => param_registers(outputs, true).get(n).map(|&r| (vec![(r, 0)], false)),
+    }
+}
+
+/// The elements `exp param N` writes (places in `ranked(outputs, true)`), each with the first
+/// dword of its register, and whether the param holds packed float16 (`out_param_registers`).
+pub fn out_param_elements(outputs: &[SigElement], params: Option<&[OutParam]>, n: usize) -> (Vec<(usize, usize)>, bool) {
+    let (regs, f16) = out_param_registers(outputs, params, n).unwrap_or_default();
+    (regs.iter().flat_map(|&(r, first)| elements_at(outputs, true, r).into_iter().map(move |j| (j, first))).collect(), f16)
+}
+
+/// The registers of a float16-packed PS attribute with the first dword of each (None: the
+/// attribute is not packed).
+pub fn ps_attribute_f16(ps: &PsInterface, attr: usize) -> Option<Vec<(u32, usize)>> {
+    let t = ps.attrs.as_ref()?;
+    let a = t.get(attr).filter(|a| a.f16)?;
+    let claimed = |r: u32| t.iter().any(|b| b.register as u32 == r || b.pair.is_some_and(|p| p as u32 == r));
+    Some(f16_registers(&ps.inputs, a.register as u32, a.pair.map(|p| p as u32), a.pair.is_some(), &claimed))
+}
+
+/// The place in `ranked(inputs, false)` and the component of the float16 in half `high` of
+/// dword `chan` of a packed attribute (`regs`: `ps_attribute_f16`). None: no such component.
+pub fn ps_f16_slot(ps: &PsInterface, regs: &[(u32, usize)], chan: usize, high: bool) -> Option<(usize, usize)> {
+    let &(r, first) = regs.iter().rev().find(|&&(_, first)| first <= chan)?;
+    let comp = 2 * (chan - first) + high as usize;
+    if comp > 3 {
+        return None;
+    }
+    let all = ranked(&ps.inputs, false);
+    let slot = all.iter().position(|e| e.register == r && e.mask >> comp & 1 == 1).or_else(|| all.iter().position(|e| e.register == r))?;
+    Some((slot, comp))
 }
 
 /// The register `v_interp attr` reads: the console's table, else the attr-th distinct register.
@@ -459,7 +568,10 @@ pub fn ps_attribute_slot(ps: &PsInterface, attr: usize, chan: usize) -> Option<u
 pub fn ps_slot_attribute(ps: &PsInterface, slot: usize) -> Option<usize> {
     let r = ranked(&ps.inputs, false).get(slot)?.register;
     match &ps.attrs {
-        Some(t) => t.iter().position(|a| a.register as u32 == r),
+        Some(t) => t
+            .iter()
+            .position(|a| a.register as u32 == r)
+            .or_else(|| (0..t.len()).find(|&k| ps_attribute_f16(ps, k).is_some_and(|regs| regs.iter().any(|&(x, _)| x == r)))),
         None => param_registers(&ps.inputs, false).iter().position(|&x| x == r),
     }
 }
@@ -467,7 +579,7 @@ pub fn ps_slot_attribute(ps: &PsInterface, slot: usize) -> Option<usize> {
 /// The register `exp param N` of a VS writes: the console's table, else the N-th distinct one.
 pub fn vs_param_register(vs: &VsInterface, n: usize) -> Option<u32> {
     match &vs.params {
-        Some(t) => t.get(n).copied(),
+        Some(t) => t.get(n).map(|p| p.register),
         None => param_registers(&vs.outputs, true).get(n).copied(),
     }
 }
@@ -496,7 +608,9 @@ pub fn interface(blob: &[u8], sh: &super::xbox::XboxShader, f: &super::xbox::Fss
                 Some((ena, t)) => (ena, Some(t)),
                 None => (f.data.get(0x248..0x24C).map(|b| u32::from_le_bytes(b.try_into().unwrap()))?, None),
             };
-            Some(Mode::Pixel(PsInterface { inputs, outputs, input_ena: ena, attrs }))
+            // only where the input table was found: elsewhere the layout is not known
+            let early_depth = attrs.is_some() && ps_shader_control(&f.data).is_some_and(|c| c & DEPTH_BEFORE_SHADER != 0);
+            Some(Mode::Pixel(PsInterface { inputs, outputs, input_ena: ena, attrs, early_depth }))
         }
         // ES variant of a VS (before a GS) and the GS itself, each translatable on its own
         ("VS", 2) => Some(Mode::Geometry(GsInterface { es_inputs: inputs, es_outputs: outputs, max_vertex_count: 1, ..Default::default() })),
@@ -516,6 +630,7 @@ pub fn interface(blob: &[u8], sh: &super::xbox::XboxShader, f: &super::xbox::Fss
                 threads,
                 max_vertices: (p.ms_max_vertices as u32).clamp(1, 256),
                 max_primitives: (p.ms_max_primitives as u32).clamp(1, 256),
+                params: vs_output_table(&f.data),
             }))
         }
         _ => None,
@@ -1634,8 +1749,12 @@ pub(crate) fn needs_coherent_mem(insts: &[Decoded]) -> bool {
 pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
     let program = code;
     let normalized;
-    let opt = if opt.mem_windows & HEAP_WINDOWS != 0 {
-        normalized = Options { mem_windows: opt.mem_windows & !HEAP_WINDOWS, heap_windows: true, ..opt.clone() };
+    let opt = if opt.mem_windows & (HEAP_WINDOWS | HEAP_FLAT) != 0 {
+        normalized = Options {
+            mem_windows: opt.mem_windows & !(HEAP_WINDOWS | HEAP_FLAT),
+            heap_windows: opt.heap_windows || opt.mem_windows & HEAP_WINDOWS != 0,
+            ..opt.clone()
+        };
         &normalized
     } else {
         opt
@@ -1836,7 +1955,7 @@ mod attribute_tests {
         f[0x10] = 5;
         f[0x1D4..0x1D4 + 18].copy_from_slice(&[6, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 6, 2, 2, 0, 0, 0]);
         f[0x1D4 + 0xC0] = 3;
-        assert_eq!(vs_output_table(&f), Some(vec![0, 1, 2]));
+        assert_eq!(vs_output_table(&f).map(|t| t.iter().map(|p| p.register).collect::<Vec<_>>()), Some(vec![0, 1, 2]));
         f[0x1D4 + 8] = 7;
         assert_eq!(vs_output_table(&f), None);
     }

@@ -1236,3 +1236,110 @@ fn ps_static_resources_match_dxc() {
     assert_eq!(part(&c, b"SFI0"), part(DXC_PS_RESOURCES, b"SFI0"));
     assert_valid(&c);
 }
+
+fn assert_flags(c: &[u8], want_sfi0: u64, want_meta: u64, label: &str) {
+    assert_eq!(u64::from_le_bytes(part(c, b"SFI0").unwrap().try_into().unwrap()), want_sfi0, "{label}: SFI0");
+    assert_valid(c);
+    if crate::gpu::recomp::dxc::location().is_ok() {
+        let dis = validate::disassemble(c).unwrap();
+        let ok = if want_meta != 0 { dis.contains(&format!("!{{i32 0, i64 {want_meta}}}")) || dis.contains(&format!("!{{i32 0, i64 {want_meta},")) } else { !dis.contains("!{i32 0, i64 ") };
+        assert!(ok, "{label}: meta {want_meta:#x} in:\n{dis}");
+    }
+}
+
+fn finish_ms_with(mut s: Shader, mut io: GraphicsIo, x: Value, prim: Option<Sig>) -> Vec<u8> {
+    let pos = io.output(SigElement::new("SV_Position", 0, SemKind::Position, CompType::F32, 4));
+    let (c0, c1, c2, c3, z) = (s.m.i32c(0), s.m.i32c(1), s.m.i32c(2), s.m.i32c(3), f(&mut s, 0.0));
+    io.set_mesh_output_counts(&mut s, c3, c1);
+    for (c, &v) in [x, z, z, z].iter().enumerate() { io.store_vertex_output(&mut s, pos, 0, c as u8, v, c0); }
+    io.emit_indices(&mut s, c0, &[c0, c1, c2]);
+    if let Some(p) = prim { io.store_primitive_output(&mut s, p, 0, 0, c0, c0); }
+    s.finish_graphics(io, StageInfo::Mesh { numthreads: [4, 1, 1], max_vertices: 3, max_primitives: 1, topology: Topology::Triangle, payload_bytes: 0 })
+}
+
+#[test]
+fn ps_inner_coverage_sets_flag_only_when_live() {
+    for live in [true, false] {
+        let (mut s, mut io) = (Shader::new(Stage::Pixel, (6, 6)), GraphicsIo::new(Stage::Pixel));
+        let t = io.output(SigElement::new("SV_Target", 0, SemKind::Target, CompType::U32, 1));
+        let out = if live { io.inner_coverage(&mut s) } else {
+            let (dead, cont) = (s.m.new_block(), s.m.new_block());
+            s.m.br(cont); s.m.set_block(dead); let _ = io.inner_coverage(&mut s); s.m.br(cont); s.m.set_block(cont);
+            s.m.i32c(0)
+        };
+        io.store_output(&mut s, t, 0, 0, out);
+        let c = s.finish_graphics(io, StageInfo::Pixel { early_depth_stencil: false });
+        assert_flags(&c, if live { 0x400 } else { 0 }, if live { 1 << 10 } else { 0 }, if live { "ps_inner_cov_live" } else { "ps_inner_cov_dead" });
+    }
+}
+
+#[test]
+fn shading_rate_sets_flag_for_vs_and_ps_but_not_ms() {
+    let (mut vs, mut vio) = (Shader::new(Stage::Vertex, (6, 6)), GraphicsIo::new(Stage::Vertex));
+    let vp = vio.output(SigElement::new("SV_Position", 0, SemKind::Position, CompType::F32, 4));
+    let vr = vio.output(SigElement::new("SV_ShadingRate", 0, SemKind::ShadingRate, CompType::U32, 1));
+    let (z, r) = (f(&mut vs, 0.0), vs.m.i32c(0));
+    for c in 0..4 { vio.store_output(&mut vs, vp, 0, c, z); }
+    vio.store_output(&mut vs, vr, 0, 0, r);
+    assert_flags(&vs.finish_graphics(vio, StageInfo::Vertex), 0x8_0000, 1 << 24, "vs_shading_rate");
+    let (mut ps, mut pio) = (Shader::new(Stage::Pixel, (6, 6)), GraphicsIo::new(Stage::Pixel));
+    let _ = pio.input(SigElement::new("SV_ShadingRate", 0, SemKind::ShadingRate, CompType::U32, 1));
+    let pt = pio.output(SigElement::new("SV_Target", 0, SemKind::Target, CompType::U32, 1));
+    let pz = ps.m.i32c(0);
+    pio.store_output(&mut ps, pt, 0, 0, pz);
+    assert_flags(&ps.finish_graphics(pio, StageInfo::Pixel { early_depth_stencil: false }), 0x8_0000, 1 << 24, "ps_shading_rate");
+    let (mut ms, mut mio) = (Shader::new(Stage::Mesh, (6, 6)), GraphicsIo::new(Stage::Mesh));
+    let mr = mio.primitive(SigElement::new("SV_ShadingRate", 0, SemKind::ShadingRate, CompType::U32, 1));
+    let mz = f(&mut ms, 0.0);
+    assert_flags(&finish_ms_with(ms, mio, mz, Some(mr)), 0, 0, "ms_shading_rate");
+}
+
+#[test]
+fn ms_derivatives_and_implicit_lod_set_flag_but_explicit_lod_does_not() {
+    use crate::gpu::dxil::ops::{CompType as OpsComp, Deriv, TexKind};
+    for kind in ["deriv", "sample", "sample_bias", "sample_cmp", "calc_lod", "sample_level", "dead_deriv"] {
+        let (mut s, io) = (Shader::new(Stage::Mesh, (6, 6)), GraphicsIo::new(Stage::Mesh));
+        let (tid, f32, z) = (s.thread_id_in_group(0), s.m.f32(), f(&mut s, 0.0));
+        let u = s.m.cast(CastOp::UIToFP, tid, f32);
+        let val = if kind == "deriv" { s.deriv(Deriv::FineX, u) } else if kind == "dead_deriv" { let _ = s.deriv(Deriv::FineX, u); z } else {
+            let (tex, smp) = (s.srv_texture(0, 0, TexKind::D2, OpsComp::F32, 4), s.sampler(0, 0, kind == "sample_cmp"));
+            match kind {
+                "sample" => s.sample(tex, smp, &[u, z], &[], None)[0],
+                "sample_bias" => s.sample_bias(tex, smp, &[u, z], &[], z, None)[0],
+                "sample_cmp" => s.sample_cmp(tex, smp, &[u, z], &[], z, None)[0],
+                "calc_lod" => s.calculate_lod(tex, smp, &[u, z], true),
+                _ => s.sample_level(tex, smp, &[u, z], &[], z)[0],
+            }
+        };
+        let needs = !matches!(kind, "sample_level" | "dead_deriv");
+        assert_flags(&finish_ms_with(s, io, val, None), if needs { 0x100_0000 } else { 0 }, if needs { 1 << 29 } else { 0 }, kind);
+    }
+}
+
+#[test]
+fn graphics_64_uavs_flag_tracks_static_uav_count() {
+    const RAW: u64 = 1 << 4;
+    let run = |stage: Stage, slots: &[u32]| {
+        let (mut s, mut io) = (Shader::new(stage, (6, 6)), GraphicsIo::new(stage));
+        let (z, mut acc) = (s.m.i32c(0), s.m.i32c(0));
+        for &u in slots { let h = s.raw_uav(u, 0); let v = s.raw_load(h, z, 1)[0]; acc = s.m.bin(BinOp::Add, acc, v); }
+        if stage == Stage::Pixel {
+            let t = io.output(SigElement::new("SV_Target", 0, SemKind::Target, CompType::U32, 1));
+            io.store_output(&mut s, t, 0, 0, acc);
+            return s.finish_graphics(io, StageInfo::Pixel { early_depth_stencil: false });
+        }
+        let vf = { let t = s.m.f32(); s.m.cast(CastOp::UIToFP, acc, t) };
+        if stage == Stage::Mesh { return finish_ms_with(s, io, vf, None); }
+        let p = io.output(SigElement::new("SV_Position", 0, SemKind::Position, CompType::F32, 4));
+        for c in 0..4 { io.store_output(&mut s, p, 0, c, vf); }
+        s.finish_graphics(io, StageInfo::Vertex)
+    };
+    let (nine, eight): (Vec<u32>, Vec<u32>) = ((0..9).collect(), (0..8).collect());
+    for (st, slots, sfi, meta, lbl) in [
+        (Stage::Vertex, &nine[..], 0xC, (1 << 15) | (1 << 16) | RAW, "vs_9uav"),
+        (Stage::Pixel, &nine[..], 0x8, (1 << 15) | RAW, "ps_9uav"),
+        (Stage::Mesh, &nine[..], 0x8, (1 << 15) | RAW, "ms_9uav"),
+        (Stage::Pixel, &eight[..], 0, RAW, "ps_8uav"),
+        (Stage::Pixel, &[8][..], 0, RAW, "ps_single_u8"),
+    ] { assert_flags(&run(st, slots), sfi, meta, lbl); }
+}

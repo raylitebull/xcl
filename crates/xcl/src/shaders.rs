@@ -964,7 +964,13 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
             return 2;
         }
         let windows = windows as u32;
-        move || if heap { windows | recomp::HEAP_WINDOWS } else { windows }
+        move || {
+            if heap {
+                windows | recomp::HEAP_WINDOWS | if recomp::pso::heap_flat() { recomp::HEAP_FLAT } else { 0 }
+            } else {
+                windows
+            }
+        }
     };
     if opts.graphics_records {
         return graphics_worker(path, runtime_windows());
@@ -1155,7 +1161,7 @@ fn export_hlsl(input: &Input, dir: &Path, min_kb: usize, count: usize, windows: 
     println!(
         "{written} program(s) written to {} (split wave64: {split}, {} windows{}, {failures} failure(s))",
         dir.display(),
-        windows & !recomp::HEAP_WINDOWS,
+        windows & !(recomp::HEAP_WINDOWS | recomp::HEAP_FLAT),
         if windows & recomp::HEAP_WINDOWS != 0 { " from the descriptor heap" } else { "" }
     );
     if written == wanted { 0 } else {
@@ -1862,7 +1868,9 @@ pub(crate) fn prepare_for_launch(root: &Path, progress: &LaunchPreparation) -> R
     }
     progress.total.store(inputs.iter().map(Input::len).sum(), Ordering::Relaxed);
     let mut windows = crate::gpu::uma::configured_runtime_windows() as u32;
-    if windows > 1 && recomp::pso::heap_windows() { windows |= recomp::HEAP_WINDOWS; }
+    if windows > 1 && recomp::pso::heap_windows() {
+        windows |= recomp::HEAP_WINDOWS | if recomp::pso::heap_flat() { recomp::HEAP_FLAT } else { 0 };
+    }
     let workers = prepare_workers();
     for input in &inputs {
         if progress.cancel.load(Ordering::Relaxed) { return Err("Shader preparation cancelled".into()); }
@@ -1980,7 +1988,7 @@ fn pipelines_in_workers(pack: &Path, windows: u32, workers: usize, records: usiz
     crate::xlog_info!("Shader preparation: compute pipelines in {workers} worker processes{}", if used_only { ", those an earlier run used" } else { "" });
     let (cancelled, failed, _) = in_workers(workers, records, progress, |i| {
         let mut c = worker_command(&me);
-        c.arg("shaders").arg(pack).args(["--precompile", "--only", "cs", "--pipelines", "--windows"]).arg((windows & !recomp::HEAP_WINDOWS).to_string());
+        c.arg("shaders").arg(pack).args(["--precompile", "--only", "cs", "--pipelines", "--windows"]).arg((windows & !(recomp::HEAP_WINDOWS | recomp::HEAP_FLAT)).to_string());
         if used_only { c.arg("--used-only"); }
         c.env("XCL_PRECOMPILE_SLICE", format!("{i}/{workers}"));
         c
@@ -2114,7 +2122,7 @@ fn graphics_in_workers(inputs: &[Input], windows: u32, workers: usize, progress:
     progress.graphics.store(true, Ordering::Relaxed);
     let (cancelled, failed, summaries) = in_workers(workers, buildable.len(), progress, |i| {
         let mut c = worker_command(&me);
-        c.arg("shaders").arg(&jobs[i].0).args(["--graphics-records", "--windows"]).arg((windows & !recomp::HEAP_WINDOWS).to_string());
+        c.arg("shaders").arg(&jobs[i].0).args(["--graphics-records", "--windows"]).arg((windows & !(recomp::HEAP_WINDOWS | recomp::HEAP_FLAT)).to_string());
         // (the title's adapter: its blobs are the ones it takes)
         if std::env::var_os("XCL_ADAPTER").is_none() && !progress.adapter.is_empty() { c.env("XCL_ADAPTER", &progress.adapter); }
         c
@@ -2294,7 +2302,7 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
         "precompiling {n} shaders into {} ({} compile threads; {} memory windows{}{})",
         recomp::dxc::cache_dir().display(),
         recomp::dxc::compile_threads(),
-        windows & !recomp::HEAP_WINDOWS,
+        windows & !(recomp::HEAP_WINDOWS | recomp::HEAP_FLAT),
         if windows & recomp::HEAP_WINDOWS != 0 { " from the descriptor heap" } else { "" },
         if split { ", split wave64 for a GPU with 32-lane waves" } else { "" }
     );
@@ -2347,6 +2355,11 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                 // a compute program as a title's pipeline translates it (`pso::console_to_dxil_in`):
                 // into the translation cache too, so the title does not translate it again
                 if sh.fssm.iter().any(|f| matches!(recomp::interface(&blob, &sh, f), Some(recomp::Mode::Compute(_)))) {
+                    // the title's pipeline would leave it out too (`gpu::rt_leave_out`)
+                    if crate::gpu::rt_leave_out::left_out(&blob) {
+                        record_done();
+                        continue;
+                    }
                     match recomp::pso::console_to_dxil_in(&blob, recomp::pso::Stage::Compute, 0, split, windows) {
                         Ok(c) => {
                             if let Some(p) = pipelines {
@@ -2444,6 +2457,9 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
         skipped.into_inner(),
         t0.elapsed().as_secs_f64()
     );
+    if crate::gpu::rt_leave_out::enabled() {
+        println!("compute programs passed over (XCL_RT_LEAVE_OUT): {}", crate::gpu::rt_leave_out::left_out_count());
+    }
     if let Some(p) = pipelines {
         if startup.is_none() {
             make_pipelines(p, pipeline_jobs.into_inner().unwrap());

@@ -12,6 +12,7 @@ pub(crate) mod fence;
 pub mod pack;
 pub mod rdna2;
 pub mod recomp;
+pub mod rt_leave_out;
 mod rdna2_spec;
 mod rdna2_xbox;
 pub mod shader;

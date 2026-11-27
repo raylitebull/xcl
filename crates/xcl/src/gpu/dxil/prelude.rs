@@ -279,20 +279,97 @@ impl Lw {
         let y = self.fmin(y, c);
         self.fmax(x, y)
     }
-    /// `div_fixup`
+    /// `div_fixup` (RDNA2 `V_DIV_FIXUP_F32` exact special-case, sign, and overflow/underflow rules).
     pub fn div_fixup(&mut self, q: Value, d: Value, n: Value) -> Value {
-        let a = self.isnan(d);
-        let b = self.isnan(n);
-        let z = self.fc(0.0);
-        let dz = self.fcmp(Pred::FOEq, d, z);
-        let di = self.isinf(d);
-        let ni = self.isinf(n);
-        let x = self.lor(a, b);
-        let y = self.lor(di, ni);
-        let y = self.lor(dz, y);
-        let c = self.lor(x, y);
-        let r = self.fdiv(n, d);
-        self.sel(c, r, q)
+        let (qu, du, nu) = (self.bits(q), self.bits(d), self.bits(n));
+        let abs = self.c(0x7FFF_FFFF);
+        let (qa, da, na) = (self.and(qu, abs), self.and(du, abs), self.and(nu, abs));
+        let x = self.xor(du, nu);
+        let top = self.c(0x8000_0000);
+        let sign = self.and(x, top);
+        let inf = self.c(0x7F80_0000);
+        let zero = self.c(0);
+        let quiet = self.c(0x0040_0000);
+        let signed_inf = self.or(sign, inf);
+        let mut r = self.or(sign, qa);
+        let q_nan = self.cmp(Pred::UGt, qa, inf);
+        r = self.sel(q_nan, signed_inf, r); // overflowed quotient: ±Inf
+        let ff = self.c(0xFF);
+        let nsh = self.lshrc(nu, 23);
+        let en = self.and(nsh, ff);
+        let dsh = self.lshrc(du, 23);
+        let ed = self.and(dsh, ff);
+        let k150 = self.c(150);
+        let en150 = self.add(en, k150);
+        let under = self.cmp(Pred::ULt, en150, ed);
+        r = self.sel(under, sign, r); // exponent gap under -150: ±0
+        let d_inf = self.cmp(Pred::Eq, da, inf);
+        let n_zero = self.cmp(Pred::Eq, na, zero);
+        let to_zero = self.lor(d_inf, n_zero);
+        r = self.sel(to_zero, sign, r); // x/Inf, 0/x
+        let d_zero = self.cmp(Pred::Eq, da, zero);
+        let n_inf = self.cmp(Pred::Eq, na, inf);
+        let to_inf = self.lor(d_zero, n_inf);
+        r = self.sel(to_inf, signed_inf, r); // x/0, Inf/x
+        let zz = self.land(d_zero, n_zero);
+        let ii = self.land(d_inf, n_inf);
+        let invalid = self.lor(zz, ii);
+        let nan = self.c(0xFFC0_0000);
+        r = self.sel(invalid, nan, r); // 0/0, Inf/Inf
+        let d_nan = self.cmp(Pred::UGt, da, inf);
+        let dq = self.or(du, quiet);
+        r = self.sel(d_nan, dq, r);
+        let n_nan = self.cmp(Pred::UGt, na, inf);
+        let nq = self.or(nu, quiet);
+        r = self.sel(n_nan, nq, r); // NaN operands, numerator wins
+        self.f(r)
+    }
+
+    /// `v_div_fmas_f32`: fused multiply-add with exact pre-rounding `2^(±64)` scale when `vcc` is set
+    /// (`+64` when `exp(s2) > 127`, `-64` otherwise, matching AMD RDNA2 hardware).
+    pub fn div_fmas_f32(&mut self, s0: Value, s1: Value, s2: Value, vcc: Value, unscaled: Value) -> Value {
+        let u0 = self.bits(s0);
+        let u1 = self.bits(s1);
+        let u2 = self.bits(s2);
+        let s0_sh = self.lshrc(u0, 23);
+        let e0 = self.andc(s0_sh, 0xFF);
+        let s1_sh = self.lshrc(u1, 23);
+        let e1 = self.andc(s1_sh, 0xFF);
+        let s2_sh = self.lshrc(u2, 23);
+        let e2 = self.andc(s2_sh, 0xFF);
+        let up = self.cmpc(Pred::UGt, e2, 127);
+
+        // Split +64 or -64 across s0 and s1 without intermediate overflow/underflow so the
+        // single fused multiply-add rounds only once at the final exponent.
+        let p0 = self.c(0);
+        let p32 = self.c(32);
+        let p64 = self.c(64);
+        let m32 = self.c(-32i32 as u32);
+        let m64 = self.c(-64i32 as u32);
+
+        let hi0 = self.cmpc(Pred::UGe, e0, 223);
+        let hi1 = self.cmpc(Pred::UGe, e1, 223);
+        let up_n0_b = self.sel(hi1, p64, p32);
+        let up_n0 = self.sel(hi0, p0, up_n0_b);
+        let up_n1_b = self.sel(hi1, p0, p32);
+        let up_n1 = self.sel(hi0, p64, up_n1_b);
+
+        let lo0 = self.cmpc(Pred::ULt, e0, 33);
+        let lo1 = self.cmpc(Pred::ULt, e1, 33);
+        let dn_n0_b = self.sel(lo1, m64, m32);
+        let dn_n0 = self.sel(lo0, p0, dn_n0_b);
+        let dn_n1_b = self.sel(lo1, p0, m32);
+        let dn_n1 = self.sel(lo0, m64, dn_n1_b);
+
+        let n0 = self.sel(up, up_n0, dn_n0);
+        let n1 = self.sel(up, up_n1, dn_n1);
+        let n2 = self.sel(up, p64, m64);
+
+        let sc0 = self.ldexp_f(s0, n0);
+        let sc1 = self.ldexp_f(s1, n1);
+        let sc2 = self.ldexp_f(s2, n2);
+        let scaled = self.fmad(sc0, sc1, sc2);
+        self.sel(vcc, scaled, unscaled)
     }
     /// cube_id / cube_sc / cube_tc / cube_ma
     pub fn cube(&mut self, name: &str, x: Value, y: Value, z: Value) -> Value {
@@ -763,6 +840,7 @@ mod disable_math_refactoring_tests {
             outputs: vec![SigElement { name: "SV_Target".into(), index: 0, system_value: 64, component_type: 3, register: 0, mask: 0xF, rw_mask: 0xF, stream: 0 }],
             input_ena: 0x0F00,
             attrs: None,
+            early_depth: false,
         }
     }
 

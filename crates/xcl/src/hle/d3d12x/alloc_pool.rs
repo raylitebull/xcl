@@ -59,6 +59,16 @@ struct State {
     /// PC list → recordings so far (a Reset or creation starts the next one)
     recordings: HashMap<usize, u64>,
     resubmits: u64,
+    /// Title allocators released while their submitted GPU fences are still running: held until
+    /// every fence completes (`release_finished`, polled at `PresentX`) so two-pass buffers,
+    /// UMA arenas, and dispatch-chain scratch are never freed out from under active GPU work.
+    pending_releases: Vec<PendingRelease>,
+}
+
+struct PendingRelease {
+    marks: Vec<(ID3D12Fence, u64)>,
+    made: Vec<usize>,
+    cleanup: Box<dyn FnOnce() + Send>,
 }
 
 struct LastSubmit {
@@ -283,6 +293,19 @@ pub fn in_flight(list: usize) -> bool {
     g.as_ref().and_then(|s| s.last_submit.get(&list)).is_some_and(|l| unsafe { super::real::fence_completed(&l.fence) } < l.value)
 }
 
+/// Snapshot of every currently in-flight title-queue `(fence, value)` pair (`completed < value`).
+/// Used by `vram_small` so freed sub-allocated blocks are never recycled while GPU work submitted
+/// at release time is still running (even across multi-second pipeline-compile stalls that outlast `COOL`).
+pub(super) fn pending_gpu_marks() -> Vec<(ID3D12Fence, u64)> {
+    let g = STATE.lock().unwrap();
+    let Some(s) = g.as_ref() else { return Vec::new() };
+    s.fences
+        .values()
+        .filter(|(f, v)| *v > 0 && unsafe { super::real::fence_completed(f) } < *v)
+        .map(|(f, v)| (f.clone(), *v))
+        .collect()
+}
+
 /// `lists` were just submitted to `queue`.
 pub unsafe fn executed(queue: *mut c_void, lists: &[*mut c_void]) {
     if !enabled() || queue.is_null() {
@@ -345,6 +368,95 @@ pub(super) unsafe fn allocator_in_flight(alloc: usize) -> bool {
     let mine = s.cur.get(&alloc).into_iter().chain(s.aside.get(&alloc).into_iter().flatten()).chain([&alloc]);
     let busy = mine.filter_map(|b| s.backings.get(b)).any(|b| !b.idle());
     busy
+}
+
+/// Like `forget`, but when `alloc` (or any of its put-aside backings) still has unfinished GPU
+/// fence marks, defers running `cleanup` (and resetting/dropping any XCL-created spare PC
+/// allocators) until all those fences complete (`release_finished`). Returns `true` if deferred,
+/// `false` if all GPU work was already done and the caller should run cleanup immediately.
+pub unsafe fn release_when_done(alloc: usize, cleanup: Box<dyn FnOnce() + Send>) -> bool {
+    let (deferred, immediate_made) = {
+        let mut g = STATE.lock().unwrap();
+        let Some(s) = g.as_mut() else {
+            return false;
+        };
+        s.types.remove(&alloc);
+        let mut mine: Vec<usize> = s.aside.remove(&alloc).unwrap_or_default();
+        mine.extend(s.cur.remove(&alloc));
+        mine.push(alloc);
+        let mut seen = HashSet::with_capacity(mine.len());
+        mine.retain(|b| seen.insert(*b));
+        let mut pending_marks: Vec<(ID3D12Fence, u64)> = Vec::new();
+        let mut made_busy: Vec<usize> = Vec::new();
+        let mut made_free: Vec<usize> = Vec::new();
+        for b in mine {
+            let mut busy = false;
+            if let Some(gone) = s.backings.remove(&b) {
+                for l in gone.users {
+                    s.of_list.remove(&l);
+                }
+                for (_, (f, v)) in gone.marks {
+                    if super::real::fence_completed(&f) < v {
+                        pending_marks.push((f, v));
+                        busy = true;
+                    }
+                }
+            }
+            if b != alloc {
+                if busy {
+                    made_busy.push(b);
+                } else {
+                    made_free.push(b);
+                }
+            }
+        }
+        if pending_marks.is_empty() {
+            (false, made_free)
+        } else {
+            s.pending_releases.push(PendingRelease {
+                marks: pending_marks,
+                made: made_busy,
+                cleanup,
+            });
+            (true, made_free)
+        }
+    };
+    for b in immediate_made {
+        super::real::dispatch_chain::allocator_reset(b);
+        super::console_list::allocator_reset(b as *mut c_void);
+        drop(ID3D12CommandAllocator::from_raw(b as *mut c_void));
+    }
+    deferred
+}
+
+/// Run deferred `release_when_done` cleanups whose GPU fences have all completed (polled once
+/// per `PresentX`, outside `STATE` so cleanups and COM drops cannot re-enter `STATE`).
+pub unsafe fn release_finished() {
+    let done: Vec<PendingRelease> = {
+        let mut g = STATE.lock().unwrap();
+        let Some(s) = g.as_mut() else { return };
+        if s.pending_releases.is_empty() {
+            return;
+        }
+        let mut ready = Vec::new();
+        let mut i = 0;
+        while i < s.pending_releases.len() {
+            if s.pending_releases[i].marks.iter().all(|(f, v)| super::real::fence_completed(f) >= *v) {
+                ready.push(s.pending_releases.swap_remove(i));
+            } else {
+                i += 1;
+            }
+        }
+        ready
+    };
+    for item in done {
+        (item.cleanup)();
+        for b in item.made {
+            super::real::dispatch_chain::allocator_reset(b);
+            super::console_list::allocator_reset(b as *mut c_void);
+            drop(ID3D12CommandAllocator::from_raw(b as *mut c_void));
+        }
+    }
 }
 
 /// The title's allocator `alloc` is gone (its last Release): nothing of it stays here – a later
@@ -418,13 +530,15 @@ unsafe fn title_reset_with(alloc: *mut c_void, reset: impl FnMut(*mut c_void) ->
     hr
 }
 
-/// The PC allocators of the title's allocator `a` (the one in use and those put aside) whose
-/// submits the GPU has passed: the recordings on them that have ended need their memory no more.
+/// The PC allocators of the title's allocator `a` (the one in use and those put aside) with no
+/// live recordings left on them and whose submits the GPU has passed: only then can their UMA
+/// arenas and two-pass scratch/record buffers go back safely (a put-aside backing whose lists
+/// have not been submitted yet has empty `marks`, so `idle()` alone would free them too early).
 unsafe fn done_with(s: &State, a: usize) -> Vec<usize> {
     let cur = s.cur.get(&a).copied().unwrap_or(a);
     std::iter::once(cur)
         .chain(s.aside.get(&a).into_iter().flatten().copied())
-        .filter(|b| s.backings.get(b).is_none_or(|x| x.idle()))
+        .filter(|b| s.backings.get(b).is_none_or(|x| x.free()))
         .collect()
 }
 

@@ -550,6 +550,33 @@ impl Lw {
         (lo, hi)
     }
 
+    /// Pixel-shader mask with only the live lanes' bits right besides this lane's own
+    /// (`recomp::ps_masks`; parity with HLSL `ballot_px_local`): `WaveActiveBallot`, which
+    /// leaves helper lanes out, OR this lane's bit; `own_only` leaves out the ballot too.
+    pub fn ballot_ps_local(&mut self, cond: Value, own_only: bool) -> (Value, Value) {
+        let z = self.c(0);
+        let b = self.u(cond);
+        let l31 = self.lane31;
+        let b = self.bin(BinOp::Shl, b, l31);
+        let (mut lo, mut hi) = if self.wave64 {
+            let u = self.upper;
+            (self.sel(u, z, b), self.sel(u, b, z))
+        } else {
+            (b, z)
+        };
+        if !own_only {
+            let w = self.s.wave_ballot(cond);
+            let (wl, wh) = match (self.wave64, self.gfx_half) {
+                (true, _) => (w[0], w[1]),
+                (false, Some(h)) => (self.sel(h, w[1], w[0]), z),
+                (false, None) => (w[0], z),
+            };
+            lo = self.or(lo, wl);
+            hi = self.or(hi, wh);
+        }
+        (lo, hi)
+    }
+
     /// Pixel-shader ballot from a precomputed 4-bit quad mask `q` (bit `p` = member `p`'s
     /// predicate, identical across all 4 lanes of each quad; parity with HLSL `ballot_px_quad`
     /// in `recomp/emit.rs`): 4 `WaveActiveBallot` passes spread each quad's member `p` from
@@ -755,6 +782,16 @@ impl Lw {
         }
         self.first_lane(lo, hi)
     }
+
+    /// `v_readfirstlane_b32`'s result `first` of `own` in a pixel shader: a helper lane takes its
+    /// own value instead so helper-only waterfall loops converge in one pass on AMD RDNA4.
+    pub fn helper_reads_own(&mut self, own: Value, first: Value) -> Value {
+        let Some(g) = self.gfx.as_mut().filter(|g| g.ps.is_some()) else {
+            return first;
+        };
+        let helper = g.io.is_helper_lane(&mut self.s);
+        self.sel(helper, own, first)
+    }
 }
 
 #[cfg(test)]
@@ -772,7 +809,7 @@ mod ps_ballot_tests {
     }
 
     fn ps_interface() -> PsInterface {
-        PsInterface { inputs: vec![el("SV_Position", 0, 1, 3, 0, 0xF)], outputs: vec![el("SV_Target", 0, 64, 3, 0, 0xF)], input_ena: 0x302, attrs: None }
+        PsInterface { inputs: vec![el("SV_Position", 0, 1, 3, 0, 0xF)], outputs: vec![el("SV_Target", 0, 64, 3, 0, 0xF)], input_ena: 0x302, attrs: None, early_depth: false }
     }
 
     /// Pixel shader exercising `s_wqm`, `v_cndmask` + DPP `ddx`, `s_and_saveexec` + DPP `ddy`,
@@ -840,8 +877,8 @@ mod ps_ballot_tests {
             assert!(dis.contains("dx.op.quadReadLaneAt.i32"), "wave64 {wave64}: PS VOPC must quad-read VGPR operands via quadReadLaneAt:\n{dis}");
             assert!(!dis.contains("dx.op.quadOp"), "wave64 {wave64}: PS VOPC must not emit quadOp on compare results (#134):\n{dis}");
 
-            // Standalone VOPC with no DPP / readfirstlane (so `rla` is never called):
-            // proves VOPC itself emits the 4 VGPR operand `quadReadLaneAt` reads and zero `quadOp`.
+            // Standalone VOPC with no DPP / readfirstlane (so `rla` is never called), whose
+            // mask only `v_cndmask` reads: the lane's own bit (`recomp::ps_masks`), no quad ops.
             let mut vopc_only = Vec::new();
             vopc_only.extend(encode(if wave64 { "S_WQM_B64" } else { "S_WQM_B32" }, "ENC_SOP1", &[("SDST", 126), ("SSRC0", 126)], None).unwrap());
             vopc_only.extend(encode("V_CMP_LT_F32", "ENC_VOPC", &[("SRC0", 128), ("VSRC1", 2)], None).unwrap());
@@ -851,7 +888,7 @@ mod ps_ballot_tests {
             let kv = kernel::translate_pixel(&vopc_only, opt, &psi).expect("translate VOPC-only PS");
             validate::validate(&kv.dxil).expect("validate VOPC-only PS");
             let vdis = validate::disassemble(&kv.dxil).expect("disassemble VOPC-only PS");
-            assert_eq!(vdis.matches("call i32 @dx.op.quadReadLaneAt.i32(").count(), 4, "wave64 {wave64}: expected 4 operand quad reads for V_CMP_LT_F32(0, v2):\n{vdis}");
+            assert_eq!(vdis.matches("call i32 @dx.op.quadReadLaneAt.i32(").count(), 0, "wave64 {wave64}: V_CMP_LT_F32(0, v2) read only by v_cndmask needs no quad reads:\n{vdis}");
             assert!(!vdis.contains("dx.op.quadOp"), "wave64 {wave64}: VOPC-only PS must not emit quadOp:\n{vdis}");
 
             // Entry EXEC alone (no post-entry ballot) must stay live-lanes-only (no quad reads).

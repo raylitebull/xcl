@@ -76,6 +76,8 @@ pub struct MeshCtx {
     pub vok: Value,
     pub pok: Value,
     pub outputs: Vec<crate::gpu::dxbc::SigElement>,
+    /// the console's output table (`MsInterface::params`)
+    pub params: Option<Vec<crate::gpu::recomp::OutParam>>,
 }
 
 /// Initial register values: loaded from `io` in the entry block on first use.
@@ -124,7 +126,7 @@ impl Init {
 
     fn first(&mut self, s: &mut Shader, var: u32) -> Value {
         if var == VAR_BUDGET {
-            return s.m.i32c(LOOP_BUDGET);
+            return s.m.i32c(super::kernel::loop_budget());
         }
         if var == super::lower_round::VAR_F32_MODE {
             return s.m.i32c(super::lower_round::MODE_INIT);
@@ -199,6 +201,8 @@ pub struct Lw {
     /// the windows come from the descriptor heap (`lower_window`; `mems` only counts them):
     /// Some(globallycoherent)
     pub heap_mem: Option<bool>,
+    /// heap windows read without a branch (`recomp::HEAP_FLAT`)
+    pub heap_flat: bool,
     pub res: Option<RawUav>,
     /// the buffer format table (`FMT_INFO`), created on first use
     pub fmt_table: Option<Value>,
@@ -233,6 +237,8 @@ pub struct Lw {
     pub has_f64_round_op: bool,
     /// the T# SGPRs of the program's image stores and atomics (`recomp::emit::image_write_srsrcs`)
     pub img_writes: Vec<u64>,
+    /// program writes/atomics global or image UAVs or uses `GLC=1`: `s_barrier` emits `ALL_SYNC`
+    pub barrier_uav_fence: bool,
     /// highest VGPR index referenced by the program (for `v_movrel*` outside `Entry::Kernel`)
     pub max_vgpr: u64,
     /// static samplers bound so far: (S#, comparison, handle) at `s<i>, space1`
@@ -279,6 +285,8 @@ pub struct Lw {
     pub gfx_half: Option<Value>,
     /// split form: SGPRs whole-live after each instruction (`recomp::x64_masks::by_pc`)
     pub whole_live: std::collections::BTreeMap<u64, u128>,
+    /// pixel shaders: compares whose mask needs less than the per-quad form (`recomp::ps_masks`)
+    pub ps_masks: std::collections::BTreeMap<u64, crate::gpu::recomp::ps_masks::Form>,
     /// set when an exchange was needed where it is not supported
     pub exchange_error: Option<String>,
     pub pc: u64,
@@ -1064,7 +1072,8 @@ impl Lw {
                 if self.barrier_waves.is_some_and(|w| w > 1) && crate::gpu::recomp::emit::safe_barrier_wanted() {
                     return err(d, "s_barrier in a group of several hardware waves");
                 }
-                self.s.barrier(super::ops::barrier::GROUP_SYNC);
+                let mode = if self.barrier_uav_fence { super::ops::barrier::ALL_SYNC } else { super::ops::barrier::GROUP_SYNC };
+                self.s.barrier(mode);
                 // (split form: both halves made their LDS writes before it)
                 self.lds_met();
                 Ok(())

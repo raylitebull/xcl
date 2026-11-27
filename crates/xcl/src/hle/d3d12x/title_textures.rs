@@ -2105,6 +2105,15 @@ unsafe fn reclaim(q: &mut QueueUploads, cap: u64, wait_ms: u64) {
     }
 }
 
+/// Drop tracked upload state for a released command queue so its fence and staging buffers do not
+/// leak and a later queue at the same address cannot reuse a stale fence.
+pub(super) fn on_queue_release(queue_key: usize) {
+    if queue_key == 0 {
+        return;
+    }
+    ON_QUEUE.lock().unwrap().remove(&queue_key);
+}
+
 /// The queue a submit's uploads go to, by device, and the one it waits for first.
 struct Target {
     /// the title's queue, when they go to it

@@ -401,12 +401,34 @@ impl Lw {
         out
     }
 
+    /// `with_mem_many_tys` of `n` dwords for a read (`f` only loads). With `heap_flat`, no branch:
+    /// `f` reads window `w`, or window 0 when `w` is outside the windows or the lane is not in
+    /// `guard`, and those lanes then take 0 (a raw buffer read out of the view's range gives 0,
+    /// so the read of window 0 is harmless). One path per access: no handle phi, no block per read.
     pub(crate) fn with_mem_i32s(
         &mut self,
         guard: Option<Value>,
         n: usize,
         f: &mut dyn FnMut(&mut Lw, RawUav) -> Vec<Value>,
     ) -> Vec<Value> {
+        if let (Some(coherent), true) = (self.heap_mem, self.heap_flat) {
+            let z = self.c(0);
+            if guard.is_some_and(|g| self.s.m.const_u64(g) == Some(0)) {
+                return vec![z; n];
+            }
+            let w = self.rd(super::lower::VAR_WIN);
+            let inside = self.cmpc(Pred::ULt, w, self.mems.len() as u32);
+            let ok = match guard {
+                Some(g) if self.s.m.const_u64(g) != Some(1) => self.and(g, inside),
+                _ => inside,
+            };
+            let w = self.sel(ok, w, z);
+            let i = self.addc(w, crate::gpu::recomp::MEM_HEAP_BASE);
+            let m = self.s.heap_raw_buffer_uav(i, coherent);
+            let vals = f(self, m);
+            debug_assert_eq!(vals.len(), n);
+            return vals.into_iter().map(|v| self.sel(ok, v, z)).collect();
+        }
         let i32 = self.s.m.i32();
         let tys = vec![i32; n];
         self.with_mem_many_tys(guard, &tys, f)
@@ -2457,8 +2479,13 @@ impl Lw {
     }
 
     fn scratch(&mut self, d: &Decoded, op: &str) -> LResult<()> {
-        let saddr = Self::fv(d, "SADDR");
-        let base = if saddr != 0x7D && saddr != 0x7F { self.sreg(saddr) } else { self.vreg(Self::fv(d, "ADDR")) };
+        // RDNA2 has no SGPR + VGPR form (no SVE bit): SADDR 0x7F (EXEC_HI) is the ST form,
+        // the offset alone; NULL (0x7D) is SV, VADDR + offset; an SGPR is SS, SGPR + offset
+        let base = match Self::fv(d, "SADDR") {
+            0x7F => self.c(0),
+            0x7D => self.vreg(Self::fv(d, "ADDR")),
+            s => self.sreg(s),
+        };
         let raw = Self::fv(d, "OFFSET") as u32;
         let off = (((raw << 20) as i32) >> 20) as u32;
         let a = self.addc(base, off);
@@ -2567,13 +2594,23 @@ impl Lw {
             13..=15 | 9 => {}
             32..=63 => {
                 let k = (tgt - 32) as usize;
-                let outputs = self.mesh.as_ref().expect("mesh").outputs.clone();
-                let at = crate::gpu::recomp::param_registers(&outputs, true).get(k).map(|&r| crate::gpu::recomp::elements_at(&outputs, true, r)).unwrap_or_default();
-                for j in at {
+                let (at, f16) = {
+                    let m = self.mesh.as_ref().expect("mesh");
+                    crate::gpu::recomp::out_param_elements(&m.outputs, m.params.as_deref(), k)
+                };
+                for (j, first) in at {
                     for c in 0..4 {
-                        if enabled(c) {
+                        // packed float16: component c is half c & 1 of dword first + c / 2; the
+                        // record keeps it as a float
+                        let dw = if f16 { first + c / 2 } else { c };
+                        if dw < 4 && enabled(dw) {
                             let a = self.addc(vtx, (4 * (j + 1) + c) as u32);
-                            let v = comp(self, c);
+                            let mut v = comp(self, dw);
+                            if f16 {
+                                let h = self.lshrc(v, 16 * (c as u32 & 1));
+                                let x = self.s.f16_to_f32(h);
+                                v = self.bits(x);
+                            }
                             st.push((a, v));
                         }
                     }

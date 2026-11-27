@@ -462,11 +462,13 @@ unsafe fn open_uma(device: &ID3D12Device, allow_driver_remap: bool) {
         }
     }
     let w0_va = bufs.first().map_or(0, |b| b.1);
+    let win_vas: Vec<String> = bufs.iter().enumerate().filter(|(_, b)| b.1 != 0).map(|(k, b)| format!("w{k}={:#x}", b.1)).collect();
     crate::xlog_info!(
-        "D3D12.X: UMA opened ({} sparse VRAM window(s), {} MB coherent window), window 0 buffer at VA {:#x}",
+        "D3D12.X: UMA opened ({} sparse VRAM window(s), {} MB coherent window), window 0 buffer at VA {:#x} [{}]",
         sparse.len(),
         u.size() >> 20,
-        w0_va
+        w0_va,
+        win_vas.join(", ")
     );
     *UMA_HEAPS.lock().unwrap() = heaps;
     for (k, buf) in &shadows {
@@ -665,6 +667,7 @@ pub(super) fn init_with_remap(allow_driver_remap: bool) -> Result<String, String
             }
             for (adapter, desc) in list {
                 if let Ok(dev) = crate::gpu::agility::create_device(&adapter, D3D_FEATURE_LEVEL_12_0) {
+                    super::gpu_awake::start(&dev, desc.VendorId);
                     device = Some(dev);
                     name = format!("{} ({} MiB VRAM)", crate::gpu::adapter::name(&desc), desc.DedicatedVideoMemory >> 20);
                     break;
@@ -1429,7 +1432,7 @@ fn view_shape_desc(
 ) -> Option<(u32, crate::gpu::desc::ImageType, u32, u32, u32, u32, u32, u32)> {
     use crate::gpu::desc::ImageType as T;
     let f = if format == windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_UNKNOWN { r.Format } else { format };
-    let fmt = crate::gpu::desc::gfx10_format(f).unwrap_or(0);
+    let fmt = view_tsharp_format(f);
     let (w, h, d) = (r.Width as u32, r.Height, r.DepthOrArraySize as u32);
     let ty = view_dim_to_image_type(dim)?;
     let depth = match ty {
@@ -1453,6 +1456,16 @@ fn view_shape_desc(
         (base, last, res_max_mip.min(15))
     };
     Some((fmt, ty, w, h, depth, base_level, last_level, max_mip))
+}
+
+/// The GFX10 format in the T# of a view in PC format `f` (0, a float image, when the table has
+/// none). The PC's stencil views (X32_TYPELESS_G8X24_UINT, X24_TYPELESS_G8_UINT) are not in the
+/// table but are UINT views: they get 8_UINT, so that translated shaders load them as integers
+/// (`img_cls`); a float load of a UINT view is undefined in D3D12.
+fn view_tsharp_format(f: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT) -> u32 {
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8_UINT, DXGI_FORMAT_X24_TYPELESS_G8_UINT, DXGI_FORMAT_X32_TYPELESS_G8X24_UINT};
+    let f = if f == DXGI_FORMAT_X24_TYPELESS_G8_UINT || f == DXGI_FORMAT_X32_TYPELESS_G8X24_UINT { DXGI_FORMAT_R8_UINT } else { f };
+    crate::gpu::desc::gfx10_format(f).unwrap_or(0)
 }
 
 /// Build the XCL shader-ABI T# for an SRV, populating GFX10 `BASE_LEVEL` (`t[3][15:12]`),
@@ -2009,6 +2022,8 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
             super::placements::gone(this as usize);
         }
         super::depth_uav::forget(this as usize);
+        super::format_alias::forget(this as usize);
+        super::ambient::forget_resource(this as usize);
         super::title_textures::forget(this as usize);
         super::lut3d::forget(this as usize);
         let gone = UMA_BUFFERS.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize)));
@@ -2482,12 +2497,7 @@ unsafe extern "system" fn dev_create_uav_checked_x(
                         rd.Format.0
                     );
                 }
-                let null_dim = desc.as_ref().map_or_else(|| default_uav_dimension(&rd), |d| d.ViewDimension);
-                let null_desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
-                    Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_FLOAT,
-                    ViewDimension: null_dim,
-                    ..Default::default()
-                };
+                let null_desc = null_uav_desc(desc.as_ref(), Some(&rd));
                 return dev_create_uav_x(this, std::ptr::null_mut(), std::ptr::null_mut(), &null_desc, cpu);
             }
             if let Some(ref c) = patched {
@@ -2669,6 +2679,7 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
             // and what rays read past it: the rest of the top level, its bottom levels, the
             // parent pointers (`bvh_want`; `XCL_BVH_WALK=0`: the 64 KiB above only)
             super::bvh_want::view_made(va);
+            crate::gpu::rt_leave_out::note_structure(va);
             let w = crate::gpu::desc::bvh_words(va, true);
             return super::console_heap::write(&slot, &[w[0], w[1], w[2], w[3], 0, 0, 0, 0]);
         }
@@ -2726,6 +2737,8 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
         // A null image SRV was already created and published at `slot.index`. Writing `[0; 8]`
         // would point shaders at `ResourceDescriptorHeap[0]` (memory window 0 / uninitialized),
         // so write a valid T# referencing `slot.index` with the view's format class and type.
+        let amb_idx = if slot.shared_srv != 0 { slot.index } else { 0 };
+        super::ambient::note_descriptor(slot.at, amb_idx, 0, 0, 0, false);
         if let Some(v) = desc.as_ref() {
             if let Some(ty) = view_dim_to_image_type(v.ViewDimension.0) {
                 let fmt = crate::gpu::desc::gfx10_format(v.Format).unwrap_or(0);
@@ -2735,12 +2748,16 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
         }
         return super::console_heap::write(&slot, &[0; 8]);
     };
+    let amb_idx = if slot.shared_srv != 0 { slot.index } else { 0 };
     if let Some(v) = desc.as_ref().filter(|v| v.ViewDimension == D3D12_SRV_DIMENSION_BUFFER) {
+        super::ambient::note_descriptor(slot.at, amb_idx, 0, 0, 0, false);
         let b = &v.Anonymous.Buffer;
         let raw = b.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0;
         return super::console_heap::write(&slot, &buffer_view(res as usize, v.Format, b.FirstElement, b.NumElements, b.StructureByteStride, raw));
     }
     let rdesc = r.GetDesc();
+    let amb_fmt = desc.as_ref().map(|v| v.Format.0).filter(|&f| f != 0).unwrap_or(rdesc.Format.0);
+    super::ambient::note_descriptor(slot.at, amb_idx, res as usize, amb_fmt, rdesc.Format.0, false);
     super::lut3d::viewed(res as usize, &rdesc, desc.as_ref(), slot.index, cpu);
     match srv_tsharp_from_desc(slot.index, &rdesc, desc.as_ref()) {
         Some(t) => super::console_heap::write(&slot, &t),
@@ -2775,6 +2792,19 @@ fn cube_as_cube_array(v: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> Option<D3D12_SHADE
 
 /// The texture a view by address describes: `desc` (a resource desc) placed at `va`, made once
 /// per address and desc – titles make views of the same memory again and again.
+/// Whether ray-traced BVH traversal is active (`false` when `XCL_RT_GATE` is set to `miss` / `hold`
+/// / `1`, so `ambient::active()` enables sky-following stand-in ambient automatically).
+pub(super) fn bvh_traversal_allowed() -> bool {
+    static ALLOWED: OnceLock<bool> = OnceLock::new();
+    *ALLOWED.get_or_init(|| {
+        match std::env::var("XCL_RT_GATE").ok().map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+            Some("miss" | "hold" | "1" | "on" | "true") => false,
+            _ => true,
+        }
+    })
+}
+
+#[allow(dead_code)]
 unsafe fn resource_at(this: *mut c_void, desc: *const u8, va: u64) -> *mut c_void {
     type Key = (u64, [u8; 0x38]);
     static MADE: Mutex<Option<HashMap<Key, usize>>> = Mutex::new(None);
@@ -2817,7 +2847,10 @@ unsafe extern "system" fn dev_create_srv_at_x(this: *mut c_void, rdesc: *const u
         super::view_want::want(super::view_want::Path::ViewAt, at, len);
         return super::console_heap::write(&slot, &words);
     }
-    dev_create_srv_x(this, resource_at(this, rdesc, va), &v, cpu);
+    let placed = super::format_alias::placed_srv_resource(this, rdesc, va, v.Format.0 as u32);
+    let res = placed.as_ref().map_or(std::ptr::null_mut(), Interface::as_raw);
+    dev_create_srv_x(this, res, &v, cpu);
+    drop(placed);
 }
 
 /// device #71: the same for an unordered access view ({ the PC's UAV desc; GPU address @0x28;
@@ -2830,13 +2863,17 @@ unsafe extern "system" fn dev_create_uav_at_x(this: *mut c_void, rdesc: *const u
     let v = (view as *const D3D12_UNORDERED_ACCESS_VIEW_DESC).read_unaligned();
     if v.ViewDimension == D3D12_UAV_DIMENSION_BUFFER {
         let Some(slot) = super::console_heap::slot(cpu) else { return };
+        note_unaligned_delta_uav(slot.pc_uav as usize, false);
         let b = &v.Anonymous.Buffer;
         let raw = b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0;
         let (words, at, len) = buffer_words_at(va, v.Format, b.FirstElement, b.NumElements, b.StructureByteStride, raw);
         super::view_want::want(super::view_want::Path::ViewAt, at, len);
         return super::console_heap::write(&slot, &words);
     }
-    dev_create_uav_x(this, resource_at(this, rdesc, va), std::ptr::null_mut(), &v, cpu);
+    let placed = super::format_alias::placed_uav_resource(this, rdesc, va, v.Format.0 as u32);
+    let res = placed.as_ref().map_or(std::ptr::null_mut(), Interface::as_raw);
+    dev_create_uav_x(this, res, std::ptr::null_mut(), &v, cpu);
+    drop(placed);
 }
 
 /// V# of `n` elements from element `first` of the buffer at `va`, and the bytes it covers
@@ -2874,6 +2911,7 @@ fn null_uav_desc(
     use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_FLOAT;
     let dim = desc
         .map(|v| v.ViewDimension.0)
+        .filter(|&d| d != 0)
         .or_else(|| rd.map(resource_dim_to_view))
         .unwrap_or(D3D12_UAV_DIMENSION_TEXTURE2D.0);
     match dim {
@@ -2889,7 +2927,7 @@ fn null_uav_desc(
                 Texture1DArray: D3D12_TEX1D_ARRAY_UAV { MipSlice: 0, FirstArraySlice: 0, ArraySize: 1 },
             },
         },
-        5 => D3D12_UNORDERED_ACCESS_VIEW_DESC {
+        5 | 7 => D3D12_UNORDERED_ACCESS_VIEW_DESC {
             Format: DXGI_FORMAT_R32_FLOAT,
             ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2DARRAY,
             Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
@@ -2908,6 +2946,37 @@ fn null_uav_desc(
             ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
             ..Default::default()
         },
+    }
+}
+
+/// Map a typeless or depth DXGI format to a concrete same-family SRV format so
+/// `CreateShaderResourceView` never receives a `*_TYPELESS` or depth-only format.
+fn concrete_srv_format(fmt: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT) -> windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT {
+    use windows::Win32::Graphics::Dxgi::Common::*;
+    match fmt {
+        DXGI_FORMAT_R32G32B32A32_TYPELESS => DXGI_FORMAT_R32G32B32A32_FLOAT,
+        DXGI_FORMAT_R32G32B32_TYPELESS => DXGI_FORMAT_R32G32B32_FLOAT,
+        DXGI_FORMAT_R16G16B16A16_TYPELESS => DXGI_FORMAT_R16G16B16A16_FLOAT,
+        DXGI_FORMAT_R32G32_TYPELESS => DXGI_FORMAT_R32G32_FLOAT,
+        DXGI_FORMAT_R32G8X24_TYPELESS | DXGI_FORMAT_D32_FLOAT_S8X24_UINT => DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS,
+        DXGI_FORMAT_R10G10B10A2_TYPELESS => DXGI_FORMAT_R10G10B10A2_UNORM,
+        DXGI_FORMAT_R8G8B8A8_TYPELESS => DXGI_FORMAT_R8G8B8A8_UNORM,
+        DXGI_FORMAT_R16G16_TYPELESS => DXGI_FORMAT_R16G16_FLOAT,
+        DXGI_FORMAT_R32_TYPELESS | DXGI_FORMAT_D32_FLOAT => DXGI_FORMAT_R32_FLOAT,
+        DXGI_FORMAT_R24G8_TYPELESS | DXGI_FORMAT_D24_UNORM_S8_UINT => DXGI_FORMAT_R24_UNORM_X8_TYPELESS,
+        DXGI_FORMAT_R8G8_TYPELESS => DXGI_FORMAT_R8G8_UNORM,
+        DXGI_FORMAT_R16_TYPELESS | DXGI_FORMAT_D16_UNORM => DXGI_FORMAT_R16_UNORM,
+        DXGI_FORMAT_R8_TYPELESS => DXGI_FORMAT_R8_UNORM,
+        DXGI_FORMAT_BC1_TYPELESS => DXGI_FORMAT_BC1_UNORM,
+        DXGI_FORMAT_BC2_TYPELESS => DXGI_FORMAT_BC2_UNORM,
+        DXGI_FORMAT_BC3_TYPELESS => DXGI_FORMAT_BC3_UNORM,
+        DXGI_FORMAT_BC4_TYPELESS => DXGI_FORMAT_BC4_UNORM,
+        DXGI_FORMAT_BC5_TYPELESS => DXGI_FORMAT_BC5_UNORM,
+        DXGI_FORMAT_B8G8R8A8_TYPELESS => DXGI_FORMAT_B8G8R8A8_UNORM,
+        DXGI_FORMAT_B8G8R8X8_TYPELESS => DXGI_FORMAT_B8G8R8X8_UNORM,
+        DXGI_FORMAT_BC6H_TYPELESS => DXGI_FORMAT_BC6H_UF16,
+        DXGI_FORMAT_BC7_TYPELESS => DXGI_FORMAT_BC7_UNORM,
+        f => f,
     }
 }
 
@@ -2950,7 +3019,7 @@ fn uav_companion_srv(
         None => {
             let r = rd?;
             let dim = resource_dim_to_view(r);
-            if !matches!(dim, 2 | 3 | 4 | 5 | 8) {
+            if !matches!(dim, 2 | 3 | 4 | 5 | 6 | 7 | 8) {
                 return None;
             }
             (dim, r.Format, 0, 0, r.DepthOrArraySize as u32, 0)
@@ -2977,6 +3046,7 @@ fn uav_companion_srv(
         (mip, first_slice, array, plane)
     };
 
+    let msaa = !null_resource && rd.is_some_and(|r| r.SampleDesc.Count > 1);
     let mut srv = match dim {
         2 => D3D12_SHADER_RESOURCE_VIEW_DESC {
             Format: fmt,
@@ -3000,7 +3070,7 @@ fn uav_companion_srv(
                 },
             },
         },
-        4 => D3D12_SHADER_RESOURCE_VIEW_DESC {
+        4 if !msaa => D3D12_SHADER_RESOURCE_VIEW_DESC {
             Format: fmt,
             ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
             Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
@@ -3008,7 +3078,13 @@ fn uav_companion_srv(
                 Texture2D: D3D12_TEX2D_SRV { MostDetailedMip: mip, MipLevels: 1, PlaneSlice: plane, ResourceMinLODClamp: 0.0 },
             },
         },
-        5 => D3D12_SHADER_RESOURCE_VIEW_DESC {
+        4 | 6 => D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: fmt,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DMS,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 { Texture2DMS: D3D12_TEX2DMS_SRV::default() },
+        },
+        5 if !msaa => D3D12_SHADER_RESOURCE_VIEW_DESC {
             Format: fmt,
             ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DARRAY,
             Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
@@ -3021,6 +3097,14 @@ fn uav_companion_srv(
                     PlaneSlice: plane,
                     ResourceMinLODClamp: 0.0,
                 },
+            },
+        },
+        5 | 7 => D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: fmt,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2DMSArray: D3D12_TEX2DMS_ARRAY_SRV { FirstArraySlice: first_slice, ArraySize: array_size },
             },
         },
         8 => D3D12_SHADER_RESOURCE_VIEW_DESC {
@@ -3039,7 +3123,236 @@ fn uav_companion_srv(
             srv = v;
         }
     }
+    srv.Format = concrete_srv_format(srv.Format);
     Some(srv)
+}
+
+/// PC UAV CPU descriptor handles that were replaced by a null buffer UAV because the placed
+/// buffer's `buffer_delta` was not element-aligned (or its counter offset was not 4096-aligned).
+/// `ClearUnorderedAccessView*` checks this before calling PC clear with a non-null resource.
+static UNALIGNED_DELTA_UAVS: std::sync::RwLock<Option<HashSet<usize>>> = std::sync::RwLock::new(None);
+static UNALIGNED_DELTA_UAV_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+pub(super) fn is_unaligned_delta_uav(pc_uav: usize) -> bool {
+    if UNALIGNED_DELTA_UAV_COUNT.load(Ordering::Relaxed) == 0 || pc_uav == 0 {
+        return false;
+    }
+    UNALIGNED_DELTA_UAVS.read().unwrap().as_ref().is_some_and(|s| s.contains(&pc_uav))
+}
+
+fn note_unaligned_delta_uav(pc_uav: usize, unaligned: bool) {
+    if pc_uav == 0 {
+        return;
+    }
+    if unaligned {
+        let mut g = UNALIGNED_DELTA_UAVS.write().unwrap();
+        if g.get_or_insert_with(HashSet::new).insert(pc_uav) {
+            UNALIGNED_DELTA_UAV_COUNT.fetch_add(1, Ordering::Relaxed);
+        }
+    } else if UNALIGNED_DELTA_UAV_COUNT.load(Ordering::Relaxed) != 0 {
+        if let Some(s) = UNALIGNED_DELTA_UAVS.write().unwrap().as_mut() {
+            if s.remove(&pc_uav) {
+                UNALIGNED_DELTA_UAV_COUNT.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+/// Element byte size for standard DXGI typed buffer formats (`None` for unknown/block-compressed).
+fn dxgi_buffer_format_bytes(fmt: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT) -> Option<u64> {
+    use windows::Win32::Graphics::Dxgi::Common::*;
+    match fmt {
+        DXGI_FORMAT_R32G32B32A32_TYPELESS
+        | DXGI_FORMAT_R32G32B32A32_FLOAT
+        | DXGI_FORMAT_R32G32B32A32_UINT
+        | DXGI_FORMAT_R32G32B32A32_SINT => Some(16),
+        DXGI_FORMAT_R32G32B32_TYPELESS
+        | DXGI_FORMAT_R32G32B32_FLOAT
+        | DXGI_FORMAT_R32G32B32_UINT
+        | DXGI_FORMAT_R32G32B32_SINT => Some(12),
+        DXGI_FORMAT_R16G16B16A16_TYPELESS
+        | DXGI_FORMAT_R16G16B16A16_FLOAT
+        | DXGI_FORMAT_R16G16B16A16_UNORM
+        | DXGI_FORMAT_R16G16B16A16_UINT
+        | DXGI_FORMAT_R16G16B16A16_SNORM
+        | DXGI_FORMAT_R16G16B16A16_SINT
+        | DXGI_FORMAT_R32G32_TYPELESS
+        | DXGI_FORMAT_R32G32_FLOAT
+        | DXGI_FORMAT_R32G32_UINT
+        | DXGI_FORMAT_R32G32_SINT => Some(8),
+        DXGI_FORMAT_R10G10B10A2_TYPELESS
+        | DXGI_FORMAT_R10G10B10A2_UNORM
+        | DXGI_FORMAT_R10G10B10A2_UINT
+        | DXGI_FORMAT_R11G11B10_FLOAT
+        | DXGI_FORMAT_R8G8B8A8_TYPELESS
+        | DXGI_FORMAT_R8G8B8A8_UNORM
+        | DXGI_FORMAT_R8G8B8A8_UNORM_SRGB
+        | DXGI_FORMAT_R8G8B8A8_UINT
+        | DXGI_FORMAT_R8G8B8A8_SNORM
+        | DXGI_FORMAT_R8G8B8A8_SINT
+        | DXGI_FORMAT_B8G8R8A8_TYPELESS
+        | DXGI_FORMAT_B8G8R8A8_UNORM
+        | DXGI_FORMAT_B8G8R8A8_UNORM_SRGB
+        | DXGI_FORMAT_B8G8R8X8_TYPELESS
+        | DXGI_FORMAT_B8G8R8X8_UNORM
+        | DXGI_FORMAT_B8G8R8X8_UNORM_SRGB
+        | DXGI_FORMAT_R16G16_TYPELESS
+        | DXGI_FORMAT_R16G16_FLOAT
+        | DXGI_FORMAT_R16G16_UNORM
+        | DXGI_FORMAT_R16G16_UINT
+        | DXGI_FORMAT_R16G16_SNORM
+        | DXGI_FORMAT_R16G16_SINT
+        | DXGI_FORMAT_R32_TYPELESS
+        | DXGI_FORMAT_R32_FLOAT
+        | DXGI_FORMAT_R32_UINT
+        | DXGI_FORMAT_R32_SINT => Some(4),
+        DXGI_FORMAT_R8G8_TYPELESS
+        | DXGI_FORMAT_R8G8_UNORM
+        | DXGI_FORMAT_R8G8_UINT
+        | DXGI_FORMAT_R8G8_SNORM
+        | DXGI_FORMAT_R8G8_SINT
+        | DXGI_FORMAT_R16_TYPELESS
+        | DXGI_FORMAT_R16_FLOAT
+        | DXGI_FORMAT_R16_UNORM
+        | DXGI_FORMAT_R16_UINT
+        | DXGI_FORMAT_R16_SNORM
+        | DXGI_FORMAT_R16_SINT
+        | DXGI_FORMAT_B5G6R5_UNORM
+        | DXGI_FORMAT_B5G5R5A1_UNORM
+        | DXGI_FORMAT_B4G4R4A4_UNORM => Some(2),
+        DXGI_FORMAT_R8_TYPELESS
+        | DXGI_FORMAT_R8_UNORM
+        | DXGI_FORMAT_R8_UINT
+        | DXGI_FORMAT_R8_SNORM
+        | DXGI_FORMAT_R8_SINT
+        | DXGI_FORMAT_A8_UNORM => Some(1),
+        _ => None,
+    }
+}
+
+fn buffer_uav_element_bytes(desc: &D3D12_UNORDERED_ACCESS_VIEW_DESC) -> Option<u64> {
+    if desc.ViewDimension != D3D12_UAV_DIMENSION_BUFFER {
+        return None;
+    }
+    let b = unsafe { desc.Anonymous.Buffer };
+    if b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0 {
+        Some(4)
+    } else if b.StructureByteStride != 0 {
+        Some(b.StructureByteStride as u64)
+    } else {
+        dxgi_buffer_format_bytes(desc.Format)
+    }
+}
+
+/// Adjust a PC buffer UAV description by `res_delta` (and `ctr_delta` when `has_counter`).
+fn patch_buffer_uav_delta(
+    desc: Option<&D3D12_UNORDERED_ACCESS_VIEW_DESC>,
+    is_buffer_res: bool,
+    res_delta: u64,
+    has_counter: bool,
+    ctr_delta: u64,
+) -> Result<Option<D3D12_UNORDERED_ACCESS_VIEW_DESC>, ()> {
+    if res_delta == 0 && (!has_counter || ctr_delta == 0) {
+        return Ok(None);
+    }
+    let is_buf_view = desc.is_some_and(|d| d.ViewDimension == D3D12_UAV_DIMENSION_BUFFER) || is_buffer_res;
+    if !is_buf_view {
+        return Ok(None);
+    }
+    let Some(d) = desc else {
+        return Err(());
+    };
+    if d.ViewDimension != D3D12_UAV_DIMENSION_BUFFER {
+        return Err(());
+    }
+    let elem = buffer_uav_element_bytes(d).filter(|&e| e > 0).ok_or(())?;
+    if res_delta % elem != 0 {
+        return Err(());
+    }
+    let mut patched = *d;
+    unsafe {
+        let b = &mut patched.Anonymous.Buffer;
+        if has_counter && ctr_delta != 0 {
+            let new_ctr = b.CounterOffsetInBytes.checked_add(ctr_delta).ok_or(())?;
+            if new_ctr % 4096 != 0 {
+                return Err(());
+            }
+            b.CounterOffsetInBytes = new_ctr;
+        }
+        b.FirstElement = b.FirstElement.checked_add(res_delta / elem).ok_or(())?;
+    }
+    Ok(Some(patched))
+}
+
+#[cfg(test)]
+mod uav_buffer_delta_tests {
+    use super::*;
+    use windows::Win32::Graphics::Dxgi::Common::*;
+
+    fn buf_uav(fmt: DXGI_FORMAT, first: u64, num: u32, stride: u32, ctr_off: u64, raw: bool) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
+        D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: fmt,
+            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_UAV {
+                    FirstElement: first,
+                    NumElements: num,
+                    StructureByteStride: stride,
+                    CounterOffsetInBytes: ctr_off,
+                    Flags: if raw { D3D12_BUFFER_UAV_FLAG_RAW } else { D3D12_BUFFER_UAV_FLAG_NONE },
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn patch_buffer_uav_delta_shifts_raw_structured_and_typed_views() {
+        let raw = buf_uav(DXGI_FORMAT_R32_TYPELESS, 10, 64, 0, 0, true);
+        assert!(patch_buffer_uav_delta(Some(&raw), true, 0, false, 0).unwrap().is_none());
+        let p = patch_buffer_uav_delta(Some(&raw), true, 0x200, false, 0).unwrap().unwrap();
+        assert_eq!(unsafe { p.Anonymous.Buffer.FirstElement }, 10 + 128);
+
+        let structured = buf_uav(DXGI_FORMAT_UNKNOWN, 5, 100, 24, 0, false);
+        let p = patch_buffer_uav_delta(Some(&structured), true, 0x300, false, 0).unwrap().unwrap();
+        assert_eq!(unsafe { p.Anonymous.Buffer.FirstElement }, 5 + 32);
+        assert!(patch_buffer_uav_delta(Some(&structured), true, 0x100, false, 0).is_err());
+
+        for (fmt, elem) in [
+            (DXGI_FORMAT_R8_UINT, 1u64),
+            (DXGI_FORMAT_R16_UNORM, 2),
+            (DXGI_FORMAT_R32_UINT, 4),
+            (DXGI_FORMAT_R11G11B10_FLOAT, 4),
+            (DXGI_FORMAT_R10G10B10A2_UNORM, 4),
+            (DXGI_FORMAT_R32G32_FLOAT, 8),
+            (DXGI_FORMAT_R32G32B32A32_FLOAT, 16),
+        ] {
+            let typed = buf_uav(fmt, 3, 16, 0, 0, false);
+            let p = patch_buffer_uav_delta(Some(&typed), true, elem * 7, false, 0).unwrap().unwrap();
+            assert_eq!(unsafe { p.Anonymous.Buffer.FirstElement }, 10);
+            if elem > 1 {
+                assert!(patch_buffer_uav_delta(Some(&typed), true, elem - 1, false, 0).is_err());
+            }
+        }
+
+        let with_ctr = buf_uav(DXGI_FORMAT_UNKNOWN, 0, 16, 16, 4096, false);
+        let p = patch_buffer_uav_delta(Some(&with_ctr), true, 64, true, 8192).unwrap().unwrap();
+        assert_eq!(unsafe { (p.Anonymous.Buffer.FirstElement, p.Anonymous.Buffer.CounterOffsetInBytes) }, (4, 12288));
+        assert!(patch_buffer_uav_delta(Some(&with_ctr), true, 64, true, 128).is_err());
+
+        assert!(patch_buffer_uav_delta(None, true, 0x100, false, 0).is_err());
+        let unknown = buf_uav(DXGI_FORMAT_UNKNOWN, 0, 16, 0, 0, false);
+        assert!(patch_buffer_uav_delta(Some(&unknown), true, 0x100, false, 0).is_err());
+    }
+
+    #[test]
+    fn unaligned_delta_uav_tracking_sets_and_clears() {
+        let handle = 0xDEAD_BEEF_1234usize;
+        assert!(!is_unaligned_delta_uav(handle));
+        note_unaligned_delta_uav(handle, true);
+        assert!(is_unaligned_delta_uav(handle));
+        note_unaligned_delta_uav(handle, false);
+        assert!(!is_unaligned_delta_uav(handle));
+    }
 }
 
 unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, counter: *mut c_void, desc: *const D3D12_UNORDERED_ACCESS_VIEW_DESC, cpu: u64) {
@@ -3083,8 +3396,30 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
     // refuses the pair, `device_x::pc_resource_desc`): a null view – a UAV of it is an invalid
     // call, and the device is removed (0x887A0001)
     let no_uav = rd_opt.is_some_and(|d| d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0);
+    // Placed buffers with `buffer_delta != 0` start below the title's VA (`va & !0xFFFF`). Shift
+    // the PC UAV's `FirstElement` (and `CounterOffsetInBytes`) by the delta so PC UAV clears and
+    // pipelines hit the title's true buffer instead of `[va & !0xFFFF, va)` in live CPU RAM; if
+    // the delta is unaligned, bind a null PC UAV and skip PC clears on it.
+    let res_delta = buffer_delta(res as usize);
+    let ctr_delta = if counter.is_null() { 0 } else { buffer_delta(counter as usize) };
+    let is_buf_res = rd_opt.is_some_and(|d| d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER);
+    let (pc_uav_desc_patched, unaligned_delta) = if !no_uav {
+        match patch_buffer_uav_delta(desc.as_ref(), is_buf_res, res_delta, !counter.is_null(), ctr_delta) {
+            Ok(patched) => (patched, false),
+            Err(()) => (None, true),
+        }
+    } else {
+        (None, false)
+    };
+    let pc_uav_desc = pc_uav_desc_patched.as_ref().map_or(desc, |d| d as *const _);
     let null_desc = null_uav_desc(desc.as_ref(), rd_opt.as_ref());
+    let null_buf_desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+        Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_UINT,
+        ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+        ..Default::default()
+    };
     let pc_uav = |at: u64| {
+        note_unaligned_delta_uav(at as usize, unaligned_delta);
         if no_uav {
             static N: AtomicU64 = AtomicU64::new(0);
             if let Some(why) = null_why {
@@ -3093,16 +3428,26 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
                 crate::xlog_warn!("D3D12.X: a UAV of a resource that cannot have one on the PC (a depth buffer) – a null view");
             }
             f(this, std::ptr::null_mut(), std::ptr::null_mut(), &null_desc, at)
+        } else if unaligned_delta {
+            static N: AtomicU64 = AtomicU64::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) < 8 {
+                crate::xlog_warn!(
+                    "D3D12.X: buffer UAV on placed resource {res:p} has unaligned delta (res_delta={res_delta:#x}, ctr_delta={ctr_delta:#x}) – binding null PC UAV"
+                );
+            }
+            f(this, std::ptr::null_mut(), std::ptr::null_mut(), &null_buf_desc, at)
         } else {
-            f(this, res, counter, desc, at)
+            f(this, res, counter, pc_uav_desc, at)
         }
     };
     let Some(slot) = super::console_heap::slot(cpu) else { return pc_uav(cpu) };
     pc_uav(slot.pc_uav);
     super::lut3d::slot_reused(slot.index, cpu, res as usize, || format!("an unordered access view of {res:p} (its companion view)"));
-    super::console_heap::publish(&slot, true, if no_uav { 0 } else { res as usize });
+    super::console_heap::publish(&slot, true, if no_uav || unaligned_delta { 0 } else { res as usize });
     super::console_heap::note_resource(&slot, res as usize);
+    let amb_idx = if slot.shared_srv != 0 { slot.index } else { 0 };
     let Some(r) = ID3D12Resource::from_raw_borrowed(&res) else {
+        super::ambient::note_descriptor(slot.at, amb_idx, 0, 0, 0, true);
         // A null image UAV was already created and published at `slot.index + 1`. Create a
         // matching null companion SRV at `slot.index` and write a valid T# referencing
         // `slot.index` so shaders never fall back to `ResourceDescriptorHeap[0]` / `[1]`.
@@ -3121,6 +3466,7 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
     };
     let rd = rd_opt.unwrap();
     if let Some(v) = desc.as_ref().filter(|v| v.ViewDimension == D3D12_UAV_DIMENSION_BUFFER) {
+        super::ambient::note_descriptor(slot.at, amb_idx, 0, 0, 0, true);
         let b = &v.Anonymous.Buffer;
         let raw = b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0;
         return super::console_heap::write(&slot, &buffer_view(res as usize, v.Format, b.FirstElement, b.NumElements, b.StructureByteStride, raw));
@@ -3141,6 +3487,8 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
         }
         None => (rd.Format, resource_dim_to_view(&rd), rd.DepthOrArraySize as u32, 0),
     };
+    let amb_fmt = if format.0 != 0 { format.0 } else { rd.Format.0 };
+    super::ambient::note_descriptor(slot.at, amb_idx, res as usize, amb_fmt, rd.Format.0, true);
     super::lut3d::wrote(res as usize, false, || {
         let first = desc.as_ref().filter(|v| v.ViewDimension == D3D12_UAV_DIMENSION_TEXTURE3D).map_or(0, |v| v.Anonymous.Texture3D.FirstWSlice);
         format!("an unordered access view made in console slot {cpu:#x} (T# index {}, the UAV at + 1): format {}, mip {mip}, depth slices {first} (+{})", slot.index, format.0, array as i32)
@@ -4525,18 +4873,37 @@ struct Slots {
     wanted_most: usize,
     /// compiles that are not built ahead of their first use waiting for a slot (`big_compile_turn`)
     urgent: AtomicUsize,
+    /// compiles a live title thread is currently blocked waiting on (`big_compile_turn`): while
+    /// non-zero, non-wanted builds (ahead or late) do not take a freed slot ahead of them
+    wanted_waiters: AtomicUsize,
     /// a build ahead of its pipeline's first use may take a slot (`big_compile_turn`)
     ahead: bool,
 }
 
 impl Slots {
     const fn new(most: usize, wanted_most: usize) -> Slots {
-        Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most, wanted_most, urgent: AtomicUsize::new(0), ahead: true }
+        Slots {
+            n: Mutex::new(0),
+            cv: std::sync::Condvar::new(),
+            most,
+            wanted_most,
+            urgent: AtomicUsize::new(0),
+            wanted_waiters: AtomicUsize::new(0),
+            ahead: true,
+        }
     }
 
     /// `new` for a lane whose slots no build ahead of its pipeline's first use takes.
     const fn closed_to_ahead(most: usize, wanted_most: usize) -> Slots {
-        Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most, wanted_most, urgent: AtomicUsize::new(0), ahead: false }
+        Slots {
+            n: Mutex::new(0),
+            cv: std::sync::Condvar::new(),
+            most,
+            wanted_most,
+            urgent: AtomicUsize::new(0),
+            wanted_waiters: AtomicUsize::new(0),
+            ahead: false,
+        }
     }
 
     fn most(&self) -> usize {
@@ -4665,14 +5032,21 @@ fn gate_compute_driver_compile(has_cached_blob: bool) -> bool {
 fn big_compile_turn(slots: &'static Slots, commit_free: impl Fn() -> bool, wanted: impl Fn() -> bool, ahead: impl Fn() -> bool) -> SlotGuard {
     const LOOK: std::time::Duration = std::time::Duration::from_millis(50);
     let mut n = slots.n.lock().unwrap();
-    // (counted in `urgent` while it waits)
+    // (counted in `urgent` / `wanted_waiters` while it waits)
     let mut queued = false;
+    let mut queued_wanted = false;
     let guard = loop {
         let is_wanted = wanted();
         let cap = if is_wanted { slots.wanted_most() } else { slots.most() };
         let ahead = !is_wanted && ahead();
         let open = slots.ahead || !ahead;
-        if open && *n < cap && (is_wanted || commit_free()) && !(ahead && slots.urgent.load(Ordering::Acquire) > 0) {
+        let yielded_to_wanted = !is_wanted && slots.wanted_waiters.load(Ordering::Acquire) > 0;
+        if open
+            && *n < cap
+            && (is_wanted || commit_free())
+            && !yielded_to_wanted
+            && !(ahead && slots.urgent.load(Ordering::Acquire) > 0)
+        {
             *n += 1;
             break SlotGuard(slots);
         }
@@ -4680,10 +5054,20 @@ fn big_compile_turn(slots: &'static Slots, commit_free: impl Fn() -> bool, wante
             queued = true;
             slots.urgent.fetch_add(1, Ordering::AcqRel);
         }
+        if is_wanted && !queued_wanted {
+            queued_wanted = true;
+            slots.wanted_waiters.fetch_add(1, Ordering::AcqRel);
+        } else if !is_wanted && queued_wanted {
+            queued_wanted = false;
+            slots.wanted_waiters.fetch_sub(1, Ordering::AcqRel);
+        }
         n = slots.cv.wait_timeout(n, LOOK).unwrap().0;
     };
     if queued {
         slots.urgent.fetch_sub(1, Ordering::AcqRel);
+    }
+    if queued_wanted {
+        slots.wanted_waiters.fetch_sub(1, Ordering::AcqRel);
     }
     guard
 }
@@ -5045,6 +5429,7 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
             LAST_COMPUTE_RS.with(|c| c.set(rs));
             note_pso_rs(*ppv, rs as *mut c_void);
             super::dred::label(*ppv as usize, &[("cs", Some(cs))]);
+            super::ambient::note_compute_pso(*ppv as usize, cs);
             if let Some(i) = crate::gpu::recomp::pso::compute_interface(cs) {
                 PSO_USER_SGPRS.insert(*ppv as usize, (i.user_sgprs, i.threads));
             }
@@ -5086,6 +5471,7 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
     TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
     note_pso_rs(*ppv, rs);
     super::dred::label(*ppv as usize, &[("cs", Some(cs))]);
+    super::ambient::note_compute_pso(*ppv as usize, cs);
     if let Some(i) = crate::gpu::recomp::pso::compute_interface(cs) {
         PSO_USER_SGPRS.insert(*ppv as usize, (i.user_sgprs, i.threads));
     }
@@ -6409,6 +6795,7 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
     let n = TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
     note_pso_rs(*ppv, rs);
     super::dred::label(*ppv as usize, &[("vs", Some(vs)), ("ps", shader_bytes(&d.PS))]);
+    super::ambient::note_graphics_pso(*ppv as usize, shader_bytes(&d.PS));
     TRANSLATED_GRAPHICS.insert(*ppv as usize, ());
     note_rect_list_gs(*ppv as usize, &copy, rect_gs.is_some());
     if (super::gpu_profile::on() || super::gpu_times::enabled()) && !super::present::trace_frame() {
@@ -6972,11 +7359,28 @@ unsafe extern "system" fn dev_create_compute_pso(this: *mut c_void, desc: *const
     hr
 }
 
+/// Whether `desc`'s console compute program is one `XCL_RT_LEAVE_OUT` leaves out.
+unsafe fn rt_left_out(desc: *const c_void) -> bool {
+    if !crate::gpu::rt_leave_out::enabled() || !crate::gpu::shader::readable(desc as usize, std::mem::size_of::<D3D12_COMPUTE_PIPELINE_STATE_DESC>()) {
+        return false;
+    }
+    let d = &*(desc as *const D3D12_COMPUTE_PIPELINE_STATE_DESC);
+    shader_bytes(&d.CS).is_some_and(|cs| crate::gpu::recomp::pso::is_console(cs) && crate::gpu::rt_leave_out::left_out(cs))
+}
+
 unsafe fn compute_pso(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     let _cost = crate::hle::api_cost::time(crate::hle::api_cost::Call::Pipeline);
     super::null::capture_compute_desc(desc as *const u8);
     let f: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreateComputePipelineState")));
-    let (mut console, missed) = if super::pso_async::enabled() { attempt(|| translated_compute_pso(this, f, desc, riid, ppv)) } else { (translated_compute_pso(this, f, desc, riid, ppv), false) };
+    // `XCL_RT_LEAVE_OUT`: not translated or built; the dummy program below, its dispatches skipped
+    let left_out = rt_left_out(desc);
+    let (mut console, missed) = if left_out {
+        (Some(Err(())), false)
+    } else if super::pso_async::enabled() {
+        attempt(|| translated_compute_pso(this, f, desc, riid, ppv))
+    } else {
+        (translated_compute_pso(this, f, desc, riid, ppv), false)
+    };
     if missed {
         if let Some(hr) = own_compute(desc).and_then(|o| go_background(this, f, desc, riid, ppv, true, o, standin_compute, compute_key, build_compute)) {
             // a console program the worker is translating (its root signature comes with it);
@@ -7006,7 +7410,9 @@ unsafe fn compute_pso(this: *mut c_void, desc: *const c_void, riid: *const GUID,
     copy.CS = bytecode(&dummy().cs);
     copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
     let hr2 = finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv);
-    note_fallback("compute PSO", hr, hr2 >= 0);
+    if !left_out || hr2 < 0 {
+        note_fallback("compute PSO", hr, hr2 >= 0);
+    }
     if console.is_some() {
         note_console_compute(hr2, ppv);
     }
@@ -7084,7 +7490,7 @@ pub(super) fn register_two_pass_for_test(pso: usize, kind: &'static str) {
                 compute: 0,
                 compute_rs: 0,
                 mesh_rs: 0,
-                record: crate::gpu::recomp::MsInterface { outputs: Vec::new(), threads: 64, max_vertices: 64, max_primitives: 64 },
+                record: crate::gpu::recomp::MsInterface { outputs: Vec::new(), threads: 64, max_vertices: 64, max_primitives: 64, params: None },
                 mesh_groups_per_record: 1,
                 kind,
             }),
@@ -7771,6 +8177,7 @@ unsafe fn translated_mesh_stream_once(this: *mut c_void, desc: *const c_void, ri
     }
     let hr = finish_two_pass(this, &out, tp, rs, &ps_samplers, "MS", riid, ppv);
     if hr >= 0 {
+        super::ambient::note_graphics_pso(*ppv as usize, console_ps);
         super::dred::label(*ppv as usize, &[("ms", Some(ms)), ("ps", console_ps)]);
         if super::gpu_times::enabled() {
             PSO_SHADERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (crate::gpu::shader::fnv64(ms), console_ps.map_or(0, crate::gpu::shader::fnv64)));
@@ -7849,6 +8256,7 @@ unsafe fn translated_gs_pso(this: *mut c_void, d: &D3D12_GRAPHICS_PIPELINE_STATE
     }
     let hr = finish_two_pass(this, &out, tp, rs, &ps_samplers, "GS", riid, ppv);
     if hr >= 0 {
+        super::ambient::note_graphics_pso(*ppv as usize, shader_bytes(&d.PS));
         super::dred::label(*ppv as usize, &[("vs", Some(vs)), ("gs", Some(gs)), ("ps", shader_bytes(&d.PS))]);
         if super::gpu_times::enabled() {
             PSO_SHADERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (crate::gpu::shader::fnv64(gs), shader_bytes(&d.PS).map_or(0, crate::gpu::shader::fnv64)));
@@ -8256,6 +8664,86 @@ mod pso_blend_and_tsharp_tests {
         };
         let img_arr = crate::gpu::desc::image(&srv_tsharp_from_desc(11, &msaa_arr, Some(&msaa_arr_srv)).unwrap()).unwrap();
         assert_eq!((img_arr.ty, img_arr.depth, img_arr.base_level, img_arr.last_level), (crate::gpu::desc::ImageType::D2MsaaArray, 4, 0, 2));
+    }
+
+    /// A stencil view is a UINT view: its T# has a uint format, so translated shaders load it as
+    /// integers (`img_cls`: the buffer-format table's numeric type 4); the depth view stays float.
+    #[test]
+    fn srv_tsharp_of_a_stencil_view_has_a_uint_format() {
+        let class = |fmt: u32| (crate::gpu::recomp::emit::buf_format_info(fmt as usize) >> 3) & 7;
+        for (resource, stencil, depth) in [
+            (DXGI_FORMAT_R24G8_TYPELESS, DXGI_FORMAT_X24_TYPELESS_G8_UINT, DXGI_FORMAT_R24_UNORM_X8_TYPELESS),
+            (DXGI_FORMAT_R32G8X24_TYPELESS, DXGI_FORMAT_X32_TYPELESS_G8X24_UINT, DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS),
+        ] {
+            let rd = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 2560,
+                Height: 1440,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: resource,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+                ..Default::default()
+            };
+            let view = |format, plane| D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: format,
+                ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                    Texture2D: D3D12_TEX2D_SRV { MostDetailedMip: 0, MipLevels: 1, PlaneSlice: plane, ResourceMinLODClamp: 0.0 },
+                },
+            };
+            let s = crate::gpu::desc::image(&srv_tsharp_from_desc(5, &rd, Some(&view(stencil, 1))).unwrap()).unwrap();
+            assert_eq!((s.format, class(s.format)), (5, 4), "stencil view {stencil:?}: T# format 8_UINT, uint class");
+            assert_eq!((s.width, s.height), (2560, 1440));
+            let d = crate::gpu::desc::image(&srv_tsharp_from_desc(6, &rd, Some(&view(depth, 0))).unwrap()).unwrap();
+            assert_ne!(class(d.format), 4, "depth view {depth:?} stays a float image");
+        }
+    }
+
+    /// A translated `image_load` of a stencil view (the T# `srv_tsharp_from_desc` writes for it)
+    /// gives the stencil values: in the second component, as the PC view has them.
+    #[test]
+    fn gpu_image_load_of_a_stencil_view_gives_the_stencil() {
+        use crate::gpu::recomp::runner::{self, KernelState, TestTexture, TexDim};
+        use crate::gpu::rdna2::encode;
+        match (runner::adapter(), runner::wave64_programs_supported(), crate::gpu::recomp::dxc::location()) {
+            (Ok(_), Ok(true), Ok(_)) => {}
+            (a, _, d) => return runner::skip_test(if a.is_err() { "no GPU" } else if d.is_err() { "no DXC" } else { "no wave64" }),
+        }
+        let rd = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 8,
+            Height: 8,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R24G8_TYPELESS,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+            ..Default::default()
+        };
+        let view = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_X24_TYPELESS_G8_UINT,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 { Texture2D: D3D12_TEX2D_SRV { MostDetailedMip: 0, MipLevels: 1, PlaneSlice: 1, ResourceMinLODClamp: 0.0 } },
+        };
+        // the runner's SRV of texture 0 is at heap index 0
+        let t = srv_tsharp_from_desc(0, &rd, Some(&view)).unwrap();
+        let mut code = encode("IMAGE_LOAD", "ENC_MIMG", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("DMASK", 0x2), ("DIM", 1), ("UNORM", 1)], None).unwrap();
+        code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+        let mut st = KernelState::default();
+        st.sgpr[16..24].copy_from_slice(&t);
+        for (l, r) in st.vgpr.iter_mut().enumerate() {
+            r[0] = (l % 8) as u32;
+            r[1] = (l / 8) as u32;
+        }
+        let stencil: Vec<u8> = (0..64).map(|k| 0x40 + k as u8).collect();
+        let tex = [TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_X24_TYPELESS_G8_UINT, width: 8, height: 8, depth: 1, texel_bytes: 1, data: stencil, uav: false }];
+        let r = runner::run_code_with(&code, &st, &[], &tex, &[]).unwrap();
+        let bad: Vec<String> = (0..64).filter(|&l| r.vgpr[l][10] != 0x40 + l as u32).map(|l| format!("lane {l}: {:#x}", r.vgpr[l][10])).collect();
+        assert!(bad.is_empty(), "image_load of a stencil view (want 0x40 + lane):\n{}", bad.join("\n"));
     }
 }
 
@@ -8731,17 +9219,57 @@ unsafe extern "system" fn q_release(this: *mut c_void) -> u32 {
     let n = f(this);
     if n == 0 {
         super::list_x::on_queue_release(this as usize);
+        super::title_textures::on_queue_release(this as usize);
     }
     n
 }
 
 unsafe extern "system" fn alloc_release(this: *mut c_void) -> u32 {
-    let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
-    let n = f(this);
+    let add_ref: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 1));
+    let rel: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
+    if add_ref(this) == 2 {
+        let a = this as usize;
+        let deferred = super::alloc_pool::release_when_done(
+            a,
+            Box::new(move || {
+                dispatch_chain::allocator_reset(a);
+                super::console_list::allocator_reset(a as *mut c_void);
+                super::list_x::on_allocator_release(a);
+                // Drop the final PC ID3D12CommandAllocator reference only after all GPU
+                // fences on its backing complete so the D3D12 command pool is never freed
+                // while still in flight on the GPU.
+                rel(a as *mut c_void);
+            }),
+        );
+        if deferred {
+            // Drop our temporary probe ref, keeping 1 ref alive for the deferred cleanup above,
+            // and report 0 to the title since its ownership of the allocator has ended.
+            rel(this);
+            return 0;
+        }
+        dispatch_chain::allocator_reset(a);
+        super::console_list::allocator_reset(this);
+        super::list_x::on_allocator_release(a);
+        rel(this);
+        return rel(this);
+    }
+    rel(this);
+    let n = rel(this);
     if n == 0 {
-        dispatch_chain::allocator_reset(this as usize);
-        super::alloc_pool::forget(this as usize);
-        super::list_x::on_allocator_release(this as usize);
+        let a = this as usize;
+        // Rare race: two threads reached final release concurrently; object is already freed.
+        if !super::alloc_pool::release_when_done(
+            a,
+            Box::new(move || {
+                dispatch_chain::allocator_reset(a);
+                super::console_list::allocator_reset(a as *mut c_void);
+                super::list_x::on_allocator_release(a);
+            }),
+        ) {
+            dispatch_chain::allocator_reset(a);
+            super::console_list::allocator_reset(this);
+            super::list_x::on_allocator_release(a);
+        }
     }
     n
 }
@@ -9129,6 +9657,7 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
         stop_if_device_removed();
         return;
     }
+    super::gpu_awake::note_activity();
     super::capture::submit(this, std::slice::from_raw_parts(lists, n as usize));
     // from here to the end: XCL's uploads and tile mappings before the lists, then the driver's
     // own work in the submission. Where that takes long, it is not the title's time
@@ -9157,6 +9686,15 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
             mapped.push(pc);
         } else if !super::title_list::push_segments(l, &mut mapped) {
             mapped.push(l);
+        }
+    }
+    // Flush and wait for any tile mappings / recycled-tile zero-fills queued concurrently while
+    // `record_deferred` built/waited on PSOs so the title's submit never races `UpdateTileMappings`.
+    // Skip for XCL's own internal submits (`own_work`) which may already hold `PAGES` or `STATE`.
+    if !super::title_textures::is_own_work() {
+        if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&this) {
+            super::sparse::wait_pending_mappings(q);
+            super::vram::wait_pending_mappings(q);
         }
     }
     super::list_x::note_queue_for_lists(this as usize, &mapped);
@@ -9461,7 +9999,7 @@ pub fn log_device_removed() {
                 v.join(", ")
             };
             let va = pf.PageFaultVA;
-            let window = uma_window_vas().iter().position(|&w| va >= w && va < w + 0x1_0000_0000).map(|k| format!(" = window {k} + {:#x}", va - uma_window_vas()[k])).unwrap_or_default();
+            let window = uma_window_vas().iter().position(|&w| w != 0 && va >= w && va < w + 0x1_0000_0000).map(|k| format!(" = window {k} + {:#x}", va - uma_window_vas()[k])).unwrap_or_default();
             crate::xlog_error!("DRED page fault at GPU VA {va:#x}{window}; allocations there: [{}]; recently freed: [{}]", names(pf.pHeadExistingAllocationNode), names(pf.pHeadRecentFreedAllocationNode));
         }
         let breadcrumbs = dred.GetAutoBreadcrumbsOutput();
@@ -10839,7 +11377,7 @@ mod mesh_stream_tests {
         let make_tp = || crate::gpu::recomp::pso::TwoPass {
             cs: vec![0; 16],
             ms: vec![0; 16],
-            record: crate::gpu::recomp::MsInterface { outputs: Vec::new(), threads: 32, max_vertices: 3, max_primitives: 1 },
+            record: crate::gpu::recomp::MsInterface { outputs: Vec::new(), threads: 32, max_vertices: 3, max_primitives: 1, params: None },
             mesh_groups_per_record: 1,
             samplers: vec![sampler],
         };
