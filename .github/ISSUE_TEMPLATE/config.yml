@@ -1,5 +1,11 @@
 blank_issues_enabled: true
 contact_links:
-  - name: GPU test results
-    url: https://github.com/ivall/xcl/issues/42
+  - name: Roadmap & current priorities (#1833)
+    url: https://github.com/xcl-dev/xcl/issues/1833
+    about: Check what XCL is focused on right now before opening a new PR or issue.
+  - name: Official merge queue (#3041)
+    url: https://github.com/xcl-dev/xcl/issues/3041
+    about: Pick a PR to test or merge-check, or see which PRs are ready to merge.
+  - name: GPU test results (#42)
+    url: https://github.com/xcl-dev/xcl/issues/42
     about: Results of the test suite on your GPU go to issue #42, not a new issue.

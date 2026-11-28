@@ -44,8 +44,11 @@ A test result that was not produced by a real run on the hardware named gets the
 
 ## Before you start
 
-1. **Search open PRs and issues first.** Several PRs have solved the same problem at once and all
-   but one were closed. If someone is already on it, review or test their PR instead.
+1. **Search open PRs, issues, and triage threads first.** Check the current roadmap
+   ([#1833](https://github.com/xcl-dev/xcl/issues/1833)), the duplicate tracker
+   ([#1607](https://github.com/xcl-dev/xcl/issues/1607)), and open PRs. Several PRs have solved the
+   same problem at once and all but one were closed. If someone is already on it, review or test
+   their PR instead.
 2. **Say what you are doing.** For anything bigger than a small fix, comment on the issue (or open
    one) with the plan in two or three lines before writing it. That avoids duplicate work and wasted
    effort on a direction the maintainer would not take.
@@ -178,10 +181,12 @@ XCL is **GPL-3.0-or-later**.
 
 ## Reviews and test reports
 
-- **Test results on your GPU** go to [#42](https://github.com/ivall/xcl/issues/42), not a new issue.
-- Testing someone else's PR helps the most when it follows the **Tested / Not tested** outline above
-  and names the exact commit tested. Post one comment and edit it when you rerun the tests; do not
-  post a new comment for every run.
+- **Test results on your GPU** go to [#42](https://github.com/xcl-dev/xcl/issues/42), not a new issue.
+- **Testing or merge-checking someone else's PR:** follow [`TESTING.md`](TESTING.md) and the
+  official merge queue ([#3041](https://github.com/xcl-dev/xcl/issues/3041)). Post the exact
+  `merge-check` format with the exact commit tested and a clear `safe to merge` or `not yet`
+  verdict. Post one comment and edit it when you rerun the tests; do not post a new comment for
+  every run.
 - **AI-written test reports are welcome** when they come from a real run: the exact commit, the
   hardware, the commands and their results. Say which tool and model wrote the report.
 - **AI reviews:** check each point yourself, post only what you confirmed, and say that a tool helped.

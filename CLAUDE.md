@@ -1,9 +1,10 @@
 # Claude Code
 
-The instructions for agents in this repository are in `AGENTS.md`, and the rules for every
-contributor are in `CONTRIBUTING.md`. Both apply to you:
+The instructions for agents in this repository are in `AGENTS.md`, the PR testing playbook is in
+`TESTING.md`, and the rules for every contributor are in `CONTRIBUTING.md`. All three apply to you:
 
 @AGENTS.md
+@TESTING.md
 @CONTRIBUTING.md
 
 Specific to Claude Code:

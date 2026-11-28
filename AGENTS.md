@@ -14,6 +14,11 @@ the `xcl` CLI), `tests/testtitle` + `tests/testgamedll` (our own console title f
 - What works and how to use it: `README.md`
 - Design: `docs/specs/2026-11-20-xcl-design.md`
 - Status, measurements and findings: `HANDOFF.md` (long; search it rather than reading it all)
+- Testing and merge-checking PRs: `TESTING.md`
+- Current priorities and triage on GitHub:
+  - Roadmap / current goal: [#1833](https://github.com/xcl-dev/xcl/issues/1833)
+  - Duplicate PR tracker and tested batches: [#1607](https://github.com/xcl-dev/xcl/issues/1607)
+  - Official merge queue (`merge-check` workflow): [#3041](https://github.com/xcl-dev/xcl/issues/3041)
 
 ## Build and test
 
@@ -53,8 +58,8 @@ test counts by hand.
   dependency changes the task does not need. Mention other problems you notice instead of fixing them.
 - **Never run `cargo fmt` on files or the crate**: the tree is not `rustfmt`-clean. Format only the
   lines you change.
-- Before starting, check whether an open PR or issue already covers the work
-  (`gh pr list -R ivall/xcl --search "<keywords>"`), and tell the user if one does.
+- Before starting, check whether an open PR, issue, or duplicate group in `#1607` already covers the work
+  (`gh pr list -R xcl-dev/xcl --search "<keywords>"`), and tell the user if one does.
 - Follow the code around you: reuse existing helpers and the module's patterns instead of adding layers.
 - When your change makes something work (or stop working) for users, update `README.md`. If it makes
   a statement in `HANDOFF.md` or `docs/specs/` wrong, say so in the PR description instead of editing them.
@@ -108,3 +113,19 @@ by line, no claims that were not measured, no filler. Link the issue (`Fixes #N`
 **Always name your model** (and the tool you run in) in **AI use**, in commit trailers and in test
 reports, e.g. `Claude Code, Claude Opus 5.5`. Use the exact model name you were given; if you do not
 know it, write that you do not know rather than guessing.
+
+## Testing or reviewing someone else's PR
+
+When the user asks you to test, verify, or merge-check a PR (for example `"test #1234"` or
+`"test https://github.com/xcl-dev/xcl/pull/1234"`):
+
+1. Read [`TESTING.md`](TESTING.md) and pick the right **test tier (Tier 0–3)** from the changed files
+   so trivial PRs do not waste time on full shader precompiles or long game runs.
+2. Fetch the PR and test-merge it onto the current `origin/<base>` in a temporary detached worktree
+   (never test on a stale base or dirty tree).
+3. Run the required build/tests for that tier, report exact pass/fail/ignored/`SKIPPED` counts, and
+   read the **entire diff** for correctness, scope, and regressions.
+4. Format your result using the exact `#3041` `merge-check` block in `TESTING.md` with an explicit
+   bottom-line verdict (`verdict: safe to merge` or `verdict: not yet: <reason>`) and plain-English
+   reasoning — never dump raw test counts without a verdict.
+5. Do not post the comment to GitHub unless the user explicitly asks you to post it in this session.
