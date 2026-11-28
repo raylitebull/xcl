@@ -345,17 +345,15 @@ fn a_preparation_worker_also_builds_a_split_programs_whole_form() {
     assert!(out.status.success(), "{text}
 {}", String::from_utf8_lossy(&out.stderr));
     let files: Vec<_> = fs::read_dir(cache.join("driver")).unwrap().flatten().map(|e| e.path()).collect();
-    // the split program's pieces, as the precompile counts them ("split compute programs: 1 (N
-    // pieces)"); the whole form is one more pipeline, its blob kept beside theirs
-    let pieces: usize = text
-        .split("split compute programs: 1 (")
-        .nth(1)
-        .and_then(|t| t.split(' ').next())
-        .and_then(|n| n.parse().ok())
-        .unwrap_or_else(|| panic!("no split program: {text}"));
-    assert!(pieces >= 2, "{text}");
-    assert!(text.contains(&format!("pipelines made on the GPU {}, refused 0", pieces + 1)), "the whole form was not built: {text}");
-    assert_eq!(files.len(), pieces + 1, "a blob for each piece and the whole form: {files:?}
+    let is_piece = |p: &std::path::Path| {
+        p.extension().is_some_and(|e| e == "pso") && p.file_name().is_some_and(|n| n.to_string_lossy().ends_with(".chain.pso"))
+    };
+    let pieces = files.iter().filter(|p| is_piece(p)).count();
+    let whole = files.iter().filter(|p| p.extension().is_some_and(|e| e == "pso") && !is_piece(p)).count();
+    assert!(pieces >= 2, "a blob for each split piece: {files:?}\n{text}");
+    assert_eq!(whole, 1, "one blob for the whole form: {files:?}\n{text}");
+    assert!(text.contains(&format!("pipelines made on the GPU {}, refused 0", pieces + whole)), "the whole form was not built: {text}");
+    assert_eq!(files.len(), pieces + whole, "only a blob for each piece and the whole form: {files:?}
 {text}");
     assert!(files.iter().all(|p| p.metadata().unwrap().len() > 0));
     let _ = fs::remove_dir_all(&dir);
