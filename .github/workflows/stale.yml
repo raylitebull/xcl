@@ -32,10 +32,10 @@ jobs:
           days-before-pr-stale: 3
           days-before-pr-close: 4
           stale-pr-label: stale
-          exempt-pr-labels: goal:world-load,keep-open
+          exempt-pr-labels: goal:world-load,keep-open,ready-to-merge
           sort-by: updated
           ascending: true
-          operations-per-run: 300
+          operations-per-run: 500
           debug-only: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
           stale-pr-message: >-
             Nothing has happened on this PR for 3 days, so it is marked `stale` and will be closed in
@@ -44,3 +44,26 @@ jobs:
           close-pr-message: >-
             Closed after a week with no activity. This is not a verdict on the code: if it still applies to
             `main`, rebase it, say so here and it can be reopened.
+
+  stale-conflicts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/stale@4391f3da665fdf50b6810c1a66712fb9ba21aa93 # v11.0.0
+        with:
+          days-before-issue-stale: -1
+          days-before-issue-close: -1
+          days-before-pr-stale: 2
+          days-before-pr-close: 3
+          only-pr-labels: needs-rebase
+          stale-pr-label: stale
+          exempt-pr-labels: keep-open
+          sort-by: updated
+          ascending: true
+          operations-per-run: 300
+          debug-only: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+          stale-pr-message: >-
+            This PR has merge conflicts (`needs-rebase`) and has had no activity for 2 days, so it is
+            marked `stale` and will be closed in 3 days unless it is rebased onto its base branch.
+          close-pr-message: >-
+            Closed because merge conflicts remained unresolved. Rebase onto `main` and comment if it
+            should be reopened.

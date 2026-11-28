@@ -1,0 +1,41 @@
+# Deterministic PR auto-triage: applies area:*, gpu:*, needs-rebase, needs-pr-check, and
+# #3041 merge-check state labels using only the GitHub API (never checks out untrusted PR code).
+name: Auto triage
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft, edited]
+  issue_comment:
+    types: [created, edited]
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+  checks: read
+
+jobs:
+  triage:
+    if: >-
+      github.event_name == 'pull_request_target' ||
+      (github.event_name == 'issue_comment' &&
+       github.event.issue.pull_request != null &&
+       startsWith(github.event.comment.body, 'merge-check'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    concurrency:
+      group: auto-triage-${{ github.event.pull_request.number || github.event.issue.number }}
+      cancel-in-progress: true
+    steps:
+      - name: Checkout default branch scripts only
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: scripts/triage_pr.py
+
+      - name: Sync managed PR labels
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          python3 scripts/triage_pr.py triage-one --repo "$REPO" --pr "$PR_NUMBER"

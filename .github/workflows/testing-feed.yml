@@ -1,0 +1,106 @@
+# Publishes a live machine-readable testing queue (`queue.json`) onto the orphan `testing-feed`
+# branch for contributors and external sync bots. Contains ONLY non-draft, mergeable, gate-passing
+# PRs on `main` that still need testing; PRs drop out automatically once merged, closed,
+# conflicted, or approved by two independent `merge-check` verdicts.
+name: Testing feed
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+    inputs:
+      sync_labels:
+        description: Also sync managed labels on gate-passing PRs during this run
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+  checks: read
+
+concurrency:
+  group: testing-feed
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout default branch scripts
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: scripts/triage_pr.py
+
+      - name: Build queue.json
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          SYNC_LABELS: ${{ github.event.inputs.sync_labels == 'true' }}
+        run: |
+          extra=()
+          if [ "$SYNC_LABELS" = "true" ]; then
+            extra=(--sync-labels)
+          fi
+          python3 scripts/triage_pr.py build-feed --repo "$REPO" --out /tmp/queue.json "${extra[@]}"
+
+      - name: Publish queue.json to orphan testing-feed branch
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          work=/tmp/feed-branch
+          rm -rf "$work"
+          mkdir -p "$work"
+          cd "$work"
+          git init -q
+          git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+
+          if git ls-remote --exit-code --heads origin testing-feed >/dev/null 2>&1; then
+            git fetch -q --depth=1 origin testing-feed
+            git checkout -q -B testing-feed FETCH_HEAD
+          else
+            git checkout -q --orphan testing-feed
+          fi
+
+          # Compare ignoring generated_at so we only push when queue content actually changed.
+          changed=true
+          if [ -f queue.json ]; then
+            if python3 -c '
+          import json, sys
+          a = json.load(open("queue.json"))
+          b = json.load(open("/tmp/queue.json"))
+          a.pop("generated_at", None)
+          b.pop("generated_at", None)
+          sys.exit(0 if a == b else 1)
+          '; then
+              changed=false
+            fi
+          fi
+
+          if [ "$changed" = "false" ]; then
+            echo "queue.json unchanged; skipping push."
+            exit 0
+          fi
+
+          cp /tmp/queue.json queue.json
+          cat > README.md <<'EOF'
+          # XCL Live Testing Queue (`testing-feed`)
+
+          Auto-generated every 15 minutes by `.github/workflows/testing-feed.yml`.
+          Consume directly at:
+          `https://raw.githubusercontent.com/xcl-dev/xcl/testing-feed/queue.json`
+
+          - `items`: open, non-draft, mergeable, CI-green, PR-check-green PRs on `main` still needing testing/merge-checks.
+          - `ready_to_merge`: gate-passing PRs with 2+ independent `safe to merge` checks on their current head.
+          - PRs disappear from `items` automatically when merged, closed, conflicted, draft, or ready to merge.
+          EOF
+
+          git add queue.json README.md
+          git commit -q -m "Update testing-feed queue.json"
+          git push -q origin testing-feed
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
