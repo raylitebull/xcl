@@ -690,6 +690,65 @@ pub struct Slot {
     pub k: u32,
 }
 
+/// A console slot looked up without reserving a page in the shared shader-visible heap:
+/// used for descriptors whose shaders read UMA directly (CBVs, buffer V#s, BVH SRVs) and
+/// never index into the shared PC heap.
+#[derive(Clone, Copy, Debug)]
+pub struct ShadowSlot {
+    pub at: usize,
+    pub pc_srv: u64,
+    pub pc_uav: u64,
+    pub sampler: bool,
+    /// Present only if the heap is unpaged or this page already has a place in the shared heap.
+    pub index: Option<u32>,
+    /// Non-zero only if this page already has a place in the shared heap.
+    pub shared_srv: u64,
+}
+
+/// Whether `cpu` lies inside any registered console descriptor heap (without reserving a page).
+pub fn contains(cpu: u64) -> bool {
+    let heaps = HEAPS.lock().unwrap();
+    heaps.iter().any(|h| cpu >= h.shadow as u64 && cpu < (h.shadow + (h.n * h.slot_bytes()) as usize) as u64)
+}
+
+/// Look up the console slot behind `cpu` without reserving a page in the shared heap.
+pub fn shadow_slot(cpu: u64) -> Option<ShadowSlot> {
+    let heaps = HEAPS.lock().unwrap();
+    let h = heaps.iter().find(|h| cpu >= h.shadow as u64 && cpu < (h.shadow + (h.n * h.slot_bytes()) as usize) as u64)?;
+    let k = ((cpu - h.shadow as u64) / h.slot_bytes() as u64) as u32;
+    if h.sampler {
+        let index = if h.pages.is_empty() {
+            Some(k)
+        } else {
+            h.pages.get((k / SAMPLER_PAGE_SLOTS) as usize).filter(|&&first| first != UNMAPPED).map(|&first| first + (k % SAMPLER_PAGE_SLOTS))
+        };
+        let shared_srv = index.filter(|_| !h.pages.is_empty()).and_then(|i| {
+            let g = GLOBAL_SAMPLER.lock().unwrap();
+            let g = g.as_ref()?;
+            Some(g.cpu + i as u64 * g.inc as u64)
+        }).unwrap_or(0);
+        return Some(ShadowSlot { at: h.shadow + (k * SAMPLER_SLOT) as usize, pc_srv: h.pc_cpu + (k * h.inc) as u64, pc_uav: 0, sampler: true, index, shared_srv });
+    }
+    let uav = ((2 * k + 1) * h.inc) as u64;
+    let index = if h.pages.is_empty() {
+        Some(2 * k)
+    } else {
+        h.pages.get((k / PAGE_SLOTS) as usize).filter(|&&first| first != UNMAPPED).map(|&first| first + 2 * (k % PAGE_SLOTS))
+    };
+    let shared_srv = index.filter(|_| !h.pages.is_empty()).and_then(|i| {
+        let g = GLOBAL.lock().unwrap();
+        let g = g.as_ref()?;
+        Some(g.cpu + i as u64 * g.inc as u64)
+    }).unwrap_or(0);
+    Some(ShadowSlot { at: h.shadow + (k * SLOT) as usize, pc_srv: h.pc_cpu + (2 * k * h.inc) as u64, pc_uav: h.pc_cpu + uav, sampler: false, index, shared_srv })
+}
+
+/// Write descriptor words into a console slot looked up via `shadow_slot`.
+pub fn write_shadow(s: &ShadowSlot, words: &[u32]) {
+    let n = words.len().min(if s.sampler { 4 } else { 8 });
+    unsafe { std::ptr::copy_nonoverlapping(words.as_ptr(), s.at as *mut u32, n) };
+}
+
 /// The slot behind a console CPU handle (None: not one of XCL's console heaps). A view slot
 /// of a heap in the shared heap gets its page's place there now if the page has none yet; one
 /// whose page finds no room there gets index 0, the null SRV / UAV pair.
@@ -933,11 +992,30 @@ pub fn census() {
 /// The descriptor at a console GPU address (low 32 bits, as in a descriptor table), if it
 /// is in one of the console heaps.
 pub fn words_at(addr32: u32) -> Option<[u32; 8]> {
-    let u = crate::gpu::uma::get()?;
-    let s = slot((u.base() + addr32 as usize) as u64)?;
-    let mut w = [0u32; 8];
-    unsafe { std::ptr::copy_nonoverlapping(s.at as *const u32, w.as_mut_ptr(), if s.sampler { 4 } else { 8 }) };
-    Some(w)
+    let (words, _) = read_slot(addr32)?;
+    Some(words)
+}
+
+/// Read guest memory and the slot's current PC index without allocating a page in the
+/// shader-visible heap. A title can fill these slots by ordinary memory copies; inspecting
+/// their words does not publish a new PC view.
+pub(super) fn read_slot(addr32: u32) -> Option<([u32; 8], Option<u32>)> {
+    let at = crate::gpu::uma::get()?.base().checked_add(addr32 as usize)?;
+    let heaps = HEAPS.lock().unwrap();
+    let (h, k) = heaps.iter().find_map(|h| {
+        let k = at.checked_sub(h.shadow)? / h.slot_bytes() as usize;
+        (k < h.n as usize).then_some((h, k as u32))
+    })?;
+    let stride = h.slot_bytes() as usize;
+    let mut words = [0u32; 8];
+    unsafe { std::ptr::copy_nonoverlapping((h.shadow + k as usize * stride) as *const u32, words.as_mut_ptr(), stride / 4) };
+    let index = if h.pages.is_empty() {
+        Some(if h.sampler { k } else { 2 * k })
+    } else {
+        let (page, step) = if h.sampler { (SAMPLER_PAGE_SLOTS, 1) } else { (PAGE_SLOTS, 2) };
+        h.pages.get((k / page) as usize).filter(|&&first| first != UNMAPPED).map(|first| first + step * (k % page))
+    };
+    Some((words, index))
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1481,6 +1559,15 @@ mod tests {
         assert!(register(0xC1, 2 * PAGE_SLOTS, 0x30_0000, 0, 32, false, true, true));
         assert!(register(0xC2, 16, 0x40_0000, 0, 32, false, true, true));
         let (a, b) = (start(0xC1).unwrap(), start(0xC2).unwrap());
+        // The dispatch trace inspects tables the title wrote directly. No PC descriptors
+        // have been published for this page, even after inspecting it.
+        assert_eq!(read_slot(rel(a + (PAGE_SLOTS * SLOT) as u64)), Some(([0; 8], None)));
+        assert!(contains(a + (PAGE_SLOTS * SLOT) as u64));
+        let sh = shadow_slot(a + (PAGE_SLOTS * SLOT) as u64).unwrap();
+        assert_eq!(sh.index, None);
+        assert_eq!(sh.shared_srv, 0);
+        write_shadow(&sh, &[1, 2, 3, 4]);
+        assert_eq!(PAGES_PLACED.load(Relaxed), 0);
         let placed = slot(a + 2 * SLOT as u64).unwrap();
         assert_eq!(placed.index, base + 4, "page 0 of the first heap takes the room there is");
         assert_ne!(placed.shared_srv, 0);

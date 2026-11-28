@@ -430,14 +430,12 @@ pub unsafe fn release_when_done(alloc: usize, cleanup: Box<dyn FnOnce() + Send>)
 }
 
 /// Run deferred `release_when_done` cleanups whose GPU fences have all completed (polled once
-/// per `PresentX`, outside `STATE` so cleanups and COM drops cannot re-enter `STATE`).
+/// per `PresentX`, outside `STATE` so cleanups and COM drops cannot re-enter `STATE`), and drop
+/// excess idle put-aside PC command allocators so bursts do not keep GBs of non-local memory.
 pub unsafe fn release_finished() {
-    let done: Vec<PendingRelease> = {
+    let (done, excess_aside): (Vec<PendingRelease>, Vec<usize>) = {
         let mut g = STATE.lock().unwrap();
         let Some(s) = g.as_mut() else { return };
-        if s.pending_releases.is_empty() {
-            return;
-        }
         let mut ready = Vec::new();
         let mut i = 0;
         while i < s.pending_releases.len() {
@@ -447,7 +445,8 @@ pub unsafe fn release_finished() {
                 i += 1;
             }
         }
-        ready
+        let excess = take_excess_aside(s);
+        (ready, excess)
     };
     for item in done {
         (item.cleanup)();
@@ -457,6 +456,53 @@ pub unsafe fn release_finished() {
             drop(ID3D12CommandAllocator::from_raw(b as *mut c_void));
         }
     }
+    for b in excess_aside {
+        super::real::dispatch_chain::allocator_reset(b);
+        super::console_list::allocator_reset(b as *mut c_void);
+        drop(ID3D12CommandAllocator::from_raw(b as *mut c_void));
+    }
+}
+
+/// Reclaim all idle XCL-created PC allocators sitting in `s.aside` (never dropping the title's
+/// own `alloc`), and whenever `s.cur[alloc]` is an idle XCL-created allocator while `alloc` itself
+/// is idle in `s.aside`, switch `alloc` back to itself and drop the idle XCL-created backing too.
+/// This prevents titles with hundreds of command allocators from keeping gigabytes of non-local
+/// driver command-buffer memory idle in system RAM.
+unsafe fn take_excess_aside(s: &mut State) -> Vec<usize> {
+    let mut drop_list = Vec::new();
+    let mut switch_back = Vec::new();
+    for (&alloc, list) in s.aside.iter_mut() {
+        let mut i = 0;
+        while i < list.len() {
+            let b = list[i];
+            if b != alloc && s.backings.get(&b).is_none_or(|x| x.free()) {
+                list.swap_remove(i);
+                s.backings.remove(&b);
+                drop_list.push(b);
+            } else {
+                i += 1;
+            }
+        }
+        // If `cur` is an idle XCL-made allocator and the title's own `alloc` is also idle in
+        // `aside`, restore `alloc` as `cur` and reclaim the idle XCL-made allocator.
+        if let Some(&cur) = s.cur.get(&alloc) {
+            if cur != alloc
+                && s.backings.get(&cur).is_none_or(|x| x.free())
+                && s.backings.get(&alloc).is_none_or(|x| x.free())
+            {
+                if let Some(pos) = list.iter().position(|&b| b == alloc) {
+                    list.swap_remove(pos);
+                    switch_back.push((alloc, cur));
+                }
+            }
+        }
+    }
+    for (alloc, cur) in switch_back {
+        s.cur.remove(&alloc);
+        s.backings.remove(&cur);
+        drop_list.push(cur);
+    }
+    drop_list
 }
 
 /// The title's allocator `alloc` is gone (its last Release): nothing of it stays here – a later
@@ -589,11 +635,23 @@ unsafe fn title_reset_in(s: &mut State, alloc: *mut c_void, mut reset: impl FnMu
     s.cur.insert(a, next);
     s.swaps += 1;
     if s.swaps.is_power_of_two() {
-        let aside: usize = s.aside.values().map(|v| v.len()).sum();
+        let (mut aside, mut free, mut pinned) = (0usize, 0usize, 0usize);
+        for v in s.aside.values() {
+            for b in v {
+                aside += 1;
+                match s.backings.get(b) {
+                    None => free += 1,
+                    Some(x) if !x.users.is_empty() => pinned += 1,
+                    Some(x) if x.idle() => free += 1,
+                    Some(_) => {}
+                }
+            }
+        }
         crate::xlog_info!(
-            "D3D12.X: {} allocator resets so far with recordings still held or on the GPU – another PC allocator took its place ({} made, {aside} put aside now)",
+            "D3D12.X: {} allocator resets so far with recordings still held or on the GPU – another PC allocator took its place ({} made, {aside} put aside now: {free} idle, {pinned} held by lists, {} on GPU)",
             s.swaps,
-            s.made
+            s.made,
+            aside.saturating_sub(free + pinned)
         );
     }
     Some(0)
@@ -602,6 +660,24 @@ unsafe fn title_reset_in(s: &mut State, alloc: *mut c_void, mut reset: impl FnMu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn excess_idle_aside_allocators_are_reclaimed_while_title_and_busy_ones_stay() {
+        let (own, spare1, spare2, pinned_alloc, list) = (0x1000usize, 0x2000usize, 0x3000usize, 0x4000usize, 0x5000usize);
+        let mut s = State::default();
+        s.aside.insert(own, vec![own, spare1, spare2, pinned_alloc]);
+        s.backings.insert(own, Backing::default());
+        s.backings.insert(spare1, Backing::default());
+        s.backings.insert(spare2, Backing::default());
+        let mut pinned = Backing::default();
+        pinned.users.insert(list);
+        s.backings.insert(pinned_alloc, pinned);
+
+        let mut dropped = unsafe { take_excess_aside(&mut s) };
+        dropped.sort_unstable();
+        assert_eq!(dropped, vec![spare1, spare2], "both idle XCL-made allocators are dropped");
+        assert_eq!(s.aside[&own], vec![own, pinned_alloc], "title's own allocator and pinned allocator remain");
+    }
 
     /// When a title list goes, the segments that recorded its put-off dispatches on its own
     /// allocator hold neither the PC allocator it stands for now nor the ones put aside: `forget`

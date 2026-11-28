@@ -137,6 +137,7 @@ unsafe fn write_now_in(va: usize, words: &[u32], run: &dyn Fn(usize, usize) -> O
     for (i, &w) in words.iter().enumerate() {
         (*((va + 4 * i) as *const AtomicU32)).store(w, Ordering::Release);
     }
+    crate::hle::kernelx::pagelog::note("list immediate written by the CPU after its submit", va, 0, bytes);
     note_placed(asked, va, bytes);
 }
 
@@ -176,6 +177,7 @@ unsafe fn write_u64_now(va: usize, value: u64) {
     let (asked, va) = (va, cpu_at(va));
     if u64_writable_now(va) {
         (*(va as *const AtomicU64)).store(value, Ordering::Release);
+        crate::hle::kernelx::pagelog::note("list 64-bit value written by the CPU after its submit", va, 0, 8);
         note_placed(asked, va, 8);
     }
 }
@@ -188,6 +190,7 @@ pub(super) unsafe fn max_u64_now(va: usize, value: u64) {
     let (asked, va) = (va, cpu_at(va));
     if u64_writable_now(va) {
         (*(va as *const AtomicU64)).fetch_max(value, Ordering::AcqRel);
+        crate::hle::kernelx::pagelog::note("list 64-bit value raised by the CPU", va, 0, 8);
         note_placed(asked, va, 8);
     }
 }
@@ -199,7 +202,7 @@ pub(super) fn writable(va: usize, bytes: usize) -> bool {
     if crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(va, bytes)) {
         return true;
     }
-    crate::hle::kernelx::lazy::ensure(va, bytes);
+    let _opened = crate::hle::kernelx::lazy::ensure(va, bytes);
     use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READWRITE, PAGE_READWRITE};
     let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     let found = unsafe { VirtualQuery(va as *const c_void, &mut m, std::mem::size_of_val(&m)) } != 0;

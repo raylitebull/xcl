@@ -1261,6 +1261,7 @@ fn pick_queue(last_queue: Option<usize>, device: usize, ty: D3D12_COMMAND_LIST_T
 }
 
 fn note_write(list: usize, va: u64, size: u64) {
+    crate::hle::kernelx::pagelog::note("list memory write recorded (the GPU writes it)", va as usize, 0, size as usize);
     recording(list).lock().unwrap().get_or_insert_with(HashMap::new).entry(list).or_default().note_write(va, size);
 }
 
@@ -1799,6 +1800,7 @@ unsafe fn publish_cpu_cycle_break_with(va: u64, val: u64, uma: Option<&crate::gp
     if uma.is_some_and(|u| u.is_sparse(addr)) {
         return;
     }
+    crate::hle::kernelx::pagelog::note("Write64 value published by the CPU (cycle break)", addr, 0, 8);
     if uma.is_some_and(|u| u.in_committed_window(addr, 8)) {
         (*(addr as *const AtomicU64)).fetch_max(val, Ordering::AcqRel);
     } else {
@@ -3675,12 +3677,75 @@ pub(super) unsafe extern "system" fn uav_barrier_x(this: *mut c_void, n: u32, ba
         },
     };
     pc::<unsafe extern "system" fn(*mut c_void, u32, *const D3D12_RESOURCE_BARRIER)>(this, PC_RESOURCE_BARRIER)(this, 1, &b);
+    barrier_groups_log(n, barriers);
+    // the title's texture barriers as transitions (`barrier_groups`), which go the way its
+    // ResourceBarrier calls go: the format aliases and the depth twins are kept from there
+    if super::barrier_groups::enabled() {
+        let moves = super::barrier_groups::transitions(n, barriers, list_type(this) == D3D12_COMMAND_LIST_TYPE_DIRECT);
+        if !moves.is_empty() {
+            resource_barrier_x(this, moves.len() as u32, moves.as_ptr());
+        }
+        super::format_alias::on_uav_barrier(this, None);
+        return;
+    }
     let mut alias_writers: Vec<(usize, u32)> = Vec::new();
     super::format_alias::filter_enhanced_barriers(n, barriers, &mut alias_writers);
     if !alias_writers.is_empty() {
         super::format_alias::sync_title_writers(this, &alias_writers);
     }
     super::format_alias::on_uav_barrier(this, None);
+}
+
+/// `XCL_BARRIER_LOG=1`: what the title's #146 calls hold, as barrier groups – calls, and the
+/// texture barriers by (layout before → after, access before → after, depth buffer or not),
+/// logged at each power of two of calls.
+unsafe fn barrier_groups_log(n: u32, groups: *const c_void) {
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("XCL_BARRIER_LOG").is_ok_and(|v| v.trim() == "1")) {
+        return;
+    }
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    static KINDS: Mutex<Option<HashMap<(u32, u32, u32, u32, u32, bool), u64>>> = Mutex::new(None);
+    let calls = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+    let mut g = KINDS.lock().unwrap();
+    let kinds = g.get_or_insert_with(HashMap::new);
+    let count = (n as usize).min(64);
+    if !groups.is_null() && count != 0 && crate::gpu::shader::readable(groups as usize, count * std::mem::size_of::<D3D12_BARRIER_GROUP>()) {
+        for grp in std::slice::from_raw_parts(groups as *const D3D12_BARRIER_GROUP, count) {
+            let nb = (grp.NumBarriers as usize).min(1024);
+            let p = grp.Anonymous.pTextureBarriers;
+            if grp.Type != D3D12_BARRIER_TYPE_TEXTURE {
+                *kinds.entry((grp.Type.0 as u32, 0, 0, 0, 0, false)).or_default() += nb as u64;
+                continue;
+            }
+            if p.is_null() || !crate::gpu::shader::readable(p as usize, nb * std::mem::size_of::<D3D12_TEXTURE_BARRIER>()) {
+                *kinds.entry((99, 0, 0, 0, 0, false)).or_default() += 1;
+                continue;
+            }
+            for tb in std::slice::from_raw_parts(p, nb) {
+                let res: usize = transmute_copy(&tb.pResource);
+                let depth = res != 0 && readable_resource(res).is_some_and(|d| d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 != 0);
+                *kinds.entry((1, tb.LayoutBefore.0 as u32, tb.LayoutAfter.0 as u32, tb.AccessBefore.0 as u32, tb.AccessAfter.0 as u32, depth)).or_default() += 1;
+            }
+        }
+    } else {
+        *kinds.entry((98, n, 0, 0, 0, false)).or_default() += 1;
+    }
+    if calls.is_power_of_two() && calls >= 16 {
+        let mut v: Vec<_> = kinds.iter().map(|(k, c)| (*c, *k)).collect();
+        v.sort_unstable_by(|a, b| b.cmp(a));
+        let text: Vec<String> = v.iter().take(24).map(|(c, (ty, lb, la, ab, aa, depth))| format!("{c}x type {ty} layout {lb:#x}->{la:#x} access {ab:#x}->{aa:#x}{}", if *depth { " (depth)" } else { "" })).collect();
+        crate::xlog_info!("D3D12.X: #146 barrier groups: {calls} calls, {} kinds: {}", v.len(), text.join("; "));
+    }
+}
+
+/// The description of the PC resource a barrier names at `res` (as `is_buffer` reads one).
+unsafe fn readable_resource(res: usize) -> Option<D3D12_RESOURCE_DESC> {
+    if !crate::gpu::shader::readable(res, 8) {
+        return None;
+    }
+    let r = res as *mut c_void;
+    ID3D12Resource::from_raw_borrowed(&r).map(|x| x.GetDesc())
 }
 
 /// A UAV barrier for all resources on `list`, where a list takes one (a copy list and a bundle
@@ -4260,12 +4325,33 @@ fn pc_va(va: u64) -> u64 {
     }
 }
 
+/// Diagnostic: an address the title gave that is not in unified memory goes to the PC as it is.
+/// When it is the title's ordinary memory (the CPU can read it) the PC's GPU has nothing there:
+/// a page fault at that very address and a device removal. The first ones are logged with the
+/// calls that led here.
+fn note_cpu_address_as_gpu(va: u64) {
+    static N: AtomicU64 = AtomicU64::new(0);
+    // (below the unified-memory windows: where a retail title keeps its ordinary heaps)
+    if va < 0x1_0000_0000 || va >= 0x10_0000_0000 || !crate::gpu::shader::readable(va as usize, 16) {
+        return;
+    }
+    let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 6 {
+        crate::xlog_error!("D3D12.X: the title's ordinary memory at {va:#x} goes to the GPU as an address (#{n}): {}", std::backtrace::Backtrace::force_capture().to_string().lines().filter(|l| l.contains("xcl::") || l.contains("game_")).take(14).map(|l| l.trim()).collect::<Vec<_>>().join(" < "));
+    } else if n.is_power_of_two() {
+        crate::xlog_error!("D3D12.X: the title's ordinary memory went to the GPU as an address {n} times so far (now {va:#x})");
+    }
+}
+
 /// `pc_va` in `u`, whose windows have the PC addresses `window_va` (`real::uma_window_va`). A
 /// GPU view of the title's memory without a PC address of its window gets none (0, read as
 /// nothing): as it is, the console address is no PC address and hangs the device.
 fn pc_va_in(u: &crate::gpu::uma::Uma, va: u64, window_va: impl Fn(usize) -> Option<u64>) -> u64 {
     let p = va as usize;
-    let Some(k) = u.window_of(p).filter(|_| u.is_title_address(p)) else { return va };
+    let Some(k) = u.window_of(p).filter(|_| u.is_title_address(p)) else {
+        note_cpu_address_as_gpu(va);
+        return va;
+    };
     match window_va(k) {
         Some(w) => w + (p - u.window(k).0) as u64,
         None if u.is_view_window(k) => 0,
@@ -4935,6 +5021,7 @@ pub(super) unsafe extern "system" fn resource_barrier_x(this: *mut c_void, n: u3
         }
     });
     if let Some(p) = &plane_copies {
+        stencil_copies_on(this, &p.stencil_to_plane, false);
         plane_copies_on(this, &p.to_plane, false);
     }
     if !out.is_empty() {
@@ -4942,6 +5029,7 @@ pub(super) unsafe extern "system" fn resource_barrier_x(this: *mut c_void, n: u3
     }
     if let Some(p) = &plane_copies {
         plane_copies_on(this, &p.to_twin, true);
+        stencil_copies_on(this, &p.stencil_to_twin, true);
     }
     if !alias_writers.is_empty() {
         super::format_alias::sync_title_writers(this, &alias_writers);
@@ -4949,6 +5037,53 @@ pub(super) unsafe extern "system" fn resource_barrier_x(this: *mut c_void, n: u3
     if any_uav || uav_transition {
         let targets = if uav_global || uav_targets.is_empty() { None } else { Some(uav_targets.as_slice()) };
         super::format_alias::on_uav_barrier(this, targets);
+    }
+}
+
+/// The copies between stencil planes and their twins around a title's barriers
+/// (`depth_uav::plan_barriers`) on `list`, through each twin's buffer: into the twins
+/// (`to_twin`) or into the planes. The depth buffer rests in `depth_uav::PARK` (COPY_SOURCE)
+/// before and after, the twin in UNORDERED_ACCESS, the buffer in COPY_DEST. Whole subresources
+/// (a D3D12 copy of a stencil plane takes the whole of it).
+unsafe fn stencil_copies_on(list: *mut c_void, copies: &[super::depth_uav::StencilCopy], to_twin: bool) {
+    let barriers = |b: &[[u32; 8]]| pc::<unsafe extern "system" fn(*mut c_void, u32, *const [u32; 8])>(list, PC_RESOURCE_BARRIER)(list, b.len() as u32, b.as_ptr());
+    let tr = |res: usize, sub: u32, before: u32, after: u32| [0, 0, res as u32, (res as u64 >> 32) as u32, sub, before, after, 0];
+    let all = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    let at = |res: usize, k: u32| D3D12_TEXTURE_COPY_LOCATION { pResource: transmute_copy(&res), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: k } };
+    let copy = pc::<unsafe extern "system" fn(*mut c_void, *const D3D12_TEXTURE_COPY_LOCATION, u32, u32, u32, *const D3D12_TEXTURE_COPY_LOCATION, *const D3D12_BOX)>(list, PC_COPY_TEXTURE_REGION);
+    let (copy_src, copy_dst) = (D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32, D3D12_RESOURCE_STATE_COPY_DEST.0 as u32);
+    for c in copies {
+        let (twin, through) = (c.twin.as_raw() as usize, c.through.as_raw() as usize);
+        let mips = c.mips.max(1) as u32;
+        for &k in &c.subs {
+            let m = k % mips;
+            let (w, h) = ((c.width >> m).max(1), (c.height >> m).max(1));
+            let placed = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: transmute_copy(&through),
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                        Offset: 0,
+                        Footprint: D3D12_SUBRESOURCE_FOOTPRINT { Format: DXGI_FORMAT_R8_TYPELESS, Width: w, Height: h, Depth: 1, RowPitch: super::depth_uav::stencil_pitch(w) },
+                    },
+                },
+            };
+            let plane = c.first + k;
+            if to_twin {
+                // plane → buffer → twin
+                copy(list, &placed, 0, 0, 0, &at(c.depth, plane), std::ptr::null());
+                barriers(&[tr(through, all, copy_dst, copy_src), tr(twin, k, UNORDERED_ACCESS, copy_dst)]);
+                copy(list, &at(twin, k), 0, 0, 0, &placed, std::ptr::null());
+                barriers(&[tr(twin, k, copy_dst, UNORDERED_ACCESS), tr(through, all, copy_src, copy_dst)]);
+            } else {
+                // twin → buffer → plane
+                barriers(&[tr(twin, k, UNORDERED_ACCESS, copy_src)]);
+                copy(list, &placed, 0, 0, 0, &at(twin, k), std::ptr::null());
+                barriers(&[tr(twin, k, copy_src, UNORDERED_ACCESS), tr(through, all, copy_dst, copy_src), tr(c.depth, plane, super::depth_uav::PARK, copy_dst)]);
+                copy(list, &at(c.depth, plane), 0, 0, 0, &placed, std::ptr::null());
+                barriers(&[tr(c.depth, plane, copy_dst, super::depth_uav::PARK), tr(through, all, copy_src, copy_dst)]);
+            }
+        }
     }
 }
 
@@ -5090,6 +5225,7 @@ pub(super) unsafe extern "system" fn copy_texture_region_x(this: *mut c_void, ds
     if let Some(d) = dst.as_ref() {
         let r: usize = transmute_copy(&d.pResource);
         super::present::note_use(r, super::present::USE_COPY);
+        super::present::trace_plane_copy("CopyTextureRegion", r, src.as_ref().map_or(0, |s| transmute_copy(&s.pResource)));
         super::placements::note_use(r);
         if let Some(s) = src.as_ref() {
             super::placements::note_use(transmute_copy(&s.pResource));
@@ -5328,6 +5464,7 @@ pub(super) unsafe extern "system" fn resolve_subresource_x(this: *mut c_void, ds
         Some(c::Op::Resolve { dst: c::describe(dst), dst_sub, src: c::describe(src), src_sub, format, region: None })
     });
     super::present::note_use(dst, super::present::USE_COPY);
+    super::present::trace_plane_copy("ResolveSubresource", dst, src);
     super::title_textures::note_gpu_write(this as usize, dst);
     trace_resolve("ResolveSubresource", dst, src, format, "");
     pc::<unsafe extern "system" fn(*mut c_void, usize, u32, usize, u32, i32)>(this, PC_RESOLVE_SUBRESOURCE)(this, dst, dst_sub, src, src_sub, format)
@@ -5359,6 +5496,7 @@ pub(super) unsafe extern "system" fn copy_resource_x(this: *mut c_void, dst: usi
         Some(c::Op::Copy { kind: "resource", dst: c::buffer(dst, 0), src: c::buffer(src, 0), at: [0; 3], bx: None, bytes: None, refused: false })
     });
     super::present::note_use(dst, super::present::USE_COPY);
+    super::present::trace_plane_copy("CopyResource", dst, src);
     super::placements::note_use(dst);
     super::placements::note_use(src);
     super::title_textures::note_gpu_write(this as usize, dst);

@@ -285,6 +285,7 @@ unsafe fn init_state(device: &ID3D12Device) -> Result<HeartbeatState, String> {
             .map_err(|e| format!("CreateCommandList(COMPUTE) failed: {e}"))?;
         list.SetComputeRootSignature(&root_sig);
         list.SetPipelineState(&pso);
+        super::real::note_root_view(list.as_raw() as usize, 0, uav_va);
         list.SetComputeRootUnorderedAccessView(0, uav_va);
         list.Dispatch(1, 1, 1);
         list.Close().map_err(|e| format!("CommandList::Close failed: {e}"))?;

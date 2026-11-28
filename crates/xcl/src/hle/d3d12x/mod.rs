@@ -17,6 +17,7 @@ pub mod console_heap;
 pub mod console_list;
 pub mod clamp;
 mod ambient;
+mod barrier_groups;
 mod depth_uav;
 mod format_alias;
 pub mod device_x;

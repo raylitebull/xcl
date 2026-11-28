@@ -759,6 +759,13 @@ pub(super) unsafe fn pc_resource_desc_for_device(device: *mut c_void, x: &[u8; 0
     strip_unsupported_uav_for_device(device, pc_resource_desc(x))
 }
 
+/// Whether an sRGB texture with unordered access is made typeless (`pc_resource_desc`): only
+/// with `XCL_SRGB_UAV=1` (a retail title's world was not seen to look right with it yet).
+fn srgb_uav() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_SRGB_UAV").is_ok_and(|v| v.trim() == "1"))
+}
+
 /// the console resource desc (0x38 bytes, D3D12_RESOURCE_DESC) as a PC one: its tile layouts
 /// and console flag bits mean nothing to a PC driver
 pub fn pc_resource_desc(x: &[u8; 0x38]) -> [u8; 0x38] {
@@ -797,6 +804,14 @@ pub fn pc_resource_desc(x: &[u8; 0x38]) -> [u8; 0x38] {
     // PC RTV/UAV/SRV support. Sampled-only R9G9B9E5 textures stay format 67.
     if format == 67 && flags & 5 != 0 {
         d[0x20..0x24].copy_from_slice(&26u32.to_le_bytes());
+    }
+    // an sRGB texture the console also lets shaders write (a retail title's G-buffer colour, a
+    // render target and a UAV): the PC has no unordered access for an sRGB format – typeless,
+    // so the title's sRGB views and a linear UAV of the same bytes both fit
+    // (`pc_shader_view_format`, `pc_uav_linear_format`)
+    let samples_x = u32::from_le_bytes(d[0x24..0x28].try_into().unwrap());
+    if matches!(format, 29 | 91) && flags & 4 != 0 && flags & 2 == 0 && samples_x <= 1 && dim != D3D12_RESOURCE_DIMENSION_BUFFER.0 as u32 && srgb_uav() {
+        d[0x20..0x24].copy_from_slice(&(if format == 29 { 27u32 } else { 90u32 }).to_le_bytes());
     }
     // a depth buffer the console also lets shaders write (a retail game's: ALLOW_DEPTH_STENCIL |
     // ALLOW_UNORDERED_ACCESS): the PC refuses the pair – the depth buffer stays
@@ -896,6 +911,10 @@ pub fn pc_shader_view_format(resource: u32, view: u32) -> u32 {
         (87, 88) => 87,
         // a target made R11G11B10_FLOAT (`pc_resource_desc`)
         (26, 67) => 26,
+        // an sRGB texture with unordered access made typeless (`pc_resource_desc`): the view the
+        // title gave no format is the sRGB one (a UAV: `pc_uav_linear_format` of it)
+        (27, 0 | 27) => 29,
+        (90, 0 | 90) => 91,
         (_, v) => v,
     }
 }
@@ -1493,7 +1512,7 @@ mod tests {
             103, 107,      // YUV (NV12, YUY2)
         ] {
             let (out_fmt, out_flags) = make(3, fmt, 1, 0x4);
-            if matches!((fmt, out_fmt), (85, 28) | (88, 87)) {
+            if matches!((fmt, out_fmt), (85, 28) | (88, 87) | (29, 27) | (91, 90)) {
                 // promoted to a format a PC driver takes as a UAV of the same values: the flag
                 // stays, and is valid there
                 assert_eq!(out_flags & 0x4, 0x4, "format {fmt} promoted to {out_fmt} keeps ALLOW_UNORDERED_ACCESS");
@@ -1502,6 +1521,16 @@ mod tests {
                 assert_eq!(out_flags & 0x4, 0, "format {fmt} must strip ALLOW_UNORDERED_ACCESS");
             }
         }
+        // an sRGB render target with unordered access is typeless with both flags; without
+        // unordered access, multisampled or a depth buffer it stays what it is
+        if srgb_uav() {
+            assert_eq!((make(3, 29, 1, 0x5), make(3, 91, 1, 0x5)), ((27, 0x5), (90, 0x5)));
+        } else {
+            assert_eq!((make(3, 29, 1, 0x5), make(3, 91, 1, 0x5)), ((29, 0x1), (91, 0x1)));
+        }
+        assert_eq!((make(3, 29, 1, 0x1), make(3, 29, 4, 0x5)), ((29, 0x1), (29, 0x1)));
+        assert_eq!((pc_shader_view_format(27, 0), pc_shader_view_format(27, 29), pc_shader_view_format(27, 28), pc_shader_view_format(90, 0)), (29, 29, 28, 91));
+        assert_eq!(pc_uav_linear_format(pc_shader_view_format(27, 0)), 28, "its UAV is the linear one");
         // Multisampled textures never support UAV even on UAV-capable formats:
         assert_eq!(make(3, 28, 4, 0x5), (28, 0x1));
         assert_eq!(make(3, 27, 2, 0x4), (27, 0x0));

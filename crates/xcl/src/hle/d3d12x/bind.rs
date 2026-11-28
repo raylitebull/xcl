@@ -129,6 +129,7 @@ impl TwoPassBuf {
             }
         };
         note_two_pass(TP_MADE);
+        super::real::note_va("two-pass buffer", res.GetGPUVirtualAddress(), bytes, false);
         Ok(TwoPassBuf { res, bytes, dev: dev.as_raw() as usize })
     }
 }
@@ -160,6 +161,7 @@ impl Drop for TwoPassBuf {
     fn drop(&mut self) {
         TWO_PASS[TP_ALIVE].fetch_sub(self.bytes, Ordering::Relaxed);
         note_two_pass(TP_GONE);
+        super::real::note_va("two-pass buffer", unsafe { self.res.GetGPUVirtualAddress() }, self.bytes, true);
     }
 }
 
@@ -239,7 +241,7 @@ pub(super) fn release_allocator_res(allocator: usize) {
     let _gone = {
         let mut free = FREE_RES.lock().unwrap();
         let now = std::time::Instant::now();
-        let mut gone = free.take_idle(now, FREE_RES_IDLE);
+        let mut gone = free.take_idle(now, FREE_RES_IDLE + console_list::retire_age());
         for b in bufs.into_iter().flatten().chain(aged.into_iter().map(|(b, _)| b)) {
             gone.extend(free.put(now, b.bytes, b.dev, b));
         }
@@ -251,7 +253,7 @@ pub(super) fn release_allocator_res(allocator: usize) {
 fn take_free(dev: usize, min: u64, max: u64) -> Option<TwoPassBuf> {
     let (gone, picked) = {
         let mut free = FREE_RES.lock().unwrap();
-        (free.take_idle(std::time::Instant::now(), FREE_RES_IDLE), free.take(dev, min, max))
+        (free.take_idle(std::time::Instant::now(), FREE_RES_IDLE + console_list::retire_age()), free.take(dev, min, max))
     };
     // (let go outside the lock)
     drop(gone);
@@ -348,12 +350,14 @@ impl<T> FreePool<T> {
 
     /// The smallest kept on `dev` of `min..=max` bytes, of those the last handed back (so the
     /// ones no recording needs grow old and go).
+    /// One handed back less than `console_list::retire_age` ago is not taken yet.
     fn take(&mut self, dev: usize, min: u64, max: u64) -> Option<T> {
+        let (now, retire) = (std::time::Instant::now(), console_list::retire_age());
         let i = self
             .free
             .iter()
             .enumerate()
-            .filter(|(_, &(_, b, d, _))| d == dev && b >= min && b <= max)
+            .filter(|(_, &(at, b, d, _))| d == dev && b >= min && b <= max && now.saturating_duration_since(at) >= retire)
             .min_by_key(|&(i, &(_, b, _, _))| (b, std::cmp::Reverse(i)))?
             .0;
         let (_, b, _, t) = self.free.remove(i);
@@ -1486,8 +1490,14 @@ unsafe fn emit_commands(this: *mut c_void, list: &ID3D12GraphicsCommandList, cmd
                 let p = *p as *mut c_void;
                 list.SetPipelineState(ID3D12PipelineState::from_raw_borrowed(&p));
             }
-            Cmd::ComputeView(slot, va) => list.SetComputeRootUnorderedAccessView(*slot, *va),
-            Cmd::GraphicsView(slot, va) => list.SetGraphicsRootUnorderedAccessView(*slot, *va),
+            Cmd::ComputeView(slot, va) => {
+                super::real::note_root_view(list.as_raw() as usize, *slot, *va);
+                list.SetComputeRootUnorderedAccessView(*slot, *va)
+            }
+            Cmd::GraphicsView(slot, va) => {
+                super::real::note_root_view(list.as_raw() as usize, *slot, *va);
+                list.SetGraphicsRootUnorderedAccessView(*slot, *va)
+            }
             Cmd::Dispatch(n) => list.Dispatch(*n, 1, 1),
             Cmd::DispatchMesh(n) => pc_dm(this, *n, 1, 1),
             Cmd::Indirect(sig, buf, at) => pc_ei(this, *sig, 1, *buf, *at, 0, 0),
@@ -1844,11 +1854,13 @@ unsafe fn emit_two_pass_stage(list: &ID3D12GraphicsCommandList, stage: &StageBin
     if compute_pass {
         list.SetComputeRootSignature(rs);
         for (k, &v) in stage.views.iter().enumerate() {
+            super::real::note_root_view(list.as_raw() as usize, k as u32, v);
             list.SetComputeRootUnorderedAccessView(k as u32, v);
         }
     } else {
         list.SetGraphicsRootSignature(rs);
         for (k, &v) in stage.views.iter().enumerate() {
+            super::real::note_root_view(list.as_raw() as usize, k as u32, v);
             list.SetGraphicsRootUnorderedAccessView(k as u32, v);
         }
     }
@@ -2080,6 +2092,7 @@ unsafe fn make_scaled_args_buffer(this: *mut c_void, list: &ID3D12GraphicsComman
     list.SetComputeRootSignature(ID3D12RootSignature::from_raw_borrowed(&rs_raw));
     list.SetPipelineState(ID3D12PipelineState::from_raw_borrowed(&pso_raw));
     for (slot, va) in rewrite.views {
+        super::real::note_root_view(list.as_raw() as usize, slot, va);
         list.SetComputeRootUnorderedAccessView(slot, va);
     }
     list.Dispatch(rewrite.groups, 1, 1);
@@ -2441,6 +2454,9 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     }
     flush_two_pass(this, RunEnd::Draw);
     let (gfx, compute) = (super::real::is_translated_graphics(pso), super::real::is_translated_compute(pso));
+    if compute {
+        note_dispatch_views(this, raw_pso);
+    }
     if !gfx && !compute {
         // (a pipeline still being built: skipped above, `DrawPipeline::StandIn`)
         // A finished two-pass MS/GS pipeline is a PC mesh shader pipeline (MS+PS) registered in
@@ -2506,6 +2522,9 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     // an indirect draw gets its frame trace line as a direct one (`graphics_bound`), marked
     if gfx && super::present::trace_frame() {
         trace_ui_draw(this, raw_pso, true);
+    }
+    if gfx && super::present::trace_planes_from().is_some() {
+        trace_plane_draw(this, raw_pso, true);
     }
     // (binds a compute root signature and a pipeline: before the dispatch's or draw's own)
     let checked = super::indirect_guard::check(this, pso, sig, max, args, args_off, count_buf);
@@ -2857,6 +2876,9 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList>
     if super::present::trace_frame() {
         trace_ui_draw(this, pso, false);
     }
+    if super::present::trace_planes_from().is_some() {
+        trace_plane_draw(this, pso, false);
+    }
     match bind_abi(this, &list, pso, true, None, 0) {
         Ok(_) => {
             super::targets::note_draw(this, super::targets::RAN);
@@ -3106,6 +3128,50 @@ unsafe fn trace_ui_draw(this: *mut c_void, pso: usize, indirect: bool) {
     }
 }
 
+/// `XCL_TRACE_PLANES=<frame>`: from that frame on, each pair of shaders that draws into a
+/// presented resource is logged once with its root arguments (the first 80 pairs).
+unsafe fn trace_plane_draw(this: *mut c_void, pso: usize, indirect: bool) {
+    let Some(from) = super::present::trace_planes_from() else { return };
+    let frame = super::present::counters().1;
+    if frame < from {
+        return;
+    }
+    static WHY: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+    let why = |k: usize, what: &str| {
+        let n = WHY[k].fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 3 || n.is_power_of_two() {
+            crate::xlog_info!("plane trace: frame {frame} a draw on list {:#x} (pipeline {pso:#x}) is not traced: {what} (#{n})", this as usize);
+        }
+    };
+    let Some(rt) = super::present::rt0_resource(this as usize) else {
+        why(0, "no render target 0 known for its list");
+        return;
+    };
+    if !super::present::is_presented(rt) {
+        return;
+    }
+    let (vs, ps) = match super::real::pso_shaders(super::pso_async::resolve(pso)) {
+        Some(x) => x,
+        None => {
+            why(2, "its pipeline has no known shaders");
+            (0, pso as u64)
+        }
+    };
+    static SEEN: Mutex<Vec<(u64, u64, usize)>> = Mutex::new(Vec::new());
+    {
+        let mut g = SEEN.lock().unwrap();
+        if g.len() >= 80 || g.contains(&(vs, ps, rt)) {
+            return;
+        }
+        g.push((vs, ps, rt));
+    }
+    crate::xlog_info!(
+        "plane trace: frame {frame} draw into {rt:#x} (pipeline {pso:#x}, vs {vs:016x} ps {ps:016x}{}): {}",
+        if indirect { ", ExecuteIndirect" } else { "" },
+        root_args_summary(this, 16)
+    );
+}
+
 /// A draw's root arguments for the frame trace: constants, root buffers (their first words, as
 /// the CPU sees them), the first slots of descriptor tables (the PC resources they name).
 unsafe fn root_args_summary(this: *mut c_void, buffer_words: usize) -> String {
@@ -3133,14 +3199,15 @@ unsafe fn root_args_summary(this: *mut c_void, buffer_words: usize) -> String {
                 let slots: Vec<String> = (0..slots)
                     .map(|k| {
                         let at = u.base() + t + 32 * k;
-                        let w = super::console_heap::words_at((t + 32 * k) as u32);
+                        let observed = super::console_heap::read_slot((t + 32 * k) as u32);
+                        let w = observed.map(|(words, _)| words);
                         // with `XCL_TRACE_SLOTS`: the image the T# describes (format, width,
                         // height, first and last level of the view, levels of the texture, smallest
                         // level of detail), the slot's own index in the shared heap, and the
                         // resource the T#'s index names there – a T# the title copied as memory
                         // carries its source slot's index, and samples whatever that slot holds now
                         let image = w.filter(|_| more.is_some()).and_then(|w| crate::gpu::desc::image(&w)).map_or(String::new(), |t| {
-                            let own = super::console_heap::slot(at as u64).map(|s| s.index);
+                            let own = observed.and_then(|(_, index)| index);
                             let named = super::console_heap::named_by_index(w.map_or(0, |w| w[0]));
                             let nd = (named != 0 && named != super::console_heap::GONE).then(|| ID3D12Resource::from_raw_borrowed(&(named as *mut c_void)).map(|x| x.GetDesc())).flatten();
                             if nd.is_some() && super::title_textures::address(named).is_some() {
@@ -3287,6 +3354,43 @@ fn bvh_builder_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("XCL_BVH_BUILDER").is_ok_and(|v| v.trim() == "1"))
 }
 
+/// `XCL_DIAG_VIEWS=1` turns on per-dispatch descriptor-table view tracking (off by default:
+/// locks `HEAPS` and `DISPATCH_VIEWS` on every compute dispatch).
+fn diag_views_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_DIAG_VIEWS").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// The buffer descriptors (V#) in the first slots of a dispatch's descriptor tables, as the CPU
+/// has them now: those in unified memory are written down (`real::note_dispatch_view`), so a
+/// crash report can say which dispatches were given a view over an address.
+unsafe fn note_dispatch_views(this: *mut c_void, pso: usize) {
+    if !diag_views_enabled() {
+        return;
+    }
+    let Some(u) = crate::gpu::uma::get() else { return };
+    let (layout, args) = with(this, |s| (s.layout.clone(), s.args.clone()));
+    let Some(layout) = layout else { return };
+    let word = |at: usize| args.get(at..at + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).unwrap_or(0);
+    for p in layout.params.iter() {
+        let Param::Table { at } = *p else { continue };
+        let t = word(at as usize);
+        if t == 0 {
+            continue;
+        }
+        for k in 0..8u32 {
+            let Some(w) = super::console_heap::words_at(t.wrapping_add(32 * k)) else { break };
+            let base = ((w[1] as u64 & 0xFFFF) << 32) | w[0] as u64;
+            let stride = ((w[1] >> 16) & 0x3FFF) as u64;
+            let bytes = if stride == 0 { w[2] as u64 } else { w[2] as u64 * stride };
+            if bytes == 0 || bytes > 1 << 30 || u.window_of(base as usize).is_none() {
+                continue;
+            }
+            super::real::note_dispatch_view(base, bytes, pso);
+        }
+    }
+}
+
 /// `Dispatch` / `DispatchX(x, y, z, flags)`.
 pub(super) unsafe fn dispatch_flags(this: *mut c_void, x: u32, y: u32, z: u32, flags: u32) {
     if !bvh_builder_runs(flags, bvh_builder_enabled()) {
@@ -3298,6 +3402,7 @@ pub(super) unsafe fn dispatch_flags(this: *mut c_void, x: u32, y: u32, z: u32, f
         return;
     }
     let pso = with(this, |s| s.pso);
+    note_dispatch_views(this, pso);
     let _c = capture_work(this, || captured_dispatch(pso, [x, y, z], flags), false);
     // (recorded at the submit through this call, with everything below: counted there)
     if super::pso_async::waits_for(pso) && super::list_x::defer(this, super::list_x::Deferred::Dispatch(x, y, z, flags)) {
@@ -3450,6 +3555,7 @@ pub(super) unsafe extern "system" fn allocate_upload_memory(this: *mut c_void, s
     let align = align.max(16);
     if size <= crate::gpu::uma::ARENA_BLOCK / 2 {
         if let Some(p) = with(this, |s| s.arena.take(u, size, align, &mut s.uma)) {
+            crate::hle::kernelx::pagelog::note("upload memory given to the title (list arena)", p as usize, 0, size);
             return p;
         }
     }
@@ -3605,12 +3711,14 @@ pub(super) unsafe fn rebind(this: *mut c_void, list: &ID3D12GraphicsCommandList,
     if gfx {
         list.SetGraphicsRootSignature(&b.rs);
         for (k, v) in b.views.iter().enumerate() {
+            super::real::note_root_view(list.as_raw() as usize, k as u32, *v);
             list.SetGraphicsRootUnorderedAccessView(k as u32, *v);
         }
         list.SetPipelineState(&b.pso);
     } else {
         list.SetComputeRootSignature(&b.rs);
         for (k, v) in b.views.iter().enumerate() {
+            super::real::note_root_view(list.as_raw() as usize, k as u32, *v);
             list.SetComputeRootUnorderedAccessView(k as u32, *v);
         }
         // (resolved here, and a compute pipeline has none of the state the hook of a title's call keeps)

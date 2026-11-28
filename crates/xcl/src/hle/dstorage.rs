@@ -861,7 +861,7 @@ fn cpu_range_in(p: usize, n: usize, in_view: impl Fn(usize) -> bool) -> Option<u
 /// Whether `n` bytes at `p` are committed, writable memory.
 fn writable(p: usize, n: usize) -> bool {
     let Some(end) = p.checked_add(n) else { return false };
-    crate::hle::kernelx::lazy::ensure(p, n);
+    let _opened = crate::hle::kernelx::lazy::ensure(p, n);
     if crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(p, n)) {
         return true;
     }

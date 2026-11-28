@@ -17,7 +17,8 @@
 //! the shaders wrote reaches the next depth test or sampling). A transition names the state it
 //! leaves and the one it enters, so each copy starts and ends in states the title gave.
 //!
-//! Behind `XCL_DEPTH_UAV_TWIN=1`; with the switch off nothing is registered, a UAV of a depth
+//! On unless `XCL_DEPTH_UAV_TWIN=0` (a title that names layouts moves its buffers through
+//! `barrier_groups`, whose transitions reach `plan_barriers`); with the switch off nothing is registered, a UAV of a depth
 //! buffer stays a null view and every hook stops at one atomic load.
 //!
 //! (After the depth+UAV twins of xcl-dev/xcl#1989 by raylitebull: registering at creation, DSVs,
@@ -40,7 +41,7 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use super::sharded::Sharded;
 
 /// The switch's value when `XCL_DEPTH_UAV_TWIN` is not set.
-const DEFAULT_ON: bool = false;
+const DEFAULT_ON: bool = true;
 
 /// Whether depth buffers with unordered access are kept (`XCL_DEPTH_UAV_TWIN`).
 pub(super) fn enabled() -> bool {
@@ -115,6 +116,10 @@ struct Twin {
     res: ID3D12Resource,
     /// its number in the log (`#n`)
     n: u64,
+    /// a stencil plane's twin: the buffer the two are copied through (no colour format shares
+    /// a family with a depth-stencil one, but the PC copies between a buffer and one plane);
+    /// it rests in COPY_DEST
+    through: Option<ID3D12Resource>,
 }
 
 // D3D12 resources are free-threaded
@@ -375,7 +380,8 @@ unsafe fn plane_twin(o: &Object, plane: usize, dev: *mut c_void) -> Option<(ID3D
     let t = make_twin(dev, &key, twin_format(key.format, o.cell.console_format, plane))?;
     TWINS.fetch_add(1, Ordering::Relaxed);
     let n = MADE.fetch_add(1, Ordering::Relaxed) + 1;
-    inner.twins[plane] = Some(Twin { res: t.clone(), n });
+    let through = if plane == 1 { make_through(dev, &key) } else { None };
+    inner.twins[plane] = Some(Twin { res: t.clone(), n, through });
     o.cell.twinned.store(true, Ordering::Relaxed);
     // (the state of the title's object; that of the UAV's own when the title made none)
     let state = inner.made_in.unwrap_or(o.state);
@@ -451,9 +457,30 @@ pub(super) struct PlaneCopy {
     pub mips: u16,
 }
 
+/// A copy between stencil plane subresources of a title's object and the same ones of the
+/// stencil twin, through the twin's buffer.
+pub(super) struct StencilCopy {
+    /// the object the title's transition names
+    pub depth: usize,
+    /// the stencil plane's subresources it copies, as the twin numbers them (the buffer's are
+    /// these + `first`)
+    pub subs: Vec<u32>,
+    /// the buffer's first stencil plane subresource
+    pub first: u32,
+    pub twin: ID3D12Resource,
+    pub through: ID3D12Resource,
+    pub width: u32,
+    pub height: u32,
+    pub mips: u16,
+}
+
 /// What goes on the PC list with a title's barriers (`plan_barriers`).
 #[derive(Default)]
 pub(super) struct Plan {
+    /// before them, and before `to_plane`: stencil twins into stencil planes (the buffer in PARK)
+    pub stencil_to_plane: Vec<StencilCopy>,
+    /// after them, and after `to_twin`: stencil planes into their twins (the buffer in PARK)
+    pub stencil_to_twin: Vec<StencilCopy>,
     /// before them: twins into depth planes (the buffer goes PARK → COPY_DEST / DEPTH_WRITE, the
     /// title's transition takes it on from there; the twin UNORDERED_ACCESS → COPY_SOURCE/SRV and back)
     pub to_plane: Vec<PlaneCopy>,
@@ -531,6 +558,32 @@ fn plan_with(barriers: &mut Vec<[u32; 8]>, direct: bool, in_step: &mut Vec<u64>,
         }
         let key = o.cell.key;
         let r24g8_steps = (key.format == 44).then(|| matches!(o.cell.console_format, 118..=120));
+        // the stencil plane's subresources the transition names, and its twin when shaders were
+        // given one: what they store there (a title's masks for its lighting) reaches the plane
+        // on the way out of UNORDERED_ACCESS, and what was drawn into the plane reaches the twin
+        // on the way in
+        let stencil_subs: Vec<u32> = if sub == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES { (0..n).collect() } else { (sub >= n && sub < 2 * n).then_some(sub - n).into_iter().collect() };
+        let stencil = (direct && !stencil_subs.is_empty() && matches!(key.format, 19 | 44)).then(|| stencil_twin_if_made(&o)).flatten().map(|(twin, through)| StencilCopy {
+            depth: res,
+            subs: stencil_subs,
+            first: n,
+            twin,
+            through,
+            width: key.width,
+            height: key.height,
+            mips: key.mips.max(1),
+        });
+        if let Some(s) = stencil {
+            let c = STENCIL_COPIES[leaving as usize].fetch_add(1, Ordering::Relaxed) + 1;
+            if c <= 2 || c.is_power_of_two() {
+                crate::xlog_info!("D3D12.X: depth UAV twin: the stencil plane of depth buffer {res:#x} ({}x{}) and its twin: {} ({c} such copies so far)", key.width, key.height, if leaving { "the twin is copied into the plane on the way out of UNORDERED_ACCESS" } else { "the plane is copied into the twin on the way into UNORDERED_ACCESS" });
+            }
+            if leaving {
+                plan.stencil_to_plane.push(s);
+            } else {
+                plan.stencil_to_twin.push(s);
+            }
+        }
         if leaving {
             before = PARK;
             // (a twin whose last way in was not copied holds something else than the plane: not
@@ -605,6 +658,57 @@ fn plan_with(barriers: &mut Vec<[u32; 8]>, direct: bool, in_step: &mut Vec<u64>,
     }
     *barriers = out;
     plan
+}
+
+/// Copies of a stencil plane into its twin, and of a twin into its plane.
+static STENCIL_COPIES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Copies of stencil planes into their twins, and of twins into their planes, so far.
+pub(super) fn stencil_copies() -> (u64, u64) {
+    (STENCIL_COPIES[0].load(Ordering::Relaxed), STENCIL_COPIES[1].load(Ordering::Relaxed))
+}
+
+/// The stencil twin of `o`'s buffer and the buffer the two are copied through, when it has both.
+fn stencil_twin_if_made(o: &Object) -> Option<(ID3D12Resource, ID3D12Resource)> {
+    let inner = o.cell.inner.lock().unwrap();
+    let t = inner.twins[1].as_ref()?;
+    Some((t.res.clone(), t.through.clone()?))
+}
+
+/// The row pitch of an 8-bit plane `width` texels wide in a buffer (D3D12_TEXTURE_DATA_PITCH_ALIGNMENT).
+pub(super) fn stencil_pitch(width: u32) -> u32 {
+    width.max(1).next_multiple_of(256)
+}
+
+/// The buffer a stencil plane of `key`'s shape and its twin are copied through: room for the
+/// largest subresource (one is copied at a time), resting in COPY_DEST.
+unsafe fn make_through(dev: *mut c_void, key: &Key) -> Option<ID3D12Resource> {
+    if dev.is_null() {
+        return None;
+    }
+    let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: (stencil_pitch(key.width) as u64 * key.height.max(1) as u64).next_multiple_of(0x1_0000),
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        ..Default::default()
+    };
+    let mut out = std::ptr::null_mut();
+    let hr = super::real::dev_create_committed_resource(
+        dev,
+        &heap as *const _ as usize,
+        0,
+        &desc as *const _ as usize,
+        D3D12_RESOURCE_STATE_COPY_DEST.0 as usize,
+        0,
+        &ID3D12Resource::IID as *const _ as *const windows_sys::core::GUID,
+        &mut out,
+    );
+    (hr >= 0 && !out.is_null()).then(|| ID3D12Resource::from_raw(out))
 }
 
 /// The depth twin of `o`'s buffer when it has one, and its number.
@@ -1220,10 +1324,9 @@ fn plane_view(view: Option<&D3D12_UNORDERED_ACCESS_VIEW_DESC>, array: u16) -> D3
     v
 }
 
-/// (tests) Whether `res` is kept.
-#[cfg(test)]
+/// Whether `res` is kept (`barrier_groups`: its way into UNORDERED_ACCESS is `plan_barriers`'s).
 pub(super) fn kept(res: usize) -> bool {
-    OBJECTS.contains(res)
+    any_kept() && OBJECTS.contains(res)
 }
 
 /// (tests) The state line L2 gives for the buffer `res` is in, and whether that buffer has a
@@ -1707,7 +1810,7 @@ mod tests {
         {
             let o = OBJECTS.get(buffer).unwrap();
             TWINS.fetch_add(1, Ordering::Relaxed);
-            o.cell.inner.lock().unwrap().twins[1] = Some(Twin { res: unsafe { ID3D12Resource::from_raw(fake) }, n: 0 });
+            o.cell.inner.lock().unwrap().twins[1] = Some(Twin { res: unsafe { ID3D12Resource::from_raw(fake) }, n: 0, through: None });
         }
         let t = fake as usize;
         let before = clears();
@@ -1738,7 +1841,7 @@ mod tests {
     fn plant_depth_twin(res: usize, t: &ID3D12Resource) {
         let o = OBJECTS.get(res).unwrap();
         TWINS.fetch_add(1, Ordering::Relaxed);
-        o.cell.inner.lock().unwrap().twins[0] = Some(Twin { res: t.clone(), n: 0 });
+        o.cell.inner.lock().unwrap().twins[0] = Some(Twin { res: t.clone(), n: 0, through: None });
     }
 
     fn tr(res: usize, sub: u32, before: u32, after: u32) -> [u32; 8] {

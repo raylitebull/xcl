@@ -212,8 +212,11 @@ unsafe fn pass(list: &ID3D12GraphicsCommandList, args: usize, off: u64, io_limit
     list.SetComputeRoot32BitConstant(0, slot as u32, 0);
     // (as `bind::fold_counts_within` bounds the product)
     list.SetComputeRoot32BitConstant(0, most.saturating_add(crate::gpu::recomp::FOLD_X), 1);
+    super::real::note_root_view(list.as_raw() as usize, 1, res.GetGPUVirtualAddress() + off);
     list.SetComputeRootUnorderedAccessView(1, res.GetGPUVirtualAddress() + off);
+    super::real::note_root_view(list.as_raw() as usize, 2, c.gpu);
     list.SetComputeRootUnorderedAccessView(2, c.gpu);
+    super::real::note_root_view(list.as_raw() as usize, 3, io_limit);
     list.SetComputeRootUnorderedAccessView(3, io_limit);
     list.Dispatch(1, 1, 1);
     // the slot for the dispatch's arguments; the io word for its program (a UAV barrier on all)

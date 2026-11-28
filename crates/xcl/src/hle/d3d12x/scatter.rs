@@ -126,8 +126,11 @@ impl Scatter {
     pub unsafe fn dispatch(&self, list: &ID3D12GraphicsCommandList, chunks: usize, ring_va: u64, to_va: u64) {
         debug_assert!(chunks > 0 && chunks <= MAX_CHUNKS);
         list.SetComputeRoot32BitConstant(0, chunks as u32, 0);
+        super::real::note_root_view(list.as_raw() as usize, 1, ring_va);
         list.SetComputeRootShaderResourceView(1, ring_va);
+        super::real::note_root_view(list.as_raw() as usize, 2, ring_va + Self::data_at(chunks) as u64);
         list.SetComputeRootShaderResourceView(2, ring_va + Self::data_at(chunks) as u64);
+        super::real::note_root_view(list.as_raw() as usize, 3, to_va);
         list.SetComputeRootUnorderedAccessView(3, to_va);
         list.Dispatch(chunks.div_ceil(GROUP) as u32, 1, 1);
     }

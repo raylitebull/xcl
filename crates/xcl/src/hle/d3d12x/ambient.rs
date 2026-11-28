@@ -11,7 +11,19 @@
 //! * `0` / `off` / `none`: disabled.
 //!
 //! Tunables: `XCL_AMBIENT_GAIN`, `XCL_AMBIENT_POWER`, `XCL_AMBIENT_LEAST`, `XCL_AMBIENT_AO`,
-//! `XCL_AMBIENT_REFLECT`, `XCL_AMBIENT_SETTLE_MS`, `XCL_AMBIENT_AIR`.
+//! `XCL_AMBIENT_REFLECT`, `XCL_AMBIENT_SETTLE_MS`, `XCL_AMBIENT_AIR`, `XCL_AMBIENT_FRAME`,
+//! `XCL_AMBIENT_KEEP`.
+//!
+//! The sky alone leaves a night scene black wherever no lamp reaches. So the fill is also raised
+//! to an estimate taken from the frame itself: the light the visible surfaces send out, which the
+//! title keeps for its own screen traces (`CS_CacheScreenSpaceRadiance`, the frame before), is
+//! averaged in 64x36 cells right after that program, and every texel of the resolve's output gets
+//! `XCL_AMBIENT_FRAME` (default 0.8; 0: off) of the cells around it, a fifth of it their slow
+//! mean. The idea and the 64x36 cells, the 5x5 taps, the damping of lamps and the slow mean with
+//! its jump are from mavis-9070xt's fork of VIctory (GPL-3.0-or-later),
+//! `crates/victory-gpu/src/ambient.rs` (`keep`, `mean`, `raise`), after beloooo's
+//! VIctory-Belobug-AMD. Not ported (2026-11-28): the directional gather at 160x90 points, the
+//! normal rebuilt from depth and the bound on the title's own value.
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
@@ -45,6 +57,7 @@ struct Config {
     reflect: f32,
     settle_ms: f32,
     air: f32,
+    frame: f32,
 }
 
 impl Default for Config {
@@ -58,6 +71,7 @@ impl Default for Config {
             reflect: 0.50,
             settle_ms: 250.0,
             air: 0.0,
+            frame: 0.8,
         }
     }
 }
@@ -92,6 +106,7 @@ fn config() -> &'static Config {
             reflect: env_f32("XCL_AMBIENT_REFLECT", def.reflect, 0.05, 4.0),
             settle_ms: env_f32("XCL_AMBIENT_SETTLE_MS", def.settle_ms, 0.0, 10_000.0),
             air: env_f32("XCL_AMBIENT_AIR", def.air, 0.0, 16.0),
+            frame: env_f32("XCL_AMBIENT_FRAME", def.frame, 0.0, 4.0),
         }
     })
 }
@@ -127,6 +142,23 @@ pub fn active() -> bool {
     }
 }
 
+/// Whether the fill keeps what the title's own resolve stored where that is the larger
+/// (`XCL_AMBIENT_KEEP=1` / `=0`). Unset: kept, unless programs that feed the resolve are left out
+/// (`XCL_RT_LEAVE_OUT`) – then what it stores is made of memory nothing wrote this frame (on a
+/// retail title: one colour all over, as bright as the fill's cap lets it be).
+fn keeps_title_light() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| keeps(std::env::var("XCL_AMBIENT_KEEP").ok().as_deref(), crate::gpu::rt_leave_out::enabled()))
+}
+
+fn keeps(switch: Option<&str>, programs_left_out: bool) -> bool {
+    match switch.map(str::trim) {
+        Some("1") => true,
+        Some("0") => false,
+        _ => !programs_left_out,
+    }
+}
+
 /// The title's rays bring no light: traversal is held back, or runs with every ray missing.
 fn rays_find_nothing(traversal_allowed: bool, every_ray_misses: bool) -> bool {
     !traversal_allowed || every_ray_misses
@@ -139,6 +171,8 @@ pub(super) enum PassRole {
     TemporalResolve,
     ReflectionHistory,
     InscatteringVolume,
+    /// keeps the light visible surfaces send out (`CS_CacheScreenSpaceRadiance`)
+    Radiance,
 }
 
 fn contains_ascii_ci(haystack: &[u8], needle: &[u8]) -> bool {
@@ -163,6 +197,8 @@ fn classify_cs(blob: &[u8]) -> Option<PassRole> {
         Some(PassRole::ReflectionHistory)
     } else if contains_ascii_ci(blob, b"CS_AccumulateLocalLightInscatteringVolume") {
         Some(PassRole::InscatteringVolume)
+    } else if contains_ascii_ci(blob, b"CS_CacheScreenSpaceRadiance") {
+        Some(PassRole::Radiance)
     } else {
         None
     }
@@ -371,6 +407,10 @@ fn score_dispatch_target_for_role(role: PassRole, rd: &D3D12_RESOURCE_DESC, view
     if role == PassRole::ReflectionHistory && view_fmt == 42 {
         return None;
     }
+    // (the light of visible surfaces is R11G11B10_FLOAT)
+    if role == PassRole::Radiance && view_fmt != 26 {
+        return None;
+    }
     score_dispatch_target(rd, view_fmt, groups)
 }
 
@@ -495,6 +535,8 @@ struct AmbientDevice {
     fill_r9_pso: ID3D12PipelineState,
     reflect_pso: ID3D12PipelineState,
     air_pso: ID3D12PipelineState,
+    keep_pso: ID3D12PipelineState,
+    mean_pso: ID3D12PipelineState,
     sky_copy: ID3D12Resource,
     sky_level: ID3D12Resource,
     dummy_depth: ID3D12Resource,
@@ -505,6 +547,7 @@ struct AmbientDevice {
     next_group: AtomicU32,
     sky_ready: AtomicBool,
     last_sky_us: AtomicU64,
+    last_keep_us: AtomicU64,
 }
 
 unsafe impl Send for AmbientDevice {}
@@ -587,6 +630,80 @@ void main(uint3 gtid : SV_GroupThreadID, uint gidx : SV_GroupIndex) {
 }
 "#;
 
+/// The cells the frame's light is kept in, and the float4s of the level buffer: the sky's level,
+/// the cells' slow mean, the cells.
+const FRAME_CELLS: (u32, u32) = (64, 36);
+const LEVEL_ELEMENTS: u32 = 2 + FRAME_CELLS.0 * FRAME_CELLS.1;
+/// A change of the cells' mean by more than this factor is taken at once (a cut, a new room).
+const FRAME_JUMP: f32 = 3.0;
+
+/// The light visible surfaces send out (`out_uav`, read only), averaged into the 64x36 cells of
+/// the level buffer, `share` of it. Lamps and glints count, but not for everything.
+const FRAME_KEEP_HLSL: &str = r#"
+Texture2D<float> _unused : register(t0);
+RWTexture2D<float4> out_uav : register(u0);
+RWStructuredBuffer<float4> sky_level : register(u1);
+cbuffer C : register(b0) {
+    uint width;
+    uint height;
+    uint _u2;
+    uint _u3;
+    uint _u4;
+    float share;
+    float _p6;
+    float _p7;
+};
+[numthreads(8, 8, 1)]
+void main(uint3 at : SV_DispatchThreadID) {
+    if (at.x >= 64 || at.y >= 36 || width == 0 || height == 0) return;
+    float3 sum = float3(0.0, 0.0, 0.0);
+    [loop]
+    for (uint y = 0; y < 5; ++y) {
+        [loop]
+        for (uint x = 0; x < 5; ++x) {
+            float2 at_texel = (float2(at.xy) + (float2(x, y) + 0.5) / 5.0) * float2(width, height) / float2(64.0, 36.0);
+            uint2 p = min(uint2(at_texel), uint2(width - 1, height - 1));
+            float3 c = out_uav[p].rgb;
+            c = all(isfinite(c)) ? max(c, 0.0) : float3(0.0, 0.0, 0.0);
+            sum += c / max(1.0, dot(c, float3(0.2126, 0.7152, 0.0722)) / 20.0);
+        }
+    }
+    sky_level[2 + at.y * 64 + at.x] = float4(sum * (share / 25.0), 1.0);
+}
+"#;
+
+/// The slow mean of the cells: `follow` of the way to this frame's mean, all of it when the mean
+/// changed by more than `jump` either way.
+const FRAME_MEAN_HLSL: &str = r#"
+RWStructuredBuffer<float4> sky_level : register(u1);
+cbuffer C : register(b0) {
+    uint _u0;
+    uint _u1;
+    uint _u2;
+    uint _u3;
+    uint _u4;
+    float follow;
+    float jump;
+    float _p7;
+};
+[numthreads(1, 1, 1)]
+void main() {
+    float3 sum = float3(0.0, 0.0, 0.0);
+    [loop]
+    for (uint i = 0; i < 2304; ++i) {
+        float3 c = sky_level[2 + i].rgb;
+        sum += all(isfinite(c)) ? c : float3(0.0, 0.0, 0.0);
+    }
+    float3 now = sum / 2304.0;
+    float4 was = sky_level[1];
+    bool kept = was.a > 0.0 && all(isfinite(was.rgb));
+    float a = max(dot(now, float3(0.2126, 0.7152, 0.0722)), 1e-5);
+    float b = max(dot(was.rgb, float3(0.2126, 0.7152, 0.0722)), 1e-5);
+    bool jumped = jump > 0.0 && max(a / b, b / a) > jump;
+    sky_level[1] = float4(kept ? lerp(was.rgb, now, jumped ? 1.0 : saturate(follow)) : now, 1.0);
+}
+"#;
+
 /// Screen-space radiance floor + 8-tap IGN-rotated golden-angle horizon crease AO + outlier
 /// probe tile suppression (requires typed UAV load on `out_uav`).
 const AMBIENT_FILL_HLSL: &str = r#"
@@ -603,6 +720,27 @@ cbuffer C : register(b0) {
     uint sky_ready;
     float fallback_level;
 };
+// The light the frame before sent out around this texel: 64x36 cells from `sky_level[2]` on,
+// their slow mean at `sky_level[1]` (its fourth part 0: nothing kept yet, no light).
+float3 frame_light(uint2 tid) {
+    float4 mean = sky_level[1];
+    if (!(mean.a > 0.0)) {
+        return float3(0.0, 0.0, 0.0);
+    }
+    float2 g = (float2(tid) + 0.5) / float2(max(width, 1u), max(height, 1u)) * float2(64.0, 36.0) - 0.5;
+    int2 g0 = int2(floor(g));
+    float2 f = g - float2(g0);
+    float3 sum = float3(0.0, 0.0, 0.0);
+    [unroll]
+    for (int k = 0; k < 4; ++k) {
+        int2 q = clamp(g0 + int2(k & 1, k >> 1), int2(0, 0), int2(63, 35));
+        float wx = (k & 1) ? f.x : 1.0 - f.x;
+        float wy = (k >> 1) ? f.y : 1.0 - f.y;
+        sum += wx * wy * sky_level[2 + q.y * 64 + q.x].rgb;
+    }
+    float3 found = lerp(sum, mean.rgb, 0.2);
+    return all(isfinite(found)) ? clamp(found, 0.0, 16.0) : float3(0.0, 0.0, 0.0);
+}
 float horizon_crease_ao(uint2 tid, int2 dc, int2 maxc) {
     float d0 = depth_tex.Load(int3(dc, 0));
     if (!isfinite(d0) || d0 <= 1e-5 || d0 >= 0.99999) {
@@ -633,7 +771,8 @@ float horizon_crease_ao(uint2 tid, int2 dc, int2 maxc) {
 [numthreads(8, 8, 1)]
 void main(uint3 tid : SV_DispatchThreadID) {
     if (tid.x >= width || tid.y >= height) return;
-    float3 amb = (sky_ready != 0) ? sky_level[0].rgb : float3(fallback_level, fallback_level, fallback_level);
+    float3 amb = ((sky_ready & 1u) != 0u) ? sky_level[0].rgb : float3(fallback_level, fallback_level, fallback_level);
+    amb = max(amb, frame_light(tid.xy));
     float ao = 1.0;
     if (has_depth != 0 && depth_w > 0 && depth_h > 0) {
         int2 dc = int2(
@@ -648,6 +787,9 @@ void main(uint3 tid : SV_DispatchThreadID) {
     float cap_lum = 4.0 * amb_lum;
     float4 cur = out_uav[tid.xy];
     float3 existing = all(isfinite(cur.rgb)) ? max(cur.rgb, 0.0) : float3(0.0, 0.0, 0.0);
+    if ((sky_ready & 2u) == 0u) {
+        existing = float3(0.0, 0.0, 0.0);
+    }
     if (existing.g < 0.5 * min(existing.r, existing.b) && max(existing.r, existing.b) > 0.02) {
         existing = float3(0.0, 0.0, 0.0);
     }
@@ -690,6 +832,27 @@ uint pack_r9g9b9e5(float3 c) {
     uint3 m = min(uint3(floor(c * inv_s + 0.5)), uint3(511u, 511u, 511u));
     return m.r | (m.g << 9) | (m.b << 18) | (uint(e) << 27);
 }
+// The light the frame before sent out around this texel: 64x36 cells from `sky_level[2]` on,
+// their slow mean at `sky_level[1]` (its fourth part 0: nothing kept yet, no light).
+float3 frame_light(uint2 tid) {
+    float4 mean = sky_level[1];
+    if (!(mean.a > 0.0)) {
+        return float3(0.0, 0.0, 0.0);
+    }
+    float2 g = (float2(tid) + 0.5) / float2(max(width, 1u), max(height, 1u)) * float2(64.0, 36.0) - 0.5;
+    int2 g0 = int2(floor(g));
+    float2 f = g - float2(g0);
+    float3 sum = float3(0.0, 0.0, 0.0);
+    [unroll]
+    for (int k = 0; k < 4; ++k) {
+        int2 q = clamp(g0 + int2(k & 1, k >> 1), int2(0, 0), int2(63, 35));
+        float wx = (k & 1) ? f.x : 1.0 - f.x;
+        float wy = (k >> 1) ? f.y : 1.0 - f.y;
+        sum += wx * wy * sky_level[2 + q.y * 64 + q.x].rgb;
+    }
+    float3 found = lerp(sum, mean.rgb, 0.2);
+    return all(isfinite(found)) ? clamp(found, 0.0, 16.0) : float3(0.0, 0.0, 0.0);
+}
 float horizon_crease_ao(uint2 tid, int2 dc, int2 maxc) {
     float d0 = depth_tex.Load(int3(dc, 0));
     if (!isfinite(d0) || d0 <= 1e-5 || d0 >= 0.99999) {
@@ -720,8 +883,8 @@ float horizon_crease_ao(uint2 tid, int2 dc, int2 maxc) {
 [numthreads(8, 8, 1)]
 void main(uint3 tid : SV_DispatchThreadID) {
     if (tid.x >= width || tid.y >= height) return;
-    float3 raw_amb = (sky_ready != 0) ? sky_level[0].rgb : float3(fallback_level, fallback_level, fallback_level);
-    float3 amb = clamp(raw_amb, 0.0, 0.65);
+    float3 raw_amb = ((sky_ready & 1u) != 0u) ? sky_level[0].rgb : float3(fallback_level, fallback_level, fallback_level);
+    float3 amb = max(clamp(raw_amb, 0.0, 0.65), frame_light(tid.xy));
     float ao = 1.0;
     if (has_depth != 0 && depth_w > 0 && depth_h > 0) {
         int2 dc = int2(
@@ -733,7 +896,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
     }
     float3 amb_ao = amb * ao;
     float3 existing = unpack_r9g9b9e5(out_uav[tid.xy]);
-    if (!all(isfinite(existing))) existing = float3(0.0, 0.0, 0.0);
+    if (!all(isfinite(existing)) || (sky_ready & 2u) == 0u) existing = float3(0.0, 0.0, 0.0);
     if (existing.g < 0.5 * min(existing.r, existing.b) && max(existing.r, existing.b) > 0.02) {
         existing = float3(0.0, 0.0, 0.0);
     }
@@ -762,6 +925,27 @@ cbuffer C : register(b0) {
     uint sky_ready;
     float fallback_level;
 };
+// The light the frame before sent out around this texel: 64x36 cells from `sky_level[2]` on,
+// their slow mean at `sky_level[1]` (its fourth part 0: nothing kept yet, no light).
+float3 frame_light(uint2 tid) {
+    float4 mean = sky_level[1];
+    if (!(mean.a > 0.0)) {
+        return float3(0.0, 0.0, 0.0);
+    }
+    float2 g = (float2(tid) + 0.5) / float2(max(width, 1u), max(height, 1u)) * float2(64.0, 36.0) - 0.5;
+    int2 g0 = int2(floor(g));
+    float2 f = g - float2(g0);
+    float3 sum = float3(0.0, 0.0, 0.0);
+    [unroll]
+    for (int k = 0; k < 4; ++k) {
+        int2 q = clamp(g0 + int2(k & 1, k >> 1), int2(0, 0), int2(63, 35));
+        float wx = (k & 1) ? f.x : 1.0 - f.x;
+        float wy = (k >> 1) ? f.y : 1.0 - f.y;
+        sum += wx * wy * sky_level[2 + q.y * 64 + q.x].rgb;
+    }
+    float3 found = lerp(sum, mean.rgb, 0.2);
+    return all(isfinite(found)) ? clamp(found, 0.0, 16.0) : float3(0.0, 0.0, 0.0);
+}
 float horizon_crease_ao(uint2 tid, int2 dc, int2 maxc) {
     float d0 = depth_tex.Load(int3(dc, 0));
     if (!isfinite(d0) || d0 <= 1e-5 || d0 >= 0.99999) {
@@ -792,7 +976,8 @@ float horizon_crease_ao(uint2 tid, int2 dc, int2 maxc) {
 [numthreads(8, 8, 1)]
 void main(uint3 tid : SV_DispatchThreadID) {
     if (tid.x >= width || tid.y >= height) return;
-    float3 amb = (sky_ready != 0) ? sky_level[0].rgb : float3(fallback_level, fallback_level, fallback_level);
+    float3 amb = ((sky_ready & 1u) != 0u) ? sky_level[0].rgb : float3(fallback_level, fallback_level, fallback_level);
+    amb = max(amb, frame_light(tid.xy));
     float ao = 1.0;
     if (has_depth != 0 && depth_w > 0 && depth_h > 0) {
         int2 dc = int2(
@@ -873,6 +1058,8 @@ unsafe fn build_device(dev: &ID3D12Device) -> Option<AmbientDevice> {
     let fill_r9_bc = compile_cs_sm5(AMBIENT_FILL_R9G9B9E5_HLSL)?;
     let reflect_bc = compile_cs_sm5(REFLECT_CLAMP_HLSL)?;
     let air_bc = compile_cs_sm5(AIR_CAP_HLSL)?;
+    let keep_bc = compile_cs_sm5(FRAME_KEEP_HLSL)?;
+    let mean_bc = compile_cs_sm5(FRAME_MEAN_HLSL)?;
 
     // Shared compute RS: [0] 8 root constants (b0), [1] 1 SRV (t0), [2] 2 UAVs (u0..u1)
     let srv_range = D3D12_DESCRIPTOR_RANGE {
@@ -971,6 +1158,8 @@ unsafe fn build_device(dev: &ID3D12Device) -> Option<AmbientDevice> {
     let fill_r9_pso = make_cs(&fill_r9_bc, "xcl ambient fill_r9")?;
     let reflect_pso = make_cs(&reflect_bc, "xcl ambient reflect_clamp")?;
     let air_pso = make_cs(&air_bc, "xcl ambient air_cap")?;
+    let keep_pso = make_cs(&keep_bc, "xcl ambient frame_keep")?;
+    let mean_pso = make_cs(&mean_bc, "xcl ambient frame_mean")?;
 
     let default_hp = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
     let make_res = |rd: &D3D12_RESOURCE_DESC, init: D3D12_RESOURCE_STATES| -> Option<ID3D12Resource> {
@@ -995,7 +1184,7 @@ unsafe fn build_device(dev: &ID3D12Device) -> Option<AmbientDevice> {
     let sky_level = make_res(
         &D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-            Width: 256,
+            Width: (LEVEL_ELEMENTS as u64 * 16).next_multiple_of(256),
             Height: 1,
             DepthOrArraySize: 1,
             MipLevels: 1,
@@ -1043,6 +1232,8 @@ unsafe fn build_device(dev: &ID3D12Device) -> Option<AmbientDevice> {
         fill_r9_pso,
         reflect_pso,
         air_pso,
+        keep_pso,
+        mean_pso,
         sky_copy,
         sky_level,
         dummy_depth,
@@ -1053,6 +1244,7 @@ unsafe fn build_device(dev: &ID3D12Device) -> Option<AmbientDevice> {
         next_group: AtomicU32::new(0),
         sky_ready: AtomicBool::new(false),
         last_sky_us: AtomicU64::new(0),
+        last_keep_us: AtomicU64::new(0),
     })
 }
 
@@ -1147,7 +1339,7 @@ pub(super) unsafe fn after_draw(list: *mut c_void, pso_resolved: usize) {
         Format: DXGI_FORMAT_UNKNOWN,
         ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
         Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
-            Buffer: D3D12_BUFFER_UAV { FirstElement: 0, NumElements: 1, StructureByteStride: 16, ..Default::default() },
+            Buffer: D3D12_BUFFER_UAV { FirstElement: 0, NumElements: LEVEL_ELEMENTS, StructureByteStride: 16, ..Default::default() },
         },
     };
     create_srv(dev_raw, ad.sky_copy.as_raw(), &sky_srv, cpu0 as usize);
@@ -1424,11 +1616,11 @@ pub(super) unsafe fn after_compute_dispatch(
         return;
     }
     let Some(role) = role_of(pso_resolved) else { return };
-    if !matches!(role, PassRole::TemporalResolve | PassRole::ReflectionHistory | PassRole::InscatteringVolume) {
+    if !matches!(role, PassRole::TemporalResolve | PassRole::ReflectionHistory | PassRole::InscatteringVolume | PassRole::Radiance) {
         return;
     }
     let cfg = config();
-    if role == PassRole::InscatteringVolume && cfg.air <= 0.0 {
+    if role == PassRole::InscatteringVolume && cfg.air <= 0.0 || role == PassRole::Radiance && cfg.frame <= 0.0 {
         return;
     }
     let ty = list_x::tracked_list_type(list);
@@ -1454,7 +1646,8 @@ pub(super) unsafe fn after_compute_dispatch(
     let Some(dev) = dev else { return };
     let Some(ad) = get_device(&dev) else { return };
     let sky_ready = ad.sky_ready.load(Ordering::Acquire);
-    if !sky_ready {
+    // (keeping the frame's light needs no sky)
+    if !sky_ready && role != PassRole::Radiance {
         static NO_SKY: AtomicU64 = AtomicU64::new(0);
         if NO_SKY.fetch_add(1, Ordering::Relaxed) < 2 {
             crate::xlog_info!(
@@ -1479,7 +1672,7 @@ pub(super) unsafe fn after_compute_dispatch(
         return;
     };
     let can_typed_load = typed_uav_load_supported(&dev, DXGI_FORMAT(uav_fmt));
-    if matches!(role, PassRole::ReflectionHistory | PassRole::InscatteringVolume) && !can_typed_load {
+    if matches!(role, PassRole::ReflectionHistory | PassRole::InscatteringVolume | PassRole::Radiance) && !can_typed_load {
         static NO_LOAD: AtomicU64 = AtomicU64::new(0);
         if NO_LOAD.fetch_add(1, Ordering::Relaxed) < 2 {
             crate::xlog_info!("D3D12.X: ambient: {role:?} skipped (typed UAV load unsupported for fmt {uav_fmt})");
@@ -1528,7 +1721,7 @@ pub(super) unsafe fn after_compute_dispatch(
         Format: DXGI_FORMAT_UNKNOWN,
         ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
         Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
-            Buffer: D3D12_BUFFER_UAV { FirstElement: 0, NumElements: 1, StructureByteStride: 16, ..Default::default() },
+            Buffer: D3D12_BUFFER_UAV { FirstElement: 0, NumElements: LEVEL_ELEMENTS, StructureByteStride: 16, ..Default::default() },
         },
     };
     create_srv(dev_raw, depth_raw, &depth_srv, cpu0 as usize);
@@ -1554,7 +1747,7 @@ pub(super) unsafe fn after_compute_dispatch(
             } else {
                 ad.fill_write_pso.as_raw()
             },
-            [w, h, depth_w, depth_h, has_depth, cfg.ao.to_bits(), sky_ready as u32, cfg.least.to_bits()],
+            [w, h, depth_w, depth_h, has_depth, cfg.ao.to_bits(), sky_ready as u32 | (keeps_title_light() as u32) << 1, cfg.least.to_bits()],
             (w.div_ceil(8), h.div_ceil(8), 1),
         ),
         PassRole::ReflectionHistory => (
@@ -1567,6 +1760,11 @@ pub(super) unsafe fn after_compute_dispatch(
             [w, h, d, 0, 0, cfg.air.to_bits(), 0, 0],
             (w.div_ceil(8), h.div_ceil(8), d.div_ceil(2)),
         ),
+        PassRole::Radiance => (
+            ad.keep_pso.as_raw(),
+            [w, h, 0, 0, 0, cfg.frame.to_bits(), 0, 0],
+            (FRAME_CELLS.0.div_ceil(8), FRAME_CELLS.1.div_ceil(8), 1),
+        ),
         PassRole::SkyDome => return,
     };
     set_heaps(list, 1, &heap_raw);
@@ -1578,6 +1776,27 @@ pub(super) unsafe fn after_compute_dispatch(
     set_cs_table(list, 2, gpu0 + inc);
     dispatch(list, disp.0, disp.1, disp.2);
     uav_barrier(list, uav_res);
+    if role == PassRole::Radiance {
+        // the cells' slow mean, by the clock
+        let level = ad.sky_level.as_raw() as usize;
+        uav_barrier(list, level);
+        let now_us = monotonic_us();
+        let prev_us = ad.last_keep_us.swap(now_us, Ordering::AcqRel);
+        let dt_s = if prev_us == 0 { 0.0 } else { now_us.saturating_sub(prev_us) as f32 * 1e-6 };
+        let consts = [0, 0, 0, 0, 0, settle_alpha(dt_s, cfg.settle_ms, prev_us == 0).to_bits(), FRAME_JUMP.to_bits(), 0];
+        super::dred::mark_pipeline(list, ad.mean_pso.as_raw() as usize, ad.mean_pso.as_raw() as usize);
+        set_pso(list, ad.mean_pso.as_raw());
+        set_cs_consts(list, 0, 8, consts.as_ptr(), 0);
+        dispatch(list, 1, 1, 1);
+        uav_barrier(list, level);
+        list_x::restore_after_internal_pass(list, false, true);
+        static KEPT: AtomicU64 = AtomicU64::new(0);
+        let n = KEPT.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 2 || n.is_power_of_two() {
+            crate::xlog_info!("D3D12.X: ambient: the frame's light kept from {w}x{h} fmt {uav_fmt} in {}x{} cells ({n} so far)", FRAME_CELLS.0, FRAME_CELLS.1);
+        }
+        return;
+    }
     list_x::restore_after_internal_pass(list, false, true);
 
     static LOGGED: AtomicU64 = AtomicU64::new(0);
@@ -1601,6 +1820,14 @@ mod tests {
     }
 
     #[test]
+    fn the_titles_own_light_is_kept_unless_the_programs_that_feed_it_are_left_out() {
+        assert!(keeps(None, false));
+        assert!(!keeps(None, true), "left-out programs: the resolve reads memory nothing wrote");
+        assert!(keeps(Some("1"), true) && !keeps(Some(" 0 "), false), "the switch decides");
+        assert!(keeps(Some("x"), false) && !keeps(Some(""), true), "any other value: as unset");
+    }
+
+    #[test]
     fn mode_and_shader_classification_match_expected_passes() {
         assert_eq!(parse_mode(None), Mode::Auto);
         assert_eq!(parse_mode(Some("auto")), Mode::Auto);
@@ -1615,6 +1842,7 @@ mod tests {
 
         assert_eq!(classify_cs(b"ILDN\0CS_ScreenProbes_TemporalResolve\0"), Some(PassRole::TemporalResolve));
         assert_eq!(classify_cs(b"ILDN\0CS_UpdateHistory_16\0"), Some(PassRole::ReflectionHistory));
+        assert_eq!(classify_cs(b"ILDN\0CS_CacheScreenSpaceRadiance\0"), Some(PassRole::Radiance));
         assert_eq!(classify_cs(b"ILDN\0CS_CullInstances\0"), None);
     }
 
@@ -1679,6 +1907,10 @@ mod tests {
         assert!(compile_cs_sm5(AMBIENT_FILL_R9G9B9E5_HLSL).is_some(), "AMBIENT_FILL_R9G9B9E5_HLSL failed D3DCompile");
         assert!(compile_cs_sm5(REFLECT_CLAMP_HLSL).is_some(), "REFLECT_CLAMP_HLSL failed D3DCompile");
         assert!(compile_cs_sm5(AIR_CAP_HLSL).is_some(), "AIR_CAP_HLSL failed D3DCompile");
+        assert!(compile_cs_sm5(FRAME_KEEP_HLSL).is_some(), "FRAME_KEEP_HLSL failed D3DCompile");
+        assert!(compile_cs_sm5(FRAME_MEAN_HLSL).is_some(), "FRAME_MEAN_HLSL failed D3DCompile");
+        // the cells the fills read are the cells the keeping writes, and the mean sums all of them
+        assert_eq!((FRAME_CELLS, LEVEL_ELEMENTS), ((64, 36), 2 + 2304));
     }
 
     #[test]
@@ -1703,6 +1935,10 @@ mod tests {
         assert!(score_dispatch_target_for_role(PassRole::TemporalResolve, &r9_probe, DXGI_FORMAT_R32_UINT.0, [320, 360, 1]).is_some());
         assert!(score_dispatch_target_for_role(PassRole::ReflectionHistory, &r9_probe, DXGI_FORMAT_R32_UINT.0, [320, 360, 1]).is_none());
         assert!(score_dispatch_target_for_role(PassRole::ReflectionHistory, &hdr_scene, DXGI_FORMAT_R11G11B10_FLOAT.0, [320, 360, 1]).is_some());
+        // the frame's light is kept from the R11G11B10_FLOAT image only
+        assert!(score_dispatch_target_for_role(PassRole::Radiance, &hdr_scene, DXGI_FORMAT_R11G11B10_FLOAT.0, [320, 360, 1]).is_some());
+        assert!(score_dispatch_target_for_role(PassRole::Radiance, &r9_probe, DXGI_FORMAT_R32_UINT.0, [320, 360, 1]).is_none());
+        assert!(score_dispatch_target_for_role(PassRole::Radiance, &hdr_scene, DXGI_FORMAT_R16G16B16A16_FLOAT.0, [320, 360, 1]).is_none());
     }
 
     #[test]

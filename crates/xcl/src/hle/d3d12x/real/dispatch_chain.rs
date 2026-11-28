@@ -64,11 +64,26 @@ impl PipelineBuilder {
     }
 }
 
+/// What a chain's whole form is made from: its console program, translated again when the whole
+/// form is first wanted (from the translation caches: the same DXIL). Most chains never want it
+/// (only an indirect dispatch runs the whole form), and their whole DXIL kept in memory was a
+/// retail title's 148 MB for 198 split programs, against 22 KB of console code on average.
+struct WholeSource {
+    console: Vec<u8>,
+    wave32: bool,
+}
+
+impl WholeSource {
+    fn code(&self) -> Result<Vec<u8>, String> {
+        crate::gpu::recomp::pso::console_to_dxil_for(&self.console, pso::Stage::Compute, 0, self.wave32).map(|c| c.dxil)
+    }
+}
+
 struct Chain {
     builder: Arc<PipelineBuilder>,
     tail: Vec<ID3D12PipelineState>,
     words: u32,
-    whole_code: Vec<u8>,
+    whole_source: WholeSource,
     whole: OnceLock<ID3D12PipelineState>,
     build_whole: Mutex<()>,
     /// a thread of its own builds the whole form (`whole_ready`)
@@ -87,7 +102,8 @@ impl Chain {
         let _call = super::super::pso_async::pc_call();
         let _guard = self.build_whole.lock().unwrap();
         if let Some(p) = self.whole.get() { return Ok(p.clone()); }
-        let p = self.builder.pipeline(&self.whole_code, &pc_iid(Kind::PipelineState)).ok_or("whole compute pipeline")?;
+        let code = self.whole_source.code().map_err(|e| format!("whole compute program: {e}"))?;
+        let p = self.builder.pipeline(&code, &pc_iid(Kind::PipelineState)).ok_or("whole compute pipeline")?;
         let _ = self.whole.set(p.clone());
         Ok(p)
     }
@@ -96,7 +112,7 @@ impl Chain {
 static CHAINS: LazyLock<Mutex<HashMap<usize, Arc<Chain>>>> = LazyLock::new(Default::default);
 
 pub(super) unsafe fn build(this: *mut c_void, create: PsoFn, desc: &D3D12_COMPUTE_PIPELINE_STATE_DESC,
-    iid: *const GUID, result: *mut *mut c_void, record: u64, whole: &[u8], samplers: &[pso::StaticSampler],
+    iid: *const GUID, result: *mut *mut c_void, record: u64, console: &[u8], wave32: bool, samplers: &[pso::StaticSampler],
     plan: Arc<DispatchChain>) -> Option<usize> {
     if result.is_null() || iid.is_null() || plan.pieces.len() < 2 { return None; }
     let dev = ID3D12Device::from_raw_borrowed(&this)?;
@@ -116,7 +132,7 @@ pub(super) unsafe fn build(this: *mut c_void, create: PsoFn, desc: &D3D12_COMPUT
     let mut pieces = built.into_iter().collect::<Option<Vec<_>>>()?.into_iter();
     let first = pieces.next()?;
     let chain = Arc::new(Chain { builder, tail: pieces.collect(), words: plan.dwords_per_group,
-        whole_code: whole.to_vec(), whole: OnceLock::new(), build_whole: Mutex::new(()), whole_sent: Default::default() });
+        whole_source: WholeSource { console: console.to_vec(), wave32 }, whole: OnceLock::new(), build_whole: Mutex::new(()), whole_sent: Default::default() });
     PROGRAMS.fetch_add(1, Ordering::Relaxed);
     PIECES.fetch_add(plan.pieces.len() as u64, Ordering::Relaxed);
     *result = first.into_raw();
@@ -315,6 +331,30 @@ pub(in crate::hle::d3d12x) unsafe fn dispatch(list: &ID3D12GraphicsCommandList, 
 #[cfg(test)]
 mod tests {
     use super::{scratch_bytes, LEAST};
+
+    #[test]
+    fn the_whole_form_is_made_again_from_the_console_program() {
+        use crate::gpu::recomp::pso::{console_to_dxil_for, Stage};
+        use crate::gpu::xbox::tests::{fssm, sample, CODE};
+        // (a compute program of one thread group of 1x1x1, as `pso::compile_time_bench` makes it)
+        let mut f = fssm(&CODE, &[(6, 0)]);
+        for offset in [0x13C, 0x140, 0x144] {
+            f[offset..offset + 4].copy_from_slice(&1u32.to_le_bytes());
+        }
+        let blob = sample(5, &[f]);
+        let first = match console_to_dxil_for(&blob, Stage::Compute, 0, false) {
+            Ok(c) => c.dxil,
+            // (no DXC here)
+            Err(e) if e.contains("dxcompiler") || e.contains("DXC") => {
+                crate::gpu::recomp::runner::skip_test("no DXC");
+                return;
+            }
+            Err(e) => panic!("the console program does not translate: {e}"),
+        };
+        let source = super::WholeSource { console: blob.clone(), wave32: false };
+        assert_eq!(source.code().unwrap(), first, "the DXIL the chain was split from");
+        assert!(source.console.len() < first.len(), "a chain keeps less than the DXIL: {} against {}", source.console.len(), first.len());
+    }
 
     const MB: u64 = 1 << 20;
 

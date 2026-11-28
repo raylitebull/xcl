@@ -41,7 +41,15 @@ unsafe fn commit(page: usize) -> bool {
     if !g.remove(&page) {
         return false;
     }
-    !VirtualAlloc(page as *const c_void, PAGE, MEM_COMMIT, PAGE_READWRITE).is_null()
+    if VirtualAlloc(page as *const c_void, PAGE, MEM_COMMIT, PAGE_READWRITE).is_null() {
+        g.insert(page);
+        return false;
+    }
+    drop(g);
+    // (a view of a physical page committed here is writable, not guarded: count it as written)
+    super::guards::committed(page);
+    super::alias::committed_at(page);
+    true
 }
 
 unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
@@ -89,20 +97,22 @@ pub(super) fn is_marked(page: usize) -> bool {
 }
 
 /// The lazy pages of `[p, p + len)` committed – memory a kernel call or XCL writes.
-pub fn ensure(p: usize, len: usize) {
+pub fn ensure(p: usize, len: usize) -> super::guards::Opened {
+    let opened = super::guards::open(p, len);
     if len == 0 {
-        return;
+        return opened;
     }
     let pages: Vec<usize> = {
         let g = LAZY.read().unwrap_or_else(|e| e.into_inner());
         if g.is_empty() {
-            return;
+            return opened;
         }
         g.range(p & !(PAGE - 1)..p.saturating_add(len)).copied().collect()
     };
     for page in pages {
         unsafe { commit(page) };
     }
+    opened
 }
 
 #[cfg(test)]
@@ -122,7 +132,7 @@ mod tests {
             std::ptr::write_volatile((r + 8) as *mut u32, 7);
             assert_eq!(std::ptr::read_volatile((r + 8) as *const u32), 7);
             assert!(!unmark(r), "used: no longer lazy");
-            ensure(r + PAGE + 4, 4);
+            let _open = ensure(r + PAGE + 4, 4);
             assert!(!LAZY.read().unwrap().contains(&(r + PAGE)));
             assert!(crate::gpu::shader::readable(r + PAGE, 4));
             VirtualFree(r as *mut c_void, 0, MEM_RELEASE);

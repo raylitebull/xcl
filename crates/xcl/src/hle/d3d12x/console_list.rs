@@ -680,7 +680,60 @@ pub fn pc_pso(pso: *mut c_void) -> *mut c_void {
     unsafe { (*(pso as *const ConsolePso)).pc as *mut c_void }
 }
 
+/// How long what a finished recording held (unified-memory blocks, two-pass buffers) waits
+/// before it is used again or let go, from when its allocator's reset said the GPU was done with
+/// it (`XCL_RETIRE_MS`, 2000 by default; 0: at once). A retail title resets its allocators with
+/// work still on the GPU about a hundred times a second in its world, and a block handed to the
+/// next recording at once was written while a list still read it whenever that bookkeeping
+/// missed a submit: its dispatch arguments over the title's own objects in upload memory (CPU
+/// crashes on a vtable of `{groups, 1, 1, 0}`), and stale arguments and addresses for the GPU
+/// (page faults at addresses no resource is at, device removals).
+pub(super) fn retire_age() -> std::time::Duration {
+    #[cfg(test)]
+    {
+        std::time::Duration::ZERO
+    }
+    #[cfg(not(test))]
+    {
+        static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        std::time::Duration::from_millis(*MS.get_or_init(|| std::env::var("XCL_RETIRE_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(2000)))
+    }
+}
+
+/// unified-memory blocks waiting out `retire_age`, oldest first
+static RETIRED: Mutex<std::collections::VecDeque<(std::time::Instant, usize)>> = Mutex::new(std::collections::VecDeque::new());
+/// committed unified memory left under which the oldest retired blocks go back early
+const RETIRE_ROOM: usize = 96 << 20;
+
 unsafe fn free_uma(blocks: &[usize]) {
+    let age = retire_age();
+    if age.is_zero() {
+        return free_uma_now(blocks);
+    }
+    let now = std::time::Instant::now();
+    let ready: Vec<usize> = {
+        let mut g = RETIRED.lock().unwrap();
+        g.extend(blocks.iter().map(|&b| (now, b)));
+        let mut out = Vec::new();
+        while g.front().is_some_and(|&(at, _)| now.saturating_duration_since(at) >= age) {
+            out.push(g.pop_front().unwrap().1);
+        }
+        // (draws with no room for their arguments are skipped: before that, the oldest go back)
+        if out.is_empty() && !g.is_empty() && crate::gpu::uma::get().is_some_and(|u| u.committed_state().0 < RETIRE_ROOM) {
+            let n = g.len().min(64);
+            out.extend(g.drain(..n).map(|e| e.1));
+            static EARLY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let k = EARLY.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed) + n as u64;
+            if (k / 64).is_power_of_two() {
+                crate::xlog_warn!("D3D12.X: {k} retired unified-memory blocks so far given back before {} ms: committed unified memory is under {} MB free", age.as_millis(), RETIRE_ROOM >> 20);
+            }
+        }
+        out
+    };
+    free_uma_now(&ready);
+}
+
+unsafe fn free_uma_now(blocks: &[usize]) {
     if let Some(u) = crate::gpu::uma::get() {
         for &b in blocks {
             if u.is_sparse(b) {
@@ -985,10 +1038,13 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                             None => list.SetComputeRootSignature(rs.as_ref().ok_or("no XCL ABI root signature")?),
                         }
                         ensure_dispatch_heaps(&list, &mut bound_heaps, &mut has_sampler_heap);
+                        super::real::note_root_view(list.as_raw() as usize, 0, va(io_at));
                         list.SetComputeRootUnorderedAccessView(0, va(io_at));
+                        super::real::note_root_view(list.as_raw() as usize, 1, va(res_at));
                         list.SetComputeRootUnorderedAccessView(1, va(res_at));
                         // (every window slot gets a buffer: direct DXIL compute reads all four, as in `bind`)
                         for k in 0..4 {
+                            super::real::note_root_view(list.as_raw() as usize, 2 + k as u32, windows.get(k).copied().filter(|&v| v != 0).unwrap_or(uma_va));
                             list.SetComputeRootUnorderedAccessView(2 + k as u32, windows.get(k).copied().filter(|&v| v != 0).unwrap_or(uma_va));
                         }
                         let raw = real as *mut c_void;

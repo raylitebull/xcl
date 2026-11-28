@@ -894,7 +894,22 @@ impl Uma {
             // a block of XCL's pool goes back to the pool
             let mut g = self.pool.lock().unwrap();
             if p >= g.0 && p < g.1 {
+                // (a block freed twice would be handed to two owners at once, each writing over
+                // the other's records)
+                if g.2.contains(&p) {
+                    drop(g);
+                    static TWICE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                    let k = TWICE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    if k.is_power_of_two() {
+                        crate::xlog_error!("UMA: pool block {p:#x} freed while it is free ({k} so far) - left out");
+                    }
+                    return true;
+                }
                 g.2.push(p);
+                drop(g);
+                for grain in 0..ARENA_BLOCK / GRAIN {
+                    crate::hle::kernelx::pagelog::note("XCL arena block freed", p + grain * GRAIN, 0, ARENA_BLOCK);
+                }
                 return true;
             }
         }
@@ -972,6 +987,9 @@ impl Arena {
             None => u.alloc(ARENA_BLOCK, GRAIN)? as usize,
         };
         blocks.push(p);
+        for grain in 0..ARENA_BLOCK / GRAIN {
+            crate::hle::kernelx::pagelog::note("XCL arena block taken", p + grain * GRAIN, 0, ARENA_BLOCK);
+        }
         self.at = p + n;
         self.end = p + ARENA_BLOCK;
         Some(p as *mut u8)

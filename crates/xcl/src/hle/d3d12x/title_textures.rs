@@ -1639,6 +1639,7 @@ unsafe fn refresh_parts(queue: *mut c_void, look: bool) {
         let _one = look.then(|| ONE_LOOK.lock().unwrap_or_else(|e| e.into_inner()));
         // (a submit without a look of its own takes these too: they are dirty by XCL's account)
         take_known(&mut dirty);
+        crate::hle::kernelx::guards::take_uploads(&mut dirty, page as usize);
         {
             let mut found = AHEAD.lock().unwrap();
             ahead = found.len();
@@ -2073,6 +2074,13 @@ unsafe impl Send for QueueUploads {}
 
 static ON_QUEUE: Mutex<BTreeMap<usize, QueueUploads>> = Mutex::new(BTreeMap::new());
 
+/// The memory line of the texture upload buffers (`XCL_ACTIVITY`): system memory the process holds
+/// for them, idle, and submitted but not yet taken back (`reclaim`: done on the GPU or not).
+pub fn upload_line() -> String {
+    let in_flight: u64 = ON_QUEUE.lock().unwrap().values().map(|q| q.bytes).sum();
+    format!("texture upload buffers: {} MB idle, {} MB submitted and not taken back yet", texture_upload::idle_bytes() >> 20, in_flight >> 20)
+}
+
 /// upload buffers the GPU has not read yet, before a submit waits for it: a moment past the first,
 /// in earnest past the second (a title's queue can stand at a wait that another submit ends)
 const IN_FLIGHT_BYTES: u64 = 512 << 20;
@@ -2287,6 +2295,18 @@ unsafe fn upload_all(todo: Vec<Due>, dirty: &[usize], page: usize, title: Option
             texture_upload::Change::Parts(p) => Some(p),
         };
         let size = d.tex.size() as usize;
+        // (a texture with lazy levels: the levels with pages; the queue waits for the mappings
+        // made here before the copies, `vram::before_execute` below. A level left without pages
+        // may get its texels before a copy reads them, and a copy to its tiles is dropped: it is
+        // not read, and nothing is kept of what its pages hold)
+        let (changed, seen_to) = if super::vram::level_pages() { level_upload(&d, changed) } else { (changed, false) };
+        if changed.as_ref().is_some_and(|p| p.is_empty()) {
+            return None;
+        }
+        if !seen_to && changed.is_none() {
+            // (before its bytes are read: what is written from here on is compared)
+            texture_upload::all_sent(&d.known, d.src, size);
+        }
         // (whole blocks go up, and whole volumes)
         const BLOCK: usize = 0x1_0000;
         let volume = d.tex.texels().is_some_and(|s| s.depth > 0);
@@ -2297,29 +2317,9 @@ unsafe fn upload_all(todo: Vec<Due>, dirty: &[usize], page: usize, title: Option
     while todo.peek().is_some() {
         let (mut items, mut known): (Vec<texture_upload::Item>, Vec<texture_upload::Known>) = (Vec::new(), Vec::new());
         let (mut bytes, mut device) = (0usize, 0usize);
-        while let Some((d, mut changed, n)) = todo.next_if(|(d, _, n)| batch_fits(items.len(), bytes, device, d.device, *n)) {
+        while let Some((d, changed, n)) = todo.next_if(|(d, _, n)| batch_fits(items.len(), bytes, device, d.device, *n)) {
             device = d.device;
             bytes += n;
-            let mut unmapped = false;
-            if super::vram::level_pages() && super::vram::has_lazy_levels(d.res.as_raw() as usize) {
-                // (the queue waits for these mappings before the copies: `vram::before_execute`
-                // below; what a level's fresh pages held is another texture's, so all of it goes up)
-                if !map_levels_with_texels(&d.res, &subresources_in(d.src, &d.tex, d.pages.as_deref())).is_empty() {
-                    changed = None;
-                }
-                unmapped = super::vram::has_unmapped_levels(d.res.as_raw() as usize);
-            }
-            if unmapped {
-                // A level left without pages (zeros when looked at above) may get its texels
-                // before the copy reads them: the copy to its tiles is dropped, and what it read
-                // must not be kept as what the PC texture holds – the next write then looks the
-                // same and the level never goes up. The next write sends all of it, and the level
-                // gets its pages then.
-                texture_upload::unknown(&d.known);
-            } else if changed.is_none() {
-                // (before its bytes are read: what is written from here on is compared)
-                texture_upload::all_sent(&d.known, d.src, d.tex.size() as usize);
-            }
             if super::present::trace_frame() {
                 note_content(d.src, &d.res, &subresources_in(d.src, &d.tex, d.pages.as_deref()));
             }
@@ -2420,6 +2420,236 @@ pub unsafe fn upload_and_wait(dev: &ID3D12Device, queue: &ID3D12CommandQueue, re
     failed.into_iter().next().map_or(Ok(()), |(_, e)| Err(e))
 }
 
+/// Whether any byte of the title memory range `[va + off, va + end)` is non-zero, without
+/// allocating per-texture buffers or detiling. Short-circuits on the first non-zero 64 KiB chunk.
+unsafe fn range_any_nonzero(va: usize, off: usize, end: usize, pages: Option<&texture_upload::PageMap>) -> bool {
+    let Some(len) = end.checked_sub(off).filter(|&n| n > 0) else {
+        return false;
+    };
+    let at = va + off;
+    if let Some(m) = pages {
+        return m.any_nonzero(at, len);
+    }
+    static SAFE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let safe = *SAFE.get_or_init(|| std::env::var("XCL_TEXTURE_SAFE_READ").is_ok_and(|v| v.trim() == "1"));
+    if !safe && crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(at, len)) {
+        return !all_zero(std::slice::from_raw_parts(at as *const u8, len));
+    }
+    thread_local! {
+        static CHUNK: std::cell::RefCell<Vec<u8>> = std::cell::RefCell::new(Vec::new());
+    }
+    const STEP: usize = 0x1_0000;
+    CHUNK.with(|c| {
+        let mut buf = c.borrow_mut();
+        if buf.len() < STEP {
+            buf.resize(STEP, 0);
+        }
+        let mut done = 0;
+        while done < len {
+            let n = STEP.min(len - done);
+            copy_readable(at + done, &mut buf[..n]);
+            if !all_zero(&buf[..n]) {
+                return true;
+            }
+            done += n;
+        }
+        false
+    })
+}
+
+/// Which mip levels of a 2D single-slice texture at `va` hold non-zero texels (`(present, zero)`).
+///
+/// Non-tail levels occupy disjoint tiled byte ranges `[l.offset, next_offset)` in slice 0, and
+/// tiling is a byte bijection (zero ↔ zero), so checking their raw bytes skips CPU detiling and
+/// multi-MB temporary allocations. Packed tail levels share one `block_bytes` block at offset 0:
+/// if that block is all zeros, every tail level is zero; otherwise only those tiny tail levels are
+/// detiled from that single block.
+unsafe fn levels_with_texels_in(va: usize, tex: &xg::Texture, pages: Option<&texture_upload::PageMap>) -> (Vec<u32>, Vec<u32>) {
+    levels_with_texels_where(va, tex, pages, |_| true)
+}
+
+/// `levels_with_texels_in` of the levels `look` names only (the others are in neither list): a
+/// level of zeros is read to its end to be found one, and a streamed texture is mostly such
+/// levels, so the ones nothing was written to since they were found zeros are not read again.
+/// The levels in the mip tail are one block: looked at together, if any of them is.
+unsafe fn levels_with_texels_where(va: usize, tex: &xg::Texture, pages: Option<&texture_upload::PageMap>, look: impl Fn(usize) -> bool) -> (Vec<u32>, Vec<u32>) {
+    let Some(t) = tex.texels() else {
+        return (Vec::new(), Vec::new());
+    };
+    if t.depth > 0 || t.array != 1 {
+        let subs = subresources_in(va, tex, pages);
+        let present: Vec<u32> = subs.iter().enumerate().filter(|(_, s)| !all_zero(&s.data)).map(|(i, _)| i as u32).collect();
+        let zero: Vec<u32> = (0..subs.len() as u32).filter(|l| !present.contains(l)).collect();
+        return (present, zero);
+    }
+    let c = &t.chain;
+    let mips = c.levels.len();
+    let mut present = Vec::with_capacity(mips);
+    let mut zero = Vec::with_capacity(mips);
+    let mut first_tail = mips;
+    for (i, l) in c.levels.iter().enumerate() {
+        if l.tail.is_some() {
+            first_tail = i;
+            break;
+        }
+        if !look(i) {
+            continue;
+        }
+        let end = if i == 0 { c.slice_bytes } else { c.levels[i - 1].offset };
+        if range_any_nonzero(va, l.offset, end, pages) {
+            present.push(i as u32);
+        } else {
+            zero.push(i as u32);
+        }
+    }
+    if first_tail < mips && (first_tail..mips).any(&look) {
+        let tail_len = c.layout.block_bytes.min(c.slice_bytes);
+        if !range_any_nonzero(va, 0, tail_len, pages) {
+            for i in first_tail..mips {
+                zero.push(i as u32);
+            }
+        } else {
+            let tail_buf: std::borrow::Cow<'_, [u8]> = match pages {
+                Some(m) => {
+                    let mut v = vec![0u8; tail_len];
+                    m.copy(va, &mut v);
+                    std::borrow::Cow::Owned(v)
+                }
+                None => title_bytes(va, tail_len),
+            };
+            for i in first_tail..mips {
+                if !all_zero(&c.detile_level(&tail_buf, i, 0)) {
+                    present.push(i as u32);
+                } else {
+                    zero.push(i as u32);
+                }
+            }
+        }
+    }
+    (present, zero)
+}
+
+/// The bytes (from, to; sorted and joined) of a one-slice texture that `levels` of `c` take.
+fn level_ranges(c: &crate::gpu::tiling::Chain, levels: impl Iterator<Item = usize>) -> Vec<(usize, usize)> {
+    let mut r: Vec<(usize, usize)> = levels.filter(|&i| i < c.levels.len()).map(|i| c.level_bytes(i)).map(|r| (r.start, r.end)).collect();
+    r.sort_unstable();
+    match texture_upload::join(texture_upload::Change::Parts(Vec::new()), texture_upload::Change::Parts(r)) {
+        texture_upload::Change::Parts(r) => r,
+        _ => Vec::new(),
+    }
+}
+
+/// `ranges` cut to what lies in `keep`, and what of them lies outside it (both sorted and disjoint).
+fn split_ranges(ranges: &[(usize, usize)], keep: &[(usize, usize)]) -> (Vec<(usize, usize)>, Vec<(usize, usize)>) {
+    let (mut inside, mut outside) = (Vec::new(), Vec::new());
+    for &(from, to) in ranges {
+        let mut at = from;
+        for &(a, z) in &keep[keep.partition_point(|k| k.1 <= from)..] {
+            if a >= to {
+                break;
+            }
+            if a > at {
+                outside.push((at, a));
+            }
+            inside.push((a.max(at), z.min(to)));
+            at = z.min(to);
+        }
+        if at < to {
+            outside.push((at, to));
+        }
+    }
+    (inside, outside)
+}
+
+/// Uploads cut to the levels that have pages (`level_upload`): how many, their bytes, and the
+/// bytes of their textures.
+static LEVEL_UPLOADS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// (`vram::level_pages`) Before an upload of `changed` (None: all) of `d`: for a texture placed
+/// with lazy levels, the levels that have texels now get their pages and those that lost them
+/// give them back (as `map_levels_with_texels`), and what goes up is cut to the levels that have
+/// pages – with the levels that got theirs just now as a whole (what a level's fresh pages held
+/// is another texture's; the queue waits for these mappings before the copies,
+/// `vram::before_execute`). Returns what goes up (None: all of it; nothing: no upload) and
+/// whether what is kept of its pages (`texture_upload::Known`) was seen to here.
+///
+/// A streamed texture is placed at its full size and has texels for its small levels only, most
+/// of the time. Sending all of it at every write – it is not known what the PC texture holds
+/// while a level has no pages, a copy to tiles without memory is dropped – detiled 9.5 GB in
+/// 1024 submits of a retail title's world, most of them zeros for tiles that are not there, and
+/// read each level of zeros to its end every time to find it one. So a level without pages is
+/// not sent and nothing is kept of its pages: its next write is found changed, the level is
+/// looked at then, and it goes up as a whole once it has texels. A level that had none and was
+/// not written since has none now.
+unsafe fn level_upload(d: &Due, changed: Option<Vec<(usize, usize)>>) -> (Option<Vec<(usize, usize)>>, bool) {
+    let key = d.res.as_raw() as usize;
+    let Some(had) = super::vram::levels_with_pages(key) else { return (changed, false) };
+    let size = d.tex.size() as usize;
+    // (a texture that goes up as a whole when written, `Entry::target` and `XCL_TEXTURE_PARTS=0`,
+    // or not the kind that gets lazy levels: as before, all of it and nothing known)
+    let by_level = !d.target && upload_parts();
+    let Some(c) = d.tex.texels().filter(|t| by_level && t.depth == 0 && t.array == 1 && t.chain.levels.len() == had.len()).map(|t| &t.chain) else {
+        let fresh = map_levels_with_texels_in(&d.res, d.src, &d.tex, d.pages.as_deref());
+        let changed = if fresh.is_empty() { changed } else { None };
+        if super::vram::has_unmapped_levels(key) {
+            texture_upload::unknown(&d.known);
+            return (changed, true);
+        }
+        return (changed, false);
+    };
+    let written = |i: usize| {
+        let r = c.level_bytes(i);
+        changed.as_ref().is_none_or(|p| p.iter().any(|&(from, to)| from < r.end && to > r.start))
+    };
+    let (present, zero) = levels_with_texels_where(d.src, &d.tex, d.pages.as_deref(), |i| had[i] || written(i));
+    super::vram::unmap_levels(&d.res, &zero);
+    let fresh = super::vram::map_levels(&d.res, Some(&present));
+    let now = super::vram::levels_with_pages(key).unwrap_or_else(|| had.clone());
+    if now.iter().all(|&m| m) && (fresh.is_empty() || changed.is_none()) {
+        return (changed, false);
+    }
+    let with_pages = level_ranges(c, (0..now.len()).filter(|&i| now[i]));
+    // (a level that gave its pages back: the PC texture holds zeros there now, not what its
+    // pages are known to have held – the same texels coming back are a change)
+    let lost = level_ranges(c, (0..now.len()).filter(|&i| had[i] && !now[i]));
+    texture_upload::unknown_parts(&d.known, d.src, size, &split_ranges(&lost, &with_pages).1);
+    let parts = match &changed {
+        None => {
+            // (before its bytes are read: what is written from here on is compared; the pages
+            // of the levels left out stay unknown)
+            texture_upload::all_sent(&d.known, d.src, size);
+            with_pages
+        }
+        Some(p) => {
+            let (inside, outside) = split_ranges(p, &with_pages);
+            texture_upload::unknown_parts(&d.known, d.src, size, &outside);
+            let fresh = level_ranges(c, fresh.iter().map(|&l| l as usize));
+            match texture_upload::join(texture_upload::Change::Parts(inside), texture_upload::Change::Parts(fresh)) {
+                texture_upload::Change::Parts(r) => r,
+                _ => Vec::new(),
+            }
+        }
+    };
+    let bytes: usize = parts.iter().map(|r| r.1 - r.0).sum();
+    let n = LEVEL_UPLOADS[0].fetch_add(1, Ordering::Relaxed) + 1;
+    let sent = LEVEL_UPLOADS[1].fetch_add(bytes as u64, Ordering::Relaxed) + bytes as u64;
+    let of = LEVEL_UPLOADS[2].fetch_add(size as u64, Ordering::Relaxed) + size as u64;
+    if n >= 1024 && n.is_power_of_two() {
+        crate::xlog_info!("title textures: {n} uploads of textures with levels that have no pages: {} MB of their {} MB went up (the levels with pages that were written, and levels given pages)", sent >> 20, of >> 20);
+    }
+    (Some(parts), true)
+}
+
+/// Fast zero-detile counterpart of `map_levels_with_texels` for the hot `upload_all` path.
+unsafe fn map_levels_with_texels_in(r: &ID3D12Resource, va: usize, tex: &xg::Texture, pages: Option<&texture_upload::PageMap>) -> Vec<u32> {
+    if !super::vram::has_lazy_levels(r.as_raw() as usize) {
+        return Vec::new();
+    }
+    let (present, zero) = levels_with_texels_in(va, tex, pages);
+    super::vram::unmap_levels(r, &zero);
+    super::vram::map_levels(r, Some(&present))
+}
+
 /// (`vram::level_pages`) Before an upload of title texture `r`: its levels with texels in `subs`
 /// (its subresources as they go up) get their video memory pages if they have none, and those
 /// with pages and no texels now give them back (`vram::unmap_levels`) - a texture placed with
@@ -2428,6 +2658,7 @@ pub unsafe fn upload_and_wait(dev: &ID3D12Device, queue: &ID3D12CommandQueue, re
 /// `read_committed`). It keeps no pages, reads as zeros as it would with them, and its copy goes
 /// to tiles that are not mapped, which drops it (tiled resources tier 2). Returns the levels that
 /// got pages now (`vram::map_levels`).
+#[cfg(test)]
 unsafe fn map_levels_with_texels(r: &ID3D12Resource, subs: &[Subresource]) -> Vec<u32> {
     if !super::vram::has_lazy_levels(r.as_raw() as usize) {
         return Vec::new();
@@ -2442,7 +2673,7 @@ unsafe fn map_levels_with_texels(r: &ID3D12Resource, subs: &[Subresource]) -> Ve
 }
 
 /// Whether every byte of `b` is zero (eight at a time: gigabytes a second where it is).
-fn all_zero(b: &[u8]) -> bool {
+pub(super) fn all_zero(b: &[u8]) -> bool {
     let mut words = b.chunks_exact(8);
     words.all(|w| u64::from_ne_bytes(w.try_into().unwrap()) == 0) && words.remainder().iter().all(|&x| x == 0)
 }
@@ -4717,12 +4948,124 @@ pub(super) mod tests {
             // mip 0's texels come back: its pages too, the ones the other texture holds
             assert!(!VirtualAlloc((at + top) as *const c_void, size - top, MEM_COMMIT, PAGE_READWRITE).is_null());
             std::ptr::copy_nonoverlapping(whole.as_ptr().add(top), (at + top) as *mut u8, size - top);
-            assert_eq!(map_levels_with_texels(&full, &subresources(at, &tex)), vec![0], "mip 0 got its pages again");
+            assert_eq!(map_levels_with_texels_in(&full, at, &tex, None), vec![0], "mip 0 got its pages again via fast raw check");
             assert_eq!(super::super::vram::mapped_level_tiles(full_key), Some(all as u64));
             assert!(read_sub(&full, 0) == want[0].data, "mip 0 on the pages the other texture kept");
+            // The title lets mip 0 go once more and rewrites level 1: the upload of that write
+            // finds mip 0 zeros (it gives its pages back) and sends level 1 only, not all of it.
+            assert_ne!(VirtualFree((at + top) as *mut c_void, size - top, MEM_DECOMMIT), 0);
+            let l1 = chain.level_bytes(1);
+            let mut other = whole.clone();
+            let pat: Vec<u8> = (0..chain.levels[1].width * chain.levels[1].height * surface.bpe as usize).map(|k| 3 + ((k * 29) % 250) as u8).collect();
+            chain.tile_level(&mut other[..chain.slice_bytes], 1, 0, &pat);
+            let want1 = subresources(other.as_ptr() as usize, &tex)[1].data.clone();
+            assert!(want1 != want[1].data);
+            std::ptr::copy_nonoverlapping(other.as_ptr().add(l1.start), (at + l1.start) as *mut u8, l1.len());
+            note_known_write(at + l1.start, l1.len());
+            let cut = |k: usize| LEVEL_UPLOADS[k].load(Ordering::Relaxed);
+            let (cut0, sent0, uploads0) = (cut(0), cut(1), UPLOADS.load(Ordering::Relaxed));
+            refresh(queue.as_raw());
+            assert_eq!(super::super::vram::mapped_level_tiles(full_key), Some((all - top_tiles) as u64), "mip 0 gave its pages back at the upload");
+            assert_eq!((cut(0) - cut0, cut(1) - sent0), (1, l1.len() as u64), "level 1's bytes went up, no others");
+            assert_eq!(UPLOADS.load(Ordering::Relaxed), uploads0 + 1);
+            assert!(read_sub(&full, 1) == want1, "level 1 as it was rewritten");
+            assert!(read_sub(&full, 2) == want[2].data, "level 2 as it was");
+            // a write that changes nothing, while mip 0 has no pages: no upload (what the other
+            // levels' pages hold is still known)
+            let l2 = chain.level_bytes(2);
+            note_known_write(at + l2.start, l2.len());
+            refresh(queue.as_raw());
+            assert_eq!((UPLOADS.load(Ordering::Relaxed), cut(0)), (uploads0 + 1, cut0 + 1), "nothing changed: nothing went up");
+            // mip 0's texels come back, the ones it held before: it gets its pages and goes up as
+            // a whole (what was known of its pages went with them), the other levels stay
+            assert!(!VirtualAlloc((at + top) as *const c_void, size - top, MEM_COMMIT, PAGE_READWRITE).is_null());
+            std::ptr::copy_nonoverlapping(whole.as_ptr().add(top), (at + top) as *mut u8, size - top);
+            note_known_write(at + top, size - top);
+            refresh(queue.as_raw());
+            assert_eq!(super::super::vram::mapped_level_tiles(full_key), Some(all as u64), "mip 0 has its pages again");
+            assert_eq!(UPLOADS.load(Ordering::Relaxed), uploads0 + 2);
+            assert!(read_sub(&full, 0) == want[0].data, "mip 0 went up with its pages");
+            assert!(read_sub(&full, 1) == want1 && read_sub(&full, 2) == want[2].data, "the other levels as they were");
             super::super::vram::LEVEL_PAGES_FOR_TEST.store(false, Ordering::Relaxed);
             drop((small, full));
             VirtualFree(at as *mut c_void, 0, MEM_RELEASE);
+        }
+    }
+
+    /// Only the levels asked about are read and reported, and the levels in the mip tail (one
+    /// block) together; the bytes of levels are their ranges in the slice, joined.
+    #[test]
+    fn levels_are_looked_at_one_by_one_and_their_bytes_are_ranges() {
+        unsafe {
+            let tex = xg::Texture::new(&console_desc(3, 1024, 1024, 1, 11, 87, 0x109)).unwrap();
+            let c = &tex.texels().unwrap().chain;
+            let tail_i = c.first_tail();
+            assert!(tail_i >= 3 && tail_i < 10, "levels of their own and a mip tail: {tail_i}");
+            let mut buf = vec![0u8; tex.size() as usize];
+            buf[c.levels[2].offset + 128] = 0x5A;
+            buf[c.levels[tail_i].tail.unwrap()] = 0xA5;
+            let at = buf.as_ptr() as usize;
+            assert_eq!(levels_with_texels_where(at, &tex, None, |i| i == 1 || i == 2), (vec![2], vec![1]));
+            assert_eq!(levels_with_texels_where(at, &tex, None, |_| false), (vec![], vec![]));
+            // (one level of the tail asked about: all of them are looked at)
+            let (present, zero) = levels_with_texels_where(at, &tex, None, |i| i == 10);
+            assert_eq!(present, vec![tail_i as u32]);
+            assert_eq!(zero, (tail_i as u32 + 1..11).collect::<Vec<_>>());
+
+            let whole = level_ranges(c, 0..11);
+            assert_eq!(whole, vec![(0, c.slice_bytes)], "all levels: the slice");
+            assert_eq!(level_ranges(c, [0, 2].into_iter()), vec![(c.levels[2].offset, c.levels[1].offset), (c.levels[0].offset, c.slice_bytes)]);
+            assert_eq!(level_ranges(c, tail_i..11), vec![(0, c.layout.block_bytes)], "the tail's levels share its block");
+        }
+    }
+
+    #[test]
+    fn ranges_are_split_at_what_is_kept() {
+        let keep = [(10, 20), (30, 40)];
+        assert_eq!(split_ranges(&[(0, 5)], &keep), (vec![], vec![(0, 5)]));
+        assert_eq!(split_ranges(&[(12, 18)], &keep), (vec![(12, 18)], vec![]));
+        assert_eq!(split_ranges(&[(5, 35), (38, 50)], &keep), (vec![(10, 20), (30, 35), (38, 40)], vec![(5, 10), (20, 30), (40, 50)]));
+        assert_eq!(split_ranges(&[(20, 30)], &keep), (vec![], vec![(20, 30)]), "between two kept ranges");
+        assert_eq!(split_ranges(&[(0, 50)], &[]), (vec![], vec![(0, 50)]));
+    }
+
+    /// `levels_with_texels_in` agrees with full CPU detiling (`subresources_in`) on non-tail mips,
+    /// packed mip tails, zeroed top levels, and sparse `PageMap`s with unmapped pages.
+    #[test]
+    fn levels_with_texels_in_matches_detiled_subresources() {
+        unsafe {
+            // 64 KiB tiled (0x109) 1024x1024 R8G8B8A8 (format 87, 11 mips) with a packed mip tail.
+            let tex = xg::Texture::new(&console_desc(3, 1024, 1024, 1, 11, 87, 0x109)).unwrap();
+            let c = &tex.texels().unwrap().chain;
+            assert!(c.levels.iter().any(|l| l.tail.is_some()), "test texture must exercise packed mip tail");
+            let size = tex.size() as usize;
+            let mut buf = vec![0u8; size];
+            // Populate one non-tail level (mip 2) and one packed tail level, leaving mip 0/1 zero.
+            let m2_at = c.levels[2].offset + 128;
+            let tail_i = c.levels.iter().position(|l| l.tail.is_some()).unwrap();
+            let tail_at = c.levels[tail_i].tail.unwrap();
+            buf[m2_at] = 0x5A;
+            buf[tail_at] = 0xA5;
+            let subs = subresources_in(buf.as_ptr() as usize, &tex, None);
+            let want_present: Vec<u32> = subs.iter().enumerate().filter(|(_, s)| !all_zero(&s.data)).map(|(i, _)| i as u32).collect();
+            let want_zero: Vec<u32> = (0..subs.len() as u32).filter(|l| !want_present.contains(l)).collect();
+            assert_eq!(want_present, vec![2, tail_i as u32]);
+            assert_eq!(levels_with_texels_in(buf.as_ptr() as usize, &tex, None), (want_present.clone(), want_zero.clone()));
+
+            // With a PageMap where only the tail page and mip 2's page are mapped (others 0).
+            const P: usize = 0x1_0000;
+            let base = 0x4000_0000usize;
+            let mut page_backing = vec![0u8; size.next_multiple_of(P)];
+            page_backing[..size].copy_from_slice(&buf);
+            let n_pages = page_backing.len() / P;
+            let mut map = vec![0usize; n_pages];
+            map[tail_at / P] = page_backing.as_ptr() as usize + (tail_at / P) * P;
+            map[m2_at / P] = page_backing.as_ptr() as usize + (m2_at / P) * P;
+            let pm = texture_upload::PageMap::new(base, map);
+            let subs_pm = subresources_in(base, &tex, Some(&pm));
+            let want_pm: Vec<u32> = subs_pm.iter().enumerate().filter(|(_, s)| !all_zero(&s.data)).map(|(i, _)| i as u32).collect();
+            let zero_pm: Vec<u32> = (0..subs_pm.len() as u32).filter(|l| !want_pm.contains(l)).collect();
+            assert_eq!(levels_with_texels_in(base, &tex, Some(&pm)), (want_pm, zero_pm));
         }
     }
 

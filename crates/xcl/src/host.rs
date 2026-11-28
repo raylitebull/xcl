@@ -80,6 +80,7 @@ pub fn host_main(boot_path: &Path) -> i32 {
         std::env::set_var("XCL_UMA_MB", boot.config.uma_mb.to_string());
     }
     crate::state::set_boot(boot.clone());
+    crate::ram_budget::start();
     if let Err(e) = crate::hle::d3d12x::present::preparation::before_guest(&boot) {
         crate::xlog_error!("Shader preparation: {e}");
         eprintln!("xcl: {e}");
@@ -104,6 +105,7 @@ pub fn host_main(boot_path: &Path) -> i32 {
             let mut own_cost = crate::hle::api_cost::submitter_totals();
             let mut views = crate::hle::d3d12x::view_want::totals();
             let mut tile_calls = crate::hle::d3d12x::sparse::tile_calls();
+            let mut heap_tick = 0u32;
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(2));
                 let now = snap();
@@ -183,6 +185,17 @@ pub fn host_main(boot_path: &Path) -> i32 {
                 );
                 if pages != 0 {
                     crate::xlog_info!("{}", crate::hle::d3d12x::vram::page_owners());
+                }
+                // `XCL_HEAP_COUNT=1`: XCL's own part of that commit, every 20 s
+                heap_tick += 1;
+                if heap_tick % 10 == 0 {
+                    crate::xlog_info!("{}", crate::hle::d3d12x::title_textures::upload_line());
+                    for l in crate::heap_count::lines(16).unwrap_or_default() {
+                        crate::xlog_info!("{l}");
+                    }
+                    for l in crate::mem_map::lines().unwrap_or_default() {
+                        crate::xlog_info!("{l}");
+                    }
                 }
                 // past the budget Windows moves the process's video memory off the card and
                 // every frame pays for bringing it back; a run at the card's limit is also

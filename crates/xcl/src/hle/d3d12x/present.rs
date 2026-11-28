@@ -66,6 +66,12 @@ pub unsafe extern "system" fn present_x(queue: *mut c_void, plane_count: u32, pl
     0
 }
 
+/// `XCL_PRESENT_PLANE=<i>`: the one plane shown (None: all of them, composed)
+fn present_plane_only() -> Option<usize> {
+    static ONLY: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *ONLY.get_or_init(|| std::env::var("XCL_PRESENT_PLANE").ok().and_then(|v| v.trim().parse().ok()))
+}
+
 const PLANE_STRIDE: usize = 0x48;
 const MAX_PLANES: usize = 8;
 
@@ -145,6 +151,44 @@ unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u
         }
     }
     let extracted = extract_planes(plane_count, planes);
+    {
+        // which resources the planes show, when a plane shows one it has not shown before
+        // (the first 24 times)
+        static SHOWN: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+        let mut shown = SHOWN.lock().unwrap();
+        for (i, &(res, rect)) in extracted.iter().enumerate() {
+            if !shown.contains(&(i, res)) && shown.len() < 24 {
+                shown.push((i, res));
+                let raw = res as *mut c_void;
+                let desc = ID3D12Resource::from_raw_borrowed(&raw).map(|r| r.GetDesc());
+                crate::xlog_info!(
+                    "D3D12.X: PresentX frame {frames}: plane {i} shows {res:#x} for the first time: {:?}, source rect {rect:?}, the title's address {:x?}, words {:x?}",
+                    desc.map(|d| (d.Width, d.Height, d.Format.0, d.Flags.0)),
+                    super::real::title_address(res),
+                    (0..PLANE_STRIDE / 8).map(|k| (planes.add(i * PLANE_STRIDE) as *const u64).add(k).read_unaligned()).collect::<Vec<u64>>()
+                );
+            }
+        }
+    }
+    if let Some(from) = trace_planes() {
+        static LAST: Mutex<Option<HashMap<usize, [u64; 4]>>> = Mutex::new(None);
+        let now: HashMap<usize, [u64; 4]> = USES.lock().unwrap().clone().unwrap_or_default();
+        let mut last = LAST.lock().unwrap();
+        if frames >= from && frames < from + 600 {
+            for (i, &(res, _)) in extracted.iter().enumerate() {
+                let n = now.get(&res).copied().unwrap_or_default();
+                let o = last.as_ref().and_then(|m| m.get(&res).copied()).unwrap_or_default();
+                crate::xlog_info!(
+                    "plane trace: frame {frames} plane {i} {res:#x}: since the last present rt binds {}, UAV views {}, copy destination {}, clears {}",
+                    n[0] - o[0],
+                    n[1] - o[1],
+                    n[2] - o[2],
+                    n[3] - o[3]
+                );
+            }
+        }
+        *last = Some(now);
+    }
     if super::capture::enabled() {
         super::capture::present(queue as usize, &extracted.iter().map(|e| e.0).collect::<Vec<_>>(), frames);
     }
@@ -243,9 +287,43 @@ pub fn trace_frame() -> bool {
     *ON.get_or_init(|| std::env::var_os("XCL_TRACE_FRAME").is_some())
 }
 
+/// `XCL_TRACE_PLANES=<frame>`: from that frame on (the next 600), what console code did with
+/// each presented plane's resource since the present before.
+fn trace_planes() -> Option<u64> {
+    static FROM: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *FROM.get_or_init(|| std::env::var("XCL_TRACE_PLANES").ok().and_then(|v| v.trim().parse().ok()))
+}
+
+/// A copy into a presented resource under `XCL_TRACE_PLANES` (the first 60): where from.
+pub unsafe fn trace_plane_copy(what: &str, dst: usize, src: usize) {
+    if trace_planes().is_none() || !is_presented(dst) {
+        return;
+    }
+    static N: AtomicU64 = AtomicU64::new(0);
+    if N.fetch_add(1, Ordering::Relaxed) >= 60 {
+        return;
+    }
+    let d = |r: usize| ID3D12Resource::from_raw_borrowed(&(r as *mut c_void)).map(|r| r.GetDesc()).map(|d| (d.Dimension.0, d.Width, d.Height, d.Format.0, d.Flags.0));
+    crate::xlog_info!(
+        "plane trace: frame {} {what} into {dst:#x} {:?} from {src:#x} {:?} (the title's address {:x?})",
+        BOUNDARIES.load(Ordering::Relaxed),
+        d(dst),
+        if src != 0 { d(src) } else { None },
+        super::real::title_address(src)
+    );
+}
+
+pub fn trace_planes_from() -> Option<u64> {
+    trace_planes()
+}
+
+pub fn trace_uses() -> bool {
+    trace_frame() || trace_planes().is_some()
+}
+
 /// `res` was used as `what` (USE_*)
 pub fn note_use(res: usize, what: usize) {
-    if trace_frame() && res != 0 {
+    if (trace_frame() || trace_planes().is_some()) && res != 0 {
         USES.lock().unwrap().get_or_insert_with(HashMap::new).entry(res).or_default()[what] += 1;
     }
 }
@@ -1081,6 +1159,11 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, Vec<(usize, 
             Some((r, desc, uv))
         })
         .collect();
+    // `XCL_PRESENT_PLANE=<i>` (diagnostic): only plane `i` of a PresentX is shown, as it is
+    let resolved = match present_plane_only() {
+        Some(i) if i < resolved.len() => vec![resolved[i].clone()],
+        _ => resolved,
+    };
     if resolved.is_empty() {
         return;
     }
@@ -1302,6 +1385,14 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, Vec<(usize, 
                 for dump in p.dumps.drain(..) {
                     if dump.tag.starts_with("twin") {
                         super::depth_uav::log_values(&dump.buffer, &dump.footprint, &dump.tag);
+                        // and as a picture of its bytes as they are (a 16-bit twin: the low byte red,
+                        // the high byte green; a 32-bit one: its low three bytes; a stencil twin: grey)
+                        let raw = match dump.format {
+                            DXGI_FORMAT_R16_TYPELESS => DXGI_FORMAT_R16_UINT,
+                            DXGI_FORMAT_R32_TYPELESS => DXGI_FORMAT_R32_UINT,
+                            f => f,
+                        };
+                        write_frame(&dump.buffer, &dump.footprint, raw, &dump.tag.replace(' ', "_"));
                         continue;
                     }
                     if dump.tag.starts_with("lut") {

@@ -108,6 +108,9 @@ pub fn exports() -> Vec<(&'static str, usize)> {
 
 pub const MEM_GRAPHICS: u32 = 0x1000_0000;
 mod placeholders;
+pub mod alias;
+pub mod guards;
+mod sections;
 pub mod lazy;
 pub const MEM_TITLE: u32 = 0x4000_0000;
 const STD_ALLOC_MASK: u32 = 0x1000 | 0x2000 | 0x8_0000 | 0x10_0000 | 0x20_0000 | 0x100_0000;
@@ -535,6 +538,11 @@ pub mod mirrors {
             .into_iter()
             .map(|(g, to)| {
                 let to = to.map(|pool| {
+                    if super::alias::enabled() {
+                        let page = super::alias::page_at(pool).unwrap_or(0);
+                        let (at, home) = super::alias::backing(page).unwrap_or((0, false));
+                        return (page, at, at != 0 && (home || super::freeing_is_seen(at)));
+                    }
                     let page = away.as_ref().and_then(|a| a.title.get(&pool).copied()).unwrap_or(0);
                     let (at, home) = if page != 0 { super::place_of(away.as_ref(), page) } else { (0, false) };
                     (page, at, at != 0 && (home || super::freeing_is_seen(at)))
@@ -930,6 +938,19 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
             u.view_release(q);
         }
     }
+    if alias::enabled() && !addr.is_null() && t & 0x1000 != 0 && alias::in_space(addr as usize) {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| crate::xlog_warn!("VirtualAlloc: a commit at {addr:p} in a reservation of 64 KiB pages that holds physical pages (XCL_PAGE_ALIAS) – refused"));
+        fnd::SetLastError(fnd::ERROR_INVALID_ADDRESS);
+        return std::ptr::null_mut();
+    }
+    if alias::enabled() && addr.is_null() && t & 0x2000 != 0 && t & 0x1000 == 0 && t & MEM_64K_PAGES == MEM_64K_PAGES {
+        if let Some(q) = alias::reserve_space(size) {
+            mirrors::reserved(q, size, t, p);
+            trace_mem("VirtualAlloc (64K pages, physical page space)", 0, size, t as u64, p, q);
+            return q as *mut c_void;
+        }
+    }
     // the title's own reservations of 64 KiB pages: in a sparse window, so the GPU sees them.
     // Skip CPU-inaccessible GPU-view mirror reservations (`PAGE_NOACCESS | PAGE_GRAPHICS_NOACCESS`):
     // their pixels live in the paired CPU view (`mirrors::source`), so putting them in sparse VA
@@ -1190,6 +1211,11 @@ pub unsafe extern "system" fn VirtualFree(addr: *mut c_void, size: usize, t: u32
     if let Some(ok) = placeholders::free(addr, size, t) {
         return ok;
     }
+    if alias::enabled() {
+        if let Some(ok) = alias::free_space(addr as usize, size, t) {
+            return ok as BOOL;
+        }
+    }
     // the title's reservations in a sparse window: decommit (and on release give the address
     // space back); their video memory goes with it
     if let Some(u) = crate::gpu::uma::get().filter(|u| u.is_sparse(addr as usize)) {
@@ -1307,7 +1333,7 @@ pub unsafe extern "system" fn VirtualFreeEx(proc_: HANDLE, addr: *mut c_void, si
     if proc_ == thr::GetCurrentProcess() {
         let a = addr as usize;
         // (a graphics reservation's decommits too: one may be a paired CPU view, `source_going`)
-        if crate::gpu::uma::get().is_some_and(|u| u.is_sparse(a) || u.contains(a) || u.is_view(a)) || in_graphics_reservation(a) {
+        if crate::gpu::uma::get().is_some_and(|u| u.is_sparse(a) || u.contains(a) || u.is_view(a)) || in_graphics_reservation(a) || alias::in_space(a) {
             return VirtualFree(addr, size, t);
         }
     }
@@ -1358,6 +1384,9 @@ unsafe fn aligned_heap_alloc(size: usize, align: usize) -> *mut c_void {
         fnd::SetLastError(fnd::ERROR_NOT_ENOUGH_MEMORY);
         return std::ptr::null_mut();
     }
+    if crate::heap_count::counting() {
+        crate::heap_count::title_added(total);
+    }
     let aligned = (raw + 16 + align - 1) & !(align - 1);
     *((aligned - 8) as *mut usize) = raw;
     aligned as *mut c_void
@@ -1368,6 +1397,12 @@ unsafe fn aligned_heap_free(p: *mut c_void) {
         return;
     }
     let raw = *((p as usize - 8) as *const usize);
+    if crate::heap_count::counting() {
+        let size = mem::HeapSize(mem::GetProcessHeap(), 0, raw as *const c_void);
+        if size != usize::MAX {
+            crate::heap_count::title_removed(size);
+        }
+    }
     mem::HeapFree(mem::GetProcessHeap(), 0, raw as *const c_void);
 }
 
@@ -1781,6 +1816,71 @@ pub mod pagelog {
     }
 }
 
+/// A measurement: the addresses pages were moved away from (`move_away`: a page the title maps
+/// at a second address while it is still mapped at the first is copied there, and the first
+/// address is given up). On the console both addresses show the page until the title unmaps one.
+/// So: how long after a move does the title unmap or map the address the page left – at once (it
+/// moves pages), or not at all (it keeps two views of a page, and here the first is gone)?
+pub mod given_up {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Mutex;
+    use std::time::Instant;
+
+    /// address the page left → (page, where it went, when, in the coherent window)
+    static LEFT: Mutex<Option<HashMap<usize, (usize, usize, Instant, bool)>>> = Mutex::new(None);
+    static MOVES: AtomicU64 = AtomicU64::new(0);
+    /// the title's next call at such an address: unmapped it (page 0) within 1 ms, 100 ms, 10 s,
+    /// later; mapped another page there within the same steps
+    static NEXT: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+
+    pub fn moved(old: usize, at: usize, page: usize) {
+        let coherent = crate::gpu::uma::get().is_some_and(|u| u.is_committed(old));
+        let n = MOVES.fetch_add(1, Ordering::Relaxed) + 1;
+        let mut g = LEFT.lock().unwrap_or_else(|e| e.into_inner());
+        let m = g.get_or_insert_with(HashMap::new);
+        m.insert(old, (page, at, Instant::now(), coherent));
+        if n.is_power_of_two() || n % 8192 == 0 {
+            let now = Instant::now();
+            let ages: Vec<u128> = m.values().map(|v| now.saturating_duration_since(v.2).as_millis()).collect();
+            let old_ones = ages.iter().filter(|&&a| a >= 1000).count();
+            let in_coherent = m.values().filter(|v| v.3).count();
+            let c: Vec<u64> = NEXT.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+            crate::xlog_info!(
+                "physical pages: {n} pages moved to a second address so far; the address they left was unmapped by the title {} times (within 1 ms {}, 100 ms {}, 10 s {}, later {}) and given another page {} times (within 1 ms {}, 100 ms {}, 10 s {}, later {}); {} such addresses the title has not touched since ({old_ones} for a second or more, the oldest {} s; {in_coherent} in the coherent window, where the old bytes stay readable)",
+                c[0] + c[1] + c[2] + c[3], c[0], c[1], c[2], c[3],
+                c[4] + c[5] + c[6] + c[7], c[4], c[5], c[6], c[7],
+                m.len(),
+                ages.iter().max().copied().unwrap_or(0) / 1000
+            );
+        }
+    }
+
+    /// The title maps `page` (0: unmaps) at `at`.
+    pub fn title_maps(at: usize, page: usize) {
+        let mut g = LEFT.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((_, _, when, _)) = g.as_mut().and_then(|m| m.remove(&at)) else { return };
+        let ms = when.elapsed().as_millis();
+        let step = if ms < 1 { 0 } else if ms < 100 { 1 } else if ms < 10_000 { 2 } else { 3 };
+        NEXT[step + if page == 0 { 0 } else { 4 }].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// For a crash report: whether `addr` is in a page-sized range a page was moved away from
+    /// and the title has not mapped or unmapped since.
+    pub fn describe(addr: usize) -> String {
+        let Ok(g) = LEFT.try_lock() else { return String::new() };
+        let Some(m) = g.as_ref() else { return String::new() };
+        match m.get(&(addr & !(super::PHYS_PAGE - 1))) {
+            Some(&(page, to, when, coherent)) => format!(
+                "page {page:#x} was moved away from here to {to:#x} {} ms ago, and the title has not unmapped this address since{}",
+                when.elapsed().as_millis(),
+                if coherent { " (the coherent window: the old bytes stay readable here)" } else { "" }
+            ),
+            None => String::new(),
+        }
+    }
+}
+
 /// Size of one console physical page (64 KiB).
 pub const PHYS_PAGE_SIZE: usize = PHYS_PAGE;
 
@@ -1829,6 +1929,7 @@ fn forget_title_mappings(base: usize, len: usize) {
 /// Whether a physical page is mapped at the page holding `va` away from its home – committed
 /// or not yet (`lazy`: a page never used is committed at its first access).
 pub fn physical_page_at(va: usize) -> bool {
+    if alias::enabled() { return alias::physical_page_at(va); }
     AWAY.lock().unwrap().as_ref().is_some_and(|a| a.at.contains_key(&(va & !(PHYS_PAGE - 1))))
 }
 
@@ -1837,6 +1938,7 @@ pub fn physical_page_at(va: usize) -> bool {
 /// is at one (`map_pages` moves it), so `d3d12x::vram` asks which page an address had to let
 /// textures at two addresses of one page share its video memory.
 pub fn physical_pages(va: usize, n: usize) -> Vec<Option<usize>> {
+    if alias::enabled() { return (0..n).map(|i| va.checked_add(i.checked_mul(PHYS_PAGE)?).and_then(alias::page_at)).collect(); }
     let g = AWAY.lock().unwrap();
     let Some(a) = g.as_ref() else { return vec![None; n] };
     (0..n).map(|i| va.checked_add(i * PHYS_PAGE).and_then(|at| a.at.get(&at).copied())).collect()
@@ -1916,6 +2018,7 @@ fn page_home(page: usize) -> Option<usize> {
 
 /// Whether every page of `pages` (at least one) is a physical page allocated now.
 pub fn physical_pages_live(pages: &[usize]) -> bool {
+    if alias::enabled() { return !pages.is_empty() && pages.iter().all(|&p| alias::page_live(p)); }
     !pages.is_empty() && pages.iter().all(|&p| page_home(p).is_some())
 }
 
@@ -1952,6 +2055,7 @@ unsafe fn resolve_physical_pages(away: Option<&Away>, pages: &[usize], offset: u
 /// number from `AllocateTitlePhysicalPages`). Returns `false` if `offset >= PHYS_PAGE_SIZE`,
 /// `pages` is too short, or any page is not a live allocation.
 pub unsafe fn read_physical_pages(pages: &[usize], offset: usize, dst: &mut [u8]) -> bool {
+    if alias::enabled() { return alias::read(pages, offset, dst); }
     if dst.is_empty() {
         return offset < PHYS_PAGE;
     }
@@ -1971,6 +2075,7 @@ pub unsafe fn read_physical_pages(pages: &[usize], offset: usize, dst: &mut [u8]
 /// Copy `src` into `pages` starting at `offset` within the first page. Validates every page
 /// before writing so the destination gets all bytes or nothing.
 pub unsafe fn write_physical_pages(pages: &[usize], offset: usize, src: &[u8]) -> bool {
+    if alias::enabled() { return alias::write(pages, offset, src); }
     if src.is_empty() {
         return offset < PHYS_PAGE;
     }
@@ -2289,6 +2394,7 @@ unsafe fn move_away(away: &mut Away, old: usize, at: usize, page: usize, in_uma:
     }
     away.at.remove(&old);
     away.page.remove(&page);
+    given_up::moved(old, at, page);
     // (before its bytes come, as in `map_pages`)
     if crate::gpu::uma::get().is_some_and(|u| u.is_sparse(at)) {
         crate::hle::d3d12x::sparse::committed(at, PHYS_PAGE);
@@ -2341,6 +2447,13 @@ pub unsafe extern "system" fn AllocateTitlePhysicalPages(_p: HANDLE, _t: u32, nu
         fnd::SetLastError(fnd::ERROR_NOT_ENOUGH_MEMORY);
         return 0;
     };
+    if alias::enabled() {
+        if alias::allocate(n, arr) {
+            return 1;
+        }
+        fnd::SetLastError(fnd::ERROR_NOT_ENOUGH_MEMORY);
+        return 0;
+    }
     let Some(u) = crate::gpu::uma::get() else {
         fnd::SetLastError(fnd::ERROR_NOT_ENOUGH_MEMORY);
         return 0;
@@ -2364,6 +2477,15 @@ pub unsafe extern "system" fn FreeTitlePhysicalPages(_p: HANDLE, n: usize, arr: 
     if arr.is_null() {
         fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
         return 0;
+    }
+    if alias::enabled() {
+        let _serial = AWAY.lock().unwrap();
+        let pages = std::slice::from_raw_parts(arr, n);
+        for &page in pages {
+            crate::hle::d3d12x::sparse::remapped(&mirrors::page_freed(page));
+        }
+        alias::free(pages);
+        return 1;
     }
     // freed pages mapped elsewhere: that address keeps whatever it holds, the mapping goes
     if let Some(away) = AWAY.lock().unwrap().as_mut() {
@@ -2413,9 +2535,25 @@ pub unsafe extern "system" fn MapTitlePhysicalPages(va: *mut c_void, n: usize, _
     let _cost = super::api_cost::time(super::api_cost::Call::PhysicalPages);
     let mut g = AWAY.lock().unwrap();
     let away = g.get_or_insert_with(Away::default);
+    if alias::enabled() { return map_aliased(va, n, arr); }
     let r = map_pages(away, va, n, arr);
     give_back_homes(away);
     r
+}
+
+/// Map section-backed guest pages while preserving this branch's GPU-view record.
+unsafe fn map_aliased(va: *mut c_void, n: usize, arr: *mut usize) -> *mut c_void {
+    if va.is_null() || n == 0 || n.checked_mul(PHYS_PAGE).and_then(|len| (va as usize).checked_add(len)).is_none() {
+        fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
+        return std::ptr::null_mut();
+    }
+    let empty;
+    let pages = if arr.is_null() { empty = vec![0; n]; empty.as_slice() } else { std::slice::from_raw_parts(arr, n) };
+    if alias::map(va as usize, pages) {
+        note_mapping_range(va as usize, n * PHYS_PAGE);
+        return va;
+    }
+    std::ptr::null_mut()
 }
 
 /// `MapTitlePhysicalPages` with `AWAY` held; the homes it moves away are given back by the
@@ -2476,6 +2614,7 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
     let mut sparse_run = SparseRun::new(crate::hle::d3d12x::sparse::committed);
     for (i, &p) in pages.iter().enumerate() {
         let at = base + i * PHYS_PAGE;
+        given_up::title_maps(at, p);
         // what was mapped at `at` goes; the new page is written down once it is in place
         away.title.remove(&at);
         if unmap_away(away, at, &(0..0)) {
@@ -2587,6 +2726,9 @@ pub unsafe extern "system" fn XMemMapPhysicalPagesScatter(addresses: *const *mut
     }
     let mut g = AWAY.lock().unwrap();
     let away = g.get_or_insert_with(Away::default);
+    if alias::enabled() {
+        return (0..n).all(|i| !map_aliased(*addresses.add(i), 1, if pages.is_null() { std::ptr::null_mut() } else { pages.add(i).cast() }).is_null()) as BOOL;
+    }
     // no page array: page 0 (unmap) for every address
     let ok = (0..n).all(|i| {
         // a part of the call that only unmaps

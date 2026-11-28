@@ -113,7 +113,8 @@ unsafe extern "system" fn unhandled_filter(info: *const EXCEPTION_POINTERS) -> i
         if !ctx.is_null() {
             let c = &*ctx;
             let mut seen: Vec<usize> = Vec::new();
-            for (n, v) in [("rax", c.Rax), ("rbx", c.Rbx), ("rcx", c.Rcx), ("rdx", c.Rdx), ("rsi", c.Rsi), ("rdi", c.Rdi), ("rbp", c.Rbp), ("r8", c.R8), ("r9", c.R9), ("r10", c.R10), ("r11", c.R11), ("r12", c.R12), ("r13", c.R13), ("r14", c.R14), ("r15", c.R15)] {
+            let fault = if rec.ExceptionCode as u32 == 0xC000_0005 && rec.NumberParameters >= 2 { rec.ExceptionInformation[1] as u64 } else { 0 };
+            for (n, v) in [("the fault address", fault), ("rax", c.Rax), ("rbx", c.Rbx), ("rcx", c.Rcx), ("rdx", c.Rdx), ("rsi", c.Rsi), ("rdi", c.Rdi), ("rbp", c.Rbp), ("r8", c.R8), ("r9", c.R9), ("r10", c.R10), ("r11", c.R11), ("r12", c.R12), ("r13", c.R13), ("r14", c.R14), ("r15", c.R15)] {
                 let p = v as usize;
                 if p < 0x1_0000 || seen.contains(&(p & !0xFFFF)) {
                     continue;
@@ -123,16 +124,55 @@ unsafe extern "system" fn unhandled_filter(info: *const EXCEPTION_POINTERS) -> i
                 if !d.is_empty() {
                     crate::xlog_error!("page of {n}={p:#x}: {d}");
                 }
+                let g = crate::hle::kernelx::given_up::describe(p);
+                if !g.is_empty() {
+                    crate::xlog_error!("{n}={p:#x}: {g}");
+                }
+                // which memory it is, and what it holds there
+                if crate::gpu::shader::readable(p & !7, 64) {
+                    let kind = match crate::gpu::uma::get() {
+                        Some(u) if u.is_sparse(p) => "a sparse window",
+                        Some(u) if u.is_view(p) => "a GPU view",
+                        Some(u) if u.is_committed(p) => "the coherent window",
+                        Some(u) if u.contains(p) => "unified memory",
+                        _ => "outside unified memory",
+                    };
+                    let words: Vec<String> = (0..8).map(|i| format!("{:016x}", ((p & !7) as *const u64).add(i).read_unaligned())).collect();
+                    crate::xlog_error!("memory at {n}={p:#x} ({kind}): {}", words.join(" "));
+                    if kind != "outside unified memory" {
+                        crate::xlog_error!("buffer views compute dispatches were given over {n}={p:#x}: {}", crate::hle::d3d12x::real::dispatch_views_over(p));
+                        // the neighbourhood, as dwords: what was written over an object shows its
+                        // extent and stride (single words, records, a block)
+                        let from = (p & !15).saturating_sub(192);
+                        if crate::gpu::shader::readable(from, 448) {
+                            for row in 0..7 {
+                                let at = from + 64 * row;
+                                let w: Vec<String> = (0..16).map(|i| format!("{:08x}", ((at + 4 * i) as *const u32).read_unaligned())).collect();
+                                crate::xlog_error!("  {at:#x}: {}", w.join(" "));
+                            }
+                        }
+                    }
+                }
             }
             crate::xlog_error!("page events so far: {}", crate::hle::kernelx::pagelog::counts());
         }
         crate::report::write_final(Some(msg));
         crate::log::flush();
     }
-    match TITLE_FILTER.load(Ordering::Acquire) {
+    let verdict = match TITLE_FILTER.load(Ordering::Acquire) {
         0 => 0, // EXCEPTION_CONTINUE_SEARCH
         f => std::mem::transmute::<usize, unsafe extern "system" fn(*const EXCEPTION_POINTERS) -> i32>(f)(info),
+    };
+    // Continuing the search hands the process to Windows Error Reporting, which snapshots it for
+    // its dump: with a title's tens of GB committed, that doubled the system's commit charge in
+    // one second (measured: +24 GB). The report is written, so the process ends here with the
+    // exception's code (`XCL_WER=1`: Windows gets it as before).
+    if verdict == 0 && std::env::var_os("XCL_WER").is_none() {
+        let code = if info.is_null() || (*info).ExceptionRecord.is_null() { 0xC000_0005u32 } else { (*(*info).ExceptionRecord).ExceptionCode as u32 };
+        crate::log::flush();
+        windows_sys::Win32::System::Threading::TerminateProcess(windows_sys::Win32::System::Threading::GetCurrentProcess(), code);
     }
+    verdict
 }
 
 static ORIG_NT_TERMINATE: AtomicUsize = AtomicUsize::new(0);
@@ -436,6 +476,76 @@ unsafe fn code_bytes_at(rip: usize, most: usize) -> usize {
     (in_page + 1..=most).rev().find(|&n| crate::gpu::shader::readable(rip, n)).unwrap_or(in_page)
 }
 
+thread_local! {
+    /// the address this thread's last `monitorx` armed (rAX)
+    static MONITORED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// `mwaitx` (ECX bit 1: EBX is a timeout in TSC ticks): waits here, without leaving the handler,
+/// until the monitored quadword changes or about a quarter of a millisecond has passed (a late or
+/// spurious wake-up is allowed: the title's loop checks and waits again). Returning at
+/// once, as before, made a title's wait on a GPU fence two exceptions per turn of its loop – a
+/// retail title's world: 61 000 turns a second on the thread that waits for the GPU.
+unsafe fn mwaitx_wait(ecx: u32, ebx: u32) {
+    use std::arch::x86_64::{_mm_pause, _rdtsc};
+    const MOST_TICKS: u64 = 800_000;
+    let at = MONITORED.with(|m| m.get());
+    if at == 0 || !at.is_multiple_of(8) || !crate::gpu::shader::readable(at, 8) {
+        std::hint::spin_loop();
+        return;
+    }
+    let cell = &*(at as *const std::sync::atomic::AtomicU64);
+    let seen = cell.load(Ordering::Relaxed);
+    // (the title's own timeout is 1000 ticks, a pause: it is not kept, the quadword is polled)
+    let _ = (ecx, ebx);
+    let end = _rdtsc().saturating_add(MOST_TICKS);
+    while cell.load(Ordering::Relaxed) == seen && _rdtsc() < end {
+        _mm_pause();
+    }
+}
+
+/// Emulated console-only instructions by kind, logged every 2 s while there are any: each one is
+/// an exception (kernel and back), so a title that runs them in a loop pays for it in frame time.
+fn count_emulated(what: &crate::insn::ConsoleOnly, rip: usize) {
+    use crate::insn::ConsoleOnly as C;
+    const NAMES: [&str; 8] = ["clwb", "clzero", "rdpru", "monitorx", "mwaitx", "rdpid", "extrq", "insertq"];
+    static N: [AtomicUsize; 8] = [const { AtomicUsize::new(0) }; 8];
+    static LAST_MS: AtomicUsize = AtomicUsize::new(0);
+    static SITES: std::sync::Mutex<Vec<(usize, u64)>> = std::sync::Mutex::new(Vec::new());
+    let k = match what {
+        C::Clwb => 0,
+        C::Clzero | C::ClzeroLoop { .. } => 1,
+        C::Rdpru => 2,
+        C::Monitorx => 3,
+        C::Mwaitx => 4,
+        C::Rdpid(_) => 5,
+        C::Extrq { .. } => 6,
+        C::Insertq { .. } => 7,
+        C::Ud2 => return,
+    };
+    N[k].fetch_add(1, Ordering::Relaxed);
+    if let Ok(mut g) = SITES.try_lock() {
+        match g.iter().position(|e| e.0 == rip) {
+            Some(i) => g[i].1 += 1,
+            None if g.len() < 4096 => g.push((rip, 1)),
+            None => {}
+        }
+    }
+    let now = (crate::log::uptime() * 1000.0) as usize;
+    let last = LAST_MS.load(Ordering::Relaxed);
+    if now >= last + 2000 && LAST_MS.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+        let counts: Vec<String> = (0..8).map(|i| (NAMES[i], N[i].swap(0, Ordering::Relaxed))).filter(|c| c.1 > 0).map(|(n, c)| format!("{c} {n}")).collect();
+        let top = SITES.lock().map_or(String::new(), |mut g| {
+            g.sort_by_key(|e| std::cmp::Reverse(e.1));
+            let t = g.iter().take(6).map(|&(a, c)| format!("{} x{c}", modules::describe_address(a))).collect::<Vec<_>>().join(", ");
+            let sites = g.len();
+            g.clear();
+            format!("{sites} places, most: {t}")
+        });
+        crate::xlog_info!("emulated console CPU instructions ({} ms): {}; {top}", now - last, counts.join(", "));
+    }
+}
+
 /// A title's STATUS_ILLEGAL_INSTRUCTION: an instruction the console's Zen 2 has and this CPU
 /// lacks (`insn`) is emulated and stepped over (EXCEPTION_CONTINUE_EXECUTION); anything else is
 /// logged with its code bytes and goes on to the title's handlers.
@@ -462,6 +572,7 @@ unsafe fn emulate_console_only(ctx: &mut windows_sys::Win32::System::Diagnostics
             }
         }
     }
+    count_emulated(&what, rip);
     let mut step = len;
     match what {
         ConsoleOnly::Ud2 => return 0,
@@ -474,10 +585,8 @@ unsafe fn emulate_console_only(ctx: &mut windows_sys::Win32::System::Diagnostics
                 unsafe { VirtualProtect(rip as *const std::ffi::c_void, len, old, &mut old) };
             }
         }
-        ConsoleOnly::Monitorx => {}
-        ConsoleOnly::Mwaitx => {
-            std::hint::spin_loop();
-        }
+        ConsoleOnly::Monitorx => MONITORED.with(|m| m.set(ctx.Rax as usize)),
+        ConsoleOnly::Mwaitx => mwaitx_wait(ctx.Rcx as u32, ctx.Rbx as u32),
         ConsoleOnly::Clzero => {
             // with an address-size prefix (0x67, among the prefixes before 0F 01 FC) the line
             // is at EAX, zero-extended – as a Zen 5 runs it

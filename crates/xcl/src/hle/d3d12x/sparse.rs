@@ -1892,6 +1892,9 @@ impl State {
                 let here = entry.cpu(t);
                 if entry.holes & (1u16 << idx) == 0 && entry.gen == gen {
                     let wrote = land_page(&mut entry.sent[idx], here + (pg - t), at - pg, p.add(src_off), step);
+                    if wrote {
+                        crate::hle::kernelx::pagelog::note("GPU copy back landed", here + (at - t), 0, step);
+                    }
                     if wrote && self.own_pages.len() < OWN_PAGES_MAX && super::look_stats::deep() {
                         self.own_pages.push(here + (pg - t));
                     }
@@ -1927,6 +1930,7 @@ impl State {
             8 => (*(cpu as *const AtomicU64)).store(value, Ordering::Release),
             _ => return,
         }
+        crate::hle::kernelx::pagelog::note("GPU immediate landed", cpu, 0, (bytes & 0x7f) as usize);
         if self.own_pages.len() < OWN_PAGES_MAX && super::look_stats::deep() {
             self.own_pages.push(cpu & !(PAGE - 1));
         }

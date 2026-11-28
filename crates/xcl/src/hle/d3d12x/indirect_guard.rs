@@ -352,9 +352,13 @@ pub(super) unsafe fn check(list: *mut c_void, pso: usize, sig: usize, max: u32, 
     let at = title.map_or(va, |t| t as u64);
     let constants = [max_groups(), slot, id as u32, (id >> 32) as u32, at as u32, (at >> 32) as u32, kind as u32];
     l.SetComputeRoot32BitConstants(0, constants.len() as u32, constants.as_ptr() as *const c_void, 0);
+    super::real::note_root_view(l.as_raw() as usize, 1, va);
     l.SetComputeRootUnorderedAccessView(1, va);
+    super::real::note_root_view(l.as_raw() as usize, 2, g.out_va);
     l.SetComputeRootUnorderedAccessView(2, g.out_va);
+    super::real::note_root_view(l.as_raw() as usize, 3, g.seen_va);
     l.SetComputeRootUnorderedAccessView(3, g.seen_va);
+    super::real::note_root_view(l.as_raw() as usize, 4, shown);
     l.SetComputeRootUnorderedAccessView(4, shown);
     l.Dispatch(1, 1, 1);
     report(&g);

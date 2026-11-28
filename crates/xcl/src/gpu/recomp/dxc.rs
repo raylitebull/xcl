@@ -386,6 +386,7 @@ impl DxcMalloc {
         if heap.is_null() {
             Err(format!("HeapCreate for DXC: {}", std::io::Error::last_os_error()))
         } else {
+            crate::heap_count::note_heap("DXC", heap as usize);
             Ok(Self { heap })
         }
     }

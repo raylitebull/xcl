@@ -127,6 +127,25 @@ pub(super) fn unknown(known: &Known) {
     k.forgotten += 1;
 }
 
+/// `parts` (from, to) of the `size` bytes of a texture at `src` did not go up, whatever their
+/// pages were found to hold: that is not taken for what the PC texture holds there, and the next
+/// write to those pages goes up. What is known of its other pages stays.
+pub(super) fn unknown_parts(known: &Known, src: usize, size: usize, parts: &[(usize, usize)]) {
+    if parts.is_empty() {
+        return;
+    }
+    let mut k = known.lock().unwrap();
+    if k.hashes.len() != pages_of(src, size) {
+        return;
+    }
+    let first = src / PAGE * PAGE;
+    let n = k.hashes.len();
+    for &(from, to) in parts.iter().filter(|r| r.0 < r.1) {
+        let (a, z) = ((src + from - first) / PAGE, (src + to - first).div_ceil(PAGE));
+        k.hashes[a.min(n)..z.min(n)].fill(0);
+    }
+}
+
 /// `parts` of a texture (from, to) are not what its PC texture holds (a mapping changed under
 /// them): they go up again with its next upload, with no comparison (`take_again`).
 pub(super) fn stale(known: &Known, parts: Vec<(usize, usize)>) {
@@ -373,6 +392,40 @@ impl PageMap {
             }
             done += n;
         }
+    }
+
+    /// Whether any byte in `[at, at + len)` is non-zero, skipping unmapped (`0`) pages with no
+    /// read and stopping at the first non-zero page.
+    pub unsafe fn any_nonzero(&self, at: usize, len: usize) -> bool {
+        let mut done = 0;
+        SCRATCH.with(|s| {
+            let mut buf = s.borrow_mut();
+            if buf.len() < Self::PAGE {
+                buf.resize(Self::PAGE, 0);
+            }
+            while done < len {
+                let a = at + done;
+                let (k, off) = (a.wrapping_sub(self.first) / Self::PAGE, a & (Self::PAGE - 1));
+                let n = (Self::PAGE - off).min(len - done);
+                match self.at.get(k).copied().filter(|_| a >= self.first).unwrap_or(0) {
+                    0 => {}
+                    p if p & 1 != 0 => {
+                        super::title_textures::copy_readable((p & !1) + off, &mut buf[..n]);
+                        if !super::title_textures::all_zero(&buf[..n]) {
+                            return true;
+                        }
+                    }
+                    p => {
+                        super::title_textures::copy_or_zeros(p + off, &mut buf[..n]);
+                        if !super::title_textures::all_zero(&buf[..n]) {
+                            return true;
+                        }
+                    }
+                }
+                done += n;
+            }
+            false
+        })
     }
 }
 
@@ -785,7 +838,21 @@ fn capacity(bytes: u64) -> Option<u64> {
     }
 }
 
-const FREE_BYTES: u64 = 512 << 20;
+/// The most bytes of idle upload buffers kept for the next batches (`XCL_UPLOAD_KEEP_MB`, default
+/// 512): memory of the system's (upload heaps), the process's commit and RAM while kept.
+fn free_bytes() -> u64 {
+    static V: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| keep_bytes_of(std::env::var("XCL_UPLOAD_KEEP_MB").ok().as_deref()))
+}
+
+fn keep_bytes_of(v: Option<&str>) -> u64 {
+    v.and_then(|v| v.trim().parse::<u64>().ok()).map_or(512, |mb| mb.min(4096)) << 20
+}
+
+/// Bytes of the upload buffers kept idle now.
+pub(super) fn idle_bytes() -> u64 {
+    FREE.lock().unwrap().iter().map(|j| j.bytes).sum()
+}
 
 /// A job whose buffer takes `bytes` bytes.
 unsafe fn take(dev: &ID3D12Device, bytes: u64) -> Result<Job, String> {
@@ -833,7 +900,7 @@ pub(super) fn give_back(job: Job) {
     let mut g = FREE.lock().unwrap();
     g.push(job);
     // (the biggest goes first: one burst does not keep its buffers for good)
-    while g.iter().map(|j| j.bytes).sum::<u64>() > FREE_BYTES {
+    while g.iter().map(|j| j.bytes).sum::<u64>() > free_bytes() {
         let Some(i) = g.iter().enumerate().max_by_key(|(_, j)| j.bytes).map(|(i, _)| i) else { break };
         g.swap_remove(i);
     }
@@ -874,6 +941,15 @@ pub(super) unsafe fn submit(dev: &ID3D12Device, queue: &ID3D12CommandQueue, item
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_idle_upload_buffers_kept_follow_the_switch() {
+        assert_eq!(keep_bytes_of(None), 512 << 20, "unset: as before");
+        assert_eq!(keep_bytes_of(Some(" 64 ")), 64 << 20);
+        assert_eq!(keep_bytes_of(Some("0")), 0, "none kept");
+        assert_eq!(keep_bytes_of(Some("lots")), 512 << 20);
+        assert_eq!(keep_bytes_of(Some("100000")), 4096 << 20);
+    }
 
     /// The written pages of a texture are compared one by one: a page never compared has changed,
     /// one that holds what it held has not, the bytes next to the texture on its first and last
@@ -921,6 +997,16 @@ mod tests {
         assert!(known.lock().unwrap().again.is_some());
         assert_eq!(look(&dirty[3..5]).0, vec![Change::All]);
         known.lock().unwrap().again = None;
+        // parts that did not go up: their pages' next write has changed, the others' are compared
+        all_sent(&known, src, size);
+        assert_eq!(look(&dirty).0, vec![Change::Parts(vec![(0, size)])]);
+        assert_eq!(look(&dirty).0, vec![Change::None]);
+        unknown_parts(&known, src, size, &[(PAGE + 0x800, 2 * PAGE + 0x900), (size - 1, size), (5, 5)]);
+        assert_eq!(look(&dirty).0, vec![Change::Parts(vec![(PAGE + 0x800, 3 * PAGE + 0x800), (6 * PAGE + 0x800, size)])], "the pages those bytes lie on");
+        assert_eq!(look(&dirty).0, vec![Change::None]);
+        forget(&known);
+        unknown_parts(&known, src, size, &[(0, size)]);
+        assert_eq!(look(&dirty[2..3]).0, vec![Change::All], "nothing known: nothing to forget");
         // several textures at once, many pages: the same as one by one
         let big = vec![7u8; 600 * PAGE];
         let at = (big.as_ptr() as usize).next_multiple_of(PAGE);
